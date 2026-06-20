@@ -92,11 +92,21 @@ class Coordinator:
         eos = gc.eos_token_id if (gc and gc.eos_token_id is not None) else self.tok.eos_token_id
         self._eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         self._draft_model = load_model(draft_model_id, device=device) if draft_model_id else None
-        self.socks = []
-        for addr in stage_addrs:
-            self.log("INFO", "connecting stage", addr=f"{addr[0]}:{addr[1]}")
-            self.socks.append(_connect(addr, self.key))
+        self._stage_addrs = stage_addrs
+        self.socks = None            # lazy: connect on first request, not at startup
         self._session = 0
+
+    def _ensure_connected(self):
+        """Connect to remote stages on first use, so the API serves immediately
+        even if a stage is still loading at startup (no startup-ordering deadlock),
+        and reconnects after a drop (socks reset to None on relay error)."""
+        if self.socks is None:
+            socks = []
+            for addr in self._stage_addrs:
+                self.log("INFO", "connecting stage", addr=f"{addr[0]}:{addr[1]}")
+                socks.append(_connect(addr, self.key, timeout=300.0))
+            self.socks = socks
+        return self.socks
 
     def stage_topology(self):
         """Describe the pipeline stages for /v1/workers (layerEnd inclusive)."""
@@ -108,7 +118,7 @@ class Coordinator:
             workers.append({"nodeId": "stage0-coordinator", "layerStart": s,
                             "layerEnd": e - 1, "ready": True, "type": "gpu"})
             start = e
-        n_remote = len(self.socks)
+        n_remote = len(self._stage_addrs)
         if n_remote:
             per = max(1, (total - start) // n_remote)
             for i in range(n_remote):
@@ -131,26 +141,30 @@ class Coordinator:
         """Run the co-located stage (if any) then each remote stage in order."""
         if self.local_stage is not None:
             hidden = self._run_local(session, pos, hidden)
-        for s in self.socks:
-            wire.write_frame(s, self.key, wire.ACTIVATION,
-                             pack_activation(session, pos, hidden.detach().cpu()))
-            mt, payload = wire.read_frame_keyed(s, self.key)
-            if mt != wire.RESULT:
-                raise wire.WireError(f"expected RESULT, got {wire.msg_name(mt)}")
-            _, _, _, hidden = unpack_activation(payload)
-            hidden = hidden.to(self.device)
+        try:
+            for s in self._ensure_connected():
+                wire.write_frame(s, self.key, wire.ACTIVATION,
+                                 pack_activation(session, pos, hidden.detach().cpu()))
+                mt, payload = wire.read_frame_keyed(s, self.key)
+                if mt != wire.RESULT:
+                    raise wire.WireError(f"expected RESULT, got {wire.msg_name(mt)}")
+                _, _, _, hidden = unpack_activation(payload)
+                hidden = hidden.to(self.device)
+        except (wire.WireError, OSError):
+            self.socks = None   # drop -> reconnect on the next request
+            raise
         return hidden
 
     def _reset_sessions(self, session: int):
         self._local_caches.pop(session, None)
-        for s in self.socks:
+        for s in (self.socks or []):
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_RESET, 0))
 
     def _kv_truncate(self, session: int, length: int):
         if session in self._local_caches:
             self._local_caches[session].truncate_to(length)
-        for s in self.socks:
+        for s in (self.socks or []):
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_TRUNCATE, length))
 
@@ -217,7 +231,7 @@ class Coordinator:
         return self.tok.decode(out), out
 
     def close(self):
-        for s in self.socks:
+        for s in (self.socks or []):
             try:
                 wire.write_frame(s, self.key, wire.BYE, b"")
                 s.close()

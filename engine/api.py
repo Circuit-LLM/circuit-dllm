@@ -68,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            n_remote = len(_coord.socks)
+            n_remote = len(_coord._stage_addrs)
             n_stages = n_remote + (1 if _coord.local_stage is not None else 0)
             self._json(200, {"status": "ok", "model": _coord.model_id,
                              "stages": n_stages, "remote_stages": n_remote})
