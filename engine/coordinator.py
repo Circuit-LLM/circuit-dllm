@@ -27,7 +27,7 @@ from engine.specdecode import speculative_greedy, GreedyDraft
 from engine.log import make_logger
 
 
-def _connect(addr: Tuple[str, int], key: bytes, timeout: float = 60.0):
+def _connect(addr: Tuple[str, int], key: bytes, timeout: float = 180.0):
     """Connect to a stage worker, retrying until it's up (it loads a model first)."""
     host, port = addr
     deadline = time.time() + timeout
@@ -59,6 +59,7 @@ class Coordinator:
         self.key = wire.normalize_key(key)
         self.device = device
         self.model_id = model_id
+        self._local_range = local_layers
         self.log("INFO", "loading coordinator parts", model=model_id,
                  local_layers=local_layers, shard=shard)
         self.local_stage = None
@@ -96,6 +97,27 @@ class Coordinator:
             self.log("INFO", "connecting stage", addr=f"{addr[0]}:{addr[1]}")
             self.socks.append(_connect(addr, self.key))
         self._session = 0
+
+    def stage_topology(self):
+        """Describe the pipeline stages for /v1/workers (layerEnd inclusive)."""
+        total = self.config.num_hidden_layers
+        workers = []
+        start = 0
+        if self.local_stage is not None and self._local_range is not None:
+            s, e = self._local_range
+            workers.append({"nodeId": "stage0-coordinator", "layerStart": s,
+                            "layerEnd": e - 1, "ready": True, "type": "gpu"})
+            start = e
+        n_remote = len(self.socks)
+        if n_remote:
+            per = max(1, (total - start) // n_remote)
+            for i in range(n_remote):
+                s = start + i * per
+                e = total if i == n_remote - 1 else s + per
+                workers.append({"nodeId": f"stage{len(workers)}-remote",
+                                "layerStart": s, "layerEnd": e - 1,
+                                "ready": True, "type": "gpu"})
+        return workers
 
     def _run_local(self, session: int, pos: int, hidden: torch.Tensor) -> torch.Tensor:
         cache = self._local_caches.get(session)

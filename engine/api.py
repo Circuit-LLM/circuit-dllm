@@ -75,6 +75,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/v1/models":
             self._json(200, {"object": "list", "data": [
                 {"id": _coord.model_id, "object": "model", "owned_by": "circuit"}]})
+        elif self.path == "/v1/workers":
+            self._json(200, {"workers": _coord.stage_topology()})
         else:
             self._json(404, {"error": "not found"})
 
