@@ -9,7 +9,7 @@ layers of a 32B) is a Phase 3 task — it doesn't affect correctness, only memor
 from __future__ import annotations
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 
 def load_model(model_id: str, dtype=None, device: str = "cpu"):
@@ -26,6 +26,35 @@ def load_model(model_id: str, dtype=None, device: str = "cpu"):
 
 def load_tokenizer(model_id: str):
     return AutoTokenizer.from_pretrained(model_id)
+
+
+def _shard_device_map(config, start: int, end: int, keep_head: bool,
+                      gpu: str, other: str):
+    """device_map placing only owned layers (+ head if keep_head) on the GPU."""
+    n = config.num_hidden_layers
+    dm = {
+        "model.embed_tokens": gpu if keep_head else other,
+        "model.norm": gpu if keep_head else other,
+        "model.rotary_emb": gpu,            # tiny, no weights; our stage needs it
+        "lm_head": gpu if keep_head else other,
+    }
+    for i in range(n):
+        dm[f"model.layers.{i}"] = gpu if (start <= i < end) else other
+    return dm
+
+
+def load_model_shard(model_id: str, start: int, end: int, keep_head: bool = False,
+                     device: str = "cuda:0", other_device: str = "cpu"):
+    """Load ONLY layers [start, end) (+ head if keep_head) into VRAM; every other
+    module goes to `other_device` (cpu, never materialized on the GPU). Use this
+    for models too big to load whole on one card — load-then-prune can't help
+    because the whole model won't even fit to be pruned. Peak VRAM ~= this
+    stage's share. Owned layers keep their global layer_idx (StageKV handles it).
+    """
+    config = AutoConfig.from_pretrained(model_id)
+    dm = _shard_device_map(config, start, end, keep_head, device, other_device)
+    model = AutoModelForCausalLM.from_pretrained(model_id, device_map=dm, dtype=torch.float16)
+    return model.eval()
 
 
 def prune_to_layers(model, start: int, end: int, keep_head: bool = True):

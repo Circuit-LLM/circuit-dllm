@@ -33,13 +33,16 @@ SPEC = os.environ.get("CIRCUIT_SPEC") == "1"
 _ll = os.environ.get("CIRCUIT_LOCAL_LAYERS")
 LOCAL_LAYERS = tuple(int(x) for x in _ll.split(":")) if _ll else None
 DRAFT = os.environ.get("CIRCUIT_DRAFT") or None
+SHARD = os.environ.get("CIRCUIT_SHARD") == "1"
+OTHER_DEVICE = os.environ.get("CIRCUIT_OTHER_DEVICE", "cpu")
 
 
 def main():
     print(f"coordinator: model={MODEL} stages={STAGES} device={DEVICE} "
-          f"local={LOCAL_LAYERS} spec={SPEC}")
+          f"local={LOCAL_LAYERS} shard={SHARD} spec={SPEC}")
     coord = Coordinator(MODEL, STAGES, KEY, device=DEVICE,
-                        local_layers=LOCAL_LAYERS, draft_model_id=DRAFT)
+                        local_layers=LOCAL_LAYERS, draft_model_id=DRAFT,
+                        shard=SHARD, other_device=OTHER_DEVICE)
     t0 = time.time()
     if SPEC:
         text, toks = coord.generate_speculative(PROMPT, N)

@@ -47,7 +47,8 @@ class Coordinator:
     def __init__(self, model_id: str, stage_addrs: List[Tuple[str, int]],
                  key: bytes, device: str = "cpu",
                  local_layers: Optional[Tuple[int, int]] = None,
-                 draft_model_id: Optional[str] = None):
+                 draft_model_id: Optional[str] = None,
+                 shard: bool = False, other_device: str = "cpu"):
         """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
         so a big model loads once on this pod (layers + head) instead of a
         coordinator and a stage worker each loading the whole model. The model
@@ -57,15 +58,26 @@ class Coordinator:
         self.log = make_logger("coord")
         self.key = wire.normalize_key(key)
         self.device = device
-        self.log("INFO", "loading coordinator parts", model=model_id, local_layers=local_layers)
-        model = load_model(model_id, device=device)
+        self.log("INFO", "loading coordinator parts", model=model_id,
+                 local_layers=local_layers, shard=shard)
         self.local_stage = None
         self._local_caches = {}
-        if local_layers is not None:
+        if local_layers is not None and shard:
+            # too big to load whole: load only embed/head + this pod's layers
+            from engine.model import load_model_shard
             s, e = local_layers
-            prune_to_layers(model, s, e, keep_head=True)
+            gpu = "cuda:0" if device == "cuda" else device
+            model = load_model_shard(model_id, s, e, keep_head=True,
+                                     device=gpu, other_device=other_device)
             self.local_stage = stage_for_range(model, s, e)
-            self.log("INFO", "co-located stage", layers=f"{s}:{e}")
+            self.log("INFO", "co-located stage (sharded)", layers=f"{s}:{e}")
+        else:
+            model = load_model(model_id, device=device)
+            if local_layers is not None:
+                s, e = local_layers
+                prune_to_layers(model, s, e, keep_head=True)
+                self.local_stage = stage_for_range(model, s, e)
+                self.log("INFO", "co-located stage", layers=f"{s}:{e}")
         self._model = model
         self.config = model.config
         self.tok = load_tokenizer(model_id)
