@@ -1,0 +1,142 @@
+"""
+specdecode.py — greedy speculative decoding over the split pipeline.
+
+Original implementation. A small draft model proposes K tokens; the target (the
+split model) verifies all K in ONE pipeline pass; we accept the longest prefix
+the target agrees with (greedy), commit one corrected/bonus token, and roll the
+rejected tokens' KV back with truncate_to().
+
+Invariant (the correctness contract): greedy speculative output is
+**token-identical to plain greedy decode**, for ANY draft. The draft only
+affects speed (acceptance rate), never the result — the target's argmax decides
+every committed token.
+
+Indexing (per round; `pos` = first unprocessed position, `head` = last committed
+but unprocessed token):
+  verify batch = [head, d_1..d_K]  at positions pos..pos+K
+  logits[0, j] = target's prediction for position pos+j+1  (verifies d_{j+1})
+  accept d_1..d_m where m = leading matches; extra = argmax(logits[0, m])
+  commit d_1..d_m + extra (m+1 tokens); new head = extra
+  keep KV length = pos + m + 1  (head + accepted drafts); rollback to it
+
+`target` protocol:  forward_tokens(ids,start_pos)->logits[1,T,V], kv_len(), rollback(L)
+`draft`  protocol:  prefill(prompt), propose(head,K,start_pos)->list[int], rollback(L)
+"""
+
+from __future__ import annotations
+
+from typing import Callable, List, Optional
+
+import torch
+
+from engine.kv import StageKV
+
+
+@torch.no_grad()
+def speculative_greedy(target, draft, prompt_ids: torch.Tensor, n_new: int,
+                       K: int = 4, device: str = "cpu",
+                       draft_perturb: Optional[Callable[[int, int], int]] = None) -> List[int]:
+    """Run greedy speculative decoding. Returns the generated token ids."""
+    # prefill the target (its KV -> prompt length) and grab the first token
+    logits = target.forward_tokens(prompt_ids, 0)
+    draft.prefill(prompt_ids)
+    head = int(logits[0, -1].argmax())
+    out = [head]
+    pos = target.kv_len()
+
+    stats = {"rounds": 0, "accepted": 0, "proposed": 0}
+    while len(out) < n_new:
+        drafts = draft.propose(head, K, pos, perturb=draft_perturb)
+        batch = torch.tensor([[head] + drafts], device=device)
+        tlogits = target.forward_tokens(batch, pos)      # [1, K+1, V]
+
+        m = 0
+        for j in range(K):
+            if int(tlogits[0, j].argmax()) == drafts[j]:
+                m += 1
+            else:
+                break
+        extra = int(tlogits[0, m].argmax())              # corrected (m<K) or bonus (m==K)
+
+        out.extend(drafts[:m] + [extra])
+        keep = pos + m + 1
+        target.rollback(keep)
+        draft.rollback(keep)
+        head = extra
+        pos = keep
+
+        stats["rounds"] += 1
+        stats["accepted"] += m
+        stats["proposed"] += K
+
+    speculative_greedy.last_stats = stats
+    return out[:n_new]
+
+
+# --- in-process implementations (Phase 1 correctness bed) ------------------
+
+class SplitTarget:
+    """Target = embedding + split stages + norm + lm_head, with per-stage KV."""
+
+    def __init__(self, model, stages, device: str = "cpu"):
+        self.embed = model.model.embed_tokens
+        self.norm = model.model.norm
+        self.lm_head = model.lm_head
+        self.stages = stages
+        self.config = model.config
+        self.device = device
+        self.caches = [StageKV(self.config) for _ in stages]
+
+    def kv_len(self) -> int:
+        return self.caches[0].get_seq_length()
+
+    @torch.no_grad()
+    def forward_tokens(self, token_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+        h = self.embed(token_ids)
+        pos = (torch.arange(token_ids.shape[1], device=self.device) + start_pos).unsqueeze(0)
+        for st, c in zip(self.stages, self.caches):
+            h = st.forward(h, pos, past_key_values=c, use_cache=True)
+        return self.lm_head(self.norm(h))
+
+    def rollback(self, length: int) -> None:
+        for c in self.caches:
+            c.truncate_to(length)
+
+
+class GreedyDraft:
+    """Draft = a full model run greedily with its own KV (+ optional perturb)."""
+
+    def __init__(self, model, device: str = "cpu"):
+        self.model = model
+        self.config = model.config
+        self.device = device
+        self.cache = StageKV(self.config)
+
+    def kv_len(self) -> int:
+        return self.cache.get_seq_length()
+
+    @torch.no_grad()
+    def prefill(self, prompt_ids: torch.Tensor) -> None:
+        self.model(prompt_ids, past_key_values=self.cache, use_cache=True)
+
+    @torch.no_grad()
+    def propose(self, head_tok: int, K: int, start_pos: int,
+                perturb: Optional[Callable[[int, int], int]] = None) -> List[int]:
+        assert self.kv_len() == start_pos, (self.kv_len(), start_pos)
+        props: List[int] = []
+        cur = head_tok
+        for i in range(K):
+            logits = self.model(torch.tensor([[cur]], device=self.device),
+                                past_key_values=self.cache, use_cache=True).logits
+            nxt = int(logits[0, -1].argmax())
+            if perturb is not None:
+                nxt = perturb(i, nxt)
+            props.append(nxt)
+            cur = nxt
+        # process the last proposed token so draft KV length == target's (pos+K+1)
+        self.model(torch.tensor([[cur]], device=self.device),
+                   past_key_values=self.cache, use_cache=True)
+        return props
+
+    def rollback(self, length: int) -> None:
+        self.cache.truncate_to(length)

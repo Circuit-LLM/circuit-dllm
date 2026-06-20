@@ -31,6 +31,20 @@ class StageKV(DynamicCache):
                 return sl
         return 0
 
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0):
+        """(kv_length, kv_offset) from the first populated layer.
+
+        create_causal_mask() calls this with layer_idx=0 to size the attention
+        mask. HF's default reads slot 0 — empty on a stage that doesn't own
+        layer 0, so it reports "no past" and builds a wrong-shaped mask (single-
+        token decode survives via SDPA's is-causal skip; multi-token verify does
+        not). Delegating to the first populated layer fixes both.
+        """
+        for layer in self.layers:
+            if layer.get_seq_length():
+                return layer.get_mask_sizes(query_length)
+        return query_length, 0
+
     def reset(self) -> None:
         """Drop all cached state — start a fresh sequence."""
         super().__init__(config=self._config)
