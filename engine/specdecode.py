@@ -73,6 +73,50 @@ def speculative_greedy(target, draft, prompt_ids: torch.Tensor, n_new: int,
     return out[:n_new]
 
 
+@torch.no_grad()
+def speculative_greedy_stream(target, draft, prompt_ids: torch.Tensor, n_new: int,
+                             eos_ids=(), K: int = 4, device: str = "cpu",
+                             draft_perturb: Optional[Callable[[int, int], int]] = None):
+    """Streaming variant of speculative_greedy: a generator that yields each
+    committed token id in order.
+
+    The yielded sequence is byte-for-byte the same tokens speculative_greedy
+    would return (and therefore identical to plain greedy) up to the stop
+    condition. Generation stops at n_new tokens, or as soon as an EOS id is
+    committed — EOS itself is not yielded. The draft only affects speed."""
+    eos = set(eos_ids)
+    logits = target.forward_tokens(prompt_ids, 0)
+    draft.prefill(prompt_ids)
+    head = int(logits[0, -1].argmax())
+    if head in eos:
+        return
+    yield head
+    produced = 1
+    pos = target.kv_len()
+    while produced < n_new:
+        drafts = draft.propose(head, K, pos, perturb=draft_perturb)
+        batch = torch.tensor([[head] + drafts], device=device)
+        tlogits = target.forward_tokens(batch, pos)      # [1, K+1, V]
+        m = 0
+        for j in range(K):
+            if int(tlogits[0, j].argmax()) == drafts[j]:
+                m += 1
+            else:
+                break
+        extra = int(tlogits[0, m].argmax())              # corrected (m<K) or bonus (m==K)
+        committed = drafts[:m] + [extra]
+        keep = pos + m + 1
+        target.rollback(keep)
+        draft.rollback(keep)
+        head = extra                                     # reused as next batch[0], not re-yielded
+        pos = keep
+        for tok in committed:
+            if tok in eos or produced >= n_new:
+                return
+            yield tok
+            produced += 1
+
+
 # --- in-process implementations (Phase 1 correctness bed) ------------------
 
 class SplitTarget:

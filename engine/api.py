@@ -112,7 +112,13 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
             try:
                 with _lock:
-                    for piece in _coord.generate_stream(prompt, max_tokens):
+                    # speculative decode when a draft is loaded (CIRCUIT_DRAFT),
+                    # else plain greedy — same output either way, draft only speeds
+                    # it up by verifying K tokens per pipeline round-trip.
+                    gen = (_coord.generate_speculative_stream(prompt, max_tokens)
+                           if _coord._draft_model is not None
+                           else _coord.generate_stream(prompt, max_tokens))
+                    for piece in gen:
                         chunk = {"id": cid, "object": "chat.completion.chunk",
                                  "created": created, "model": model,
                                  "choices": [{"index": 0, "delta": {"content": piece},

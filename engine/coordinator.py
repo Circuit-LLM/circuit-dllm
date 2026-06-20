@@ -23,7 +23,7 @@ from engine.model import load_model, load_tokenizer, prune_to_layers
 from engine.stage import stage_for_range
 from engine.kv import StageKV
 from engine.stage_worker import KVOP_RESET, KVOP_TRUNCATE
-from engine.specdecode import speculative_greedy, GreedyDraft
+from engine.specdecode import speculative_greedy, speculative_greedy_stream, GreedyDraft
 from engine.log import make_logger
 
 
@@ -229,6 +229,31 @@ class Coordinator:
             draft = GreedyDraft(self._draft_model or self._model, device=self.device)
         out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device)
         return self.tok.decode(out), out
+
+    @torch.no_grad()
+    def generate_speculative_stream(self, prompt: str, n_new: int = 256, K: int = 4):
+        """Streaming speculative decode (yields decoded text incrementally, like
+        generate_stream, but verifies K draft tokens per pipeline round-trip).
+        Output is token-identical to greedy; the draft only affects speed.
+        Requires a separate draft model (the co-located main model is pruned and
+        cannot draft itself)."""
+        if self._draft_model is None:
+            raise RuntimeError("generate_speculative_stream requires a draft model (set CIRCUIT_DRAFT)")
+        self._session += 1
+        sid = self._session
+        ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+        target = SocketTarget(self, sid)
+        draft = GreedyDraft(self._draft_model, device=self.device)
+        produced: List[int] = []
+        prev_text = ""
+        for tid in speculative_greedy_stream(target, draft, ids, n_new,
+                                             eos_ids=self._eos_ids, K=K,
+                                             device=self.device):
+            produced.append(tid)
+            text = self.tok.decode(produced)
+            if len(text) > len(prev_text):
+                yield text[len(prev_text):]
+                prev_text = text
 
     def close(self):
         for s in (self.socks or []):
