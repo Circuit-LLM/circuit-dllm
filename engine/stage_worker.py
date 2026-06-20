@@ -39,10 +39,15 @@ def _position_ids(seq_len: int, start_pos: int, device):
 
 
 def serve(port: int, start: int, end: int, model_id: str, key: bytes,
-          device: str = "cpu", host: str = "0.0.0.0"):
+          device: str = "cpu", host: str = "0.0.0.0",
+          prune: bool = False, keep_head: bool = False):
     log = make_logger(f"stage[{start}:{end}]")
     log("INFO", "loading model", model=model_id, device=device)
     model = load_model(model_id, device=device)
+    if prune:
+        from engine.model import prune_to_layers
+        prune_to_layers(model, start, end, keep_head=keep_head)
+        log("INFO", "pruned to owned layers", keep_head=keep_head)
     stage = stage_for_range(model, start, end)
     config = model.config
     sessions: dict[int, StageKV] = {}
@@ -110,9 +115,14 @@ def main():
     ap.add_argument("--key", required=True, help="64-char hex cluster key")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--prune", action="store_true",
+                    help="free VRAM of layers this stage doesn't own (for big models)")
+    ap.add_argument("--keep-head", action="store_true",
+                    help="keep embed/norm/lm_head (for the coordinator-colocated stage)")
     a = ap.parse_args()
     start, end = (int(x) for x in a.layers.split(":"))
-    serve(a.port, start, end, a.model, wire.normalize_key(a.key), a.device, a.host)
+    serve(a.port, start, end, a.model, wire.normalize_key(a.key), a.device, a.host,
+          prune=a.prune, keep_head=a.keep_head)
 
 
 if __name__ == "__main__":

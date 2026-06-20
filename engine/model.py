@@ -20,3 +20,30 @@ def load_model(model_id: str, dtype=torch.float32, device: str = "cpu"):
 
 def load_tokenizer(model_id: str):
     return AutoTokenizer.from_pretrained(model_id)
+
+
+def prune_to_layers(model, start: int, end: int, keep_head: bool = True):
+    """Free the VRAM of layers/head this stage doesn't own.
+
+    A stage holding layers [start, end) doesn't need the others, and a
+    non-coordinator stage needs neither embedding nor lm_head. We replace the
+    unneeded modules with Identity and empty the CUDA allocator so their weights
+    are freed: peak memory during load is the whole (4-bit) model, steady-state
+    is ~this stage's share — letting two L4s comfortably hold a 32B with KV room.
+
+    The kept layers retain their *global* layer_idx (StageKV handles the offset),
+    so stage_for_range(model, start, end) works unchanged afterward.
+    """
+    import gc
+    inner = model.model
+    for i in range(len(inner.layers)):
+        if not (start <= i < end):
+            inner.layers[i] = torch.nn.Identity()
+    if not keep_head:
+        inner.embed_tokens = torch.nn.Identity()
+        inner.norm = torch.nn.Identity()
+        model.lm_head = torch.nn.Identity()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return model
