@@ -58,6 +58,7 @@ class Coordinator:
         self.log = make_logger("coord")
         self.key = wire.normalize_key(key)
         self.device = device
+        self.model_id = model_id
         self.log("INFO", "loading coordinator parts", model=model_id,
                  local_layers=local_layers, shard=shard)
         self.local_stage = None
@@ -84,6 +85,11 @@ class Coordinator:
         self.embed = model.model.embed_tokens
         self.norm = model.model.norm
         self.lm_head = model.lm_head
+        # stop tokens: the model's generation_config eos (Qwen chat = both
+        # <|im_end|> and <|endoftext|>), falling back to the tokenizer eos
+        gc = getattr(model, "generation_config", None)
+        eos = gc.eos_token_id if (gc and gc.eos_token_id is not None) else self.tok.eos_token_id
+        self._eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         self._draft_model = load_model(draft_model_id, device=device) if draft_model_id else None
         self.socks = []
         for addr in stage_addrs:
@@ -136,14 +142,41 @@ class Coordinator:
         # prefill (pos=0 tells the stages to begin a fresh sequence)
         hidden = self._relay(sid, 0, self.embed(ids))
         nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-        out = [int(nxt)]
+        out = []
         cur = seq
-        for _ in range(n_new - 1):
+        for _ in range(n_new):
+            tid = int(nxt)
+            if tid in self._eos_ids:
+                break
+            out.append(tid)
             hidden = self._relay(sid, cur, self.embed(nxt))
             nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-            out.append(int(nxt))
             cur += 1
         return self.tok.decode(out), out
+
+    @torch.no_grad()
+    def generate_stream(self, prompt: str, n_new: int = 256, stop_on_eos: bool = True):
+        """Greedy decode, yielding decoded text incrementally (for streaming APIs)."""
+        self._session += 1
+        sid = self._session
+        ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+        cur = ids.shape[1]
+        hidden = self._relay(sid, 0, self.embed(ids))
+        nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
+        produced: List[int] = []
+        prev_text = ""
+        for _ in range(n_new):
+            tid = int(nxt)
+            if stop_on_eos and tid in self._eos_ids:
+                break
+            produced.append(tid)
+            text = self.tok.decode(produced)
+            if len(text) > len(prev_text):
+                yield text[len(prev_text):]
+                prev_text = text
+            hidden = self._relay(sid, cur, self.embed(nxt))
+            nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
+            cur += 1
 
     @torch.no_grad()
     def generate_speculative(self, prompt: str, n_new: int = 24, K: int = 4,
