@@ -24,6 +24,7 @@ from engine.stage import split_model  # noqa: E402
 from engine.kv import StageKV  # noqa: E402
 
 MODEL = os.environ.get("CIRCUIT_QUANT_MODEL", "Qwen/Qwen2.5-3B-Instruct")
+PREQUANT = os.environ.get("CIRCUIT_PREQUANT") == "1"  # model is already AWQ/GPTQ
 N_NEW = 30
 PROMPT = "List three facts about the moon:"
 
@@ -61,12 +62,17 @@ def _split_greedy(model, stages, ids, n):
 
 
 def main():
-    print(f"quant split test — {MODEL} (bitsandbytes nf4 4-bit)")
+    kind = "pre-quantized AWQ/GPTQ" if PREQUANT else "bitsandbytes nf4 4-bit"
+    print(f"quant split test — {MODEL} ({kind})")
     tok = AutoTokenizer.from_pretrained(MODEL)
-    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
-                             bnb_4bit_quant_type="nf4")
-    model = AutoModelForCausalLM.from_pretrained(MODEL, quantization_config=bnb,
-                                                 device_map="cuda").eval()
+    if PREQUANT:
+        model = AutoModelForCausalLM.from_pretrained(MODEL, device_map="cuda",
+                                                     dtype=torch.float16).eval()
+    else:
+        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
+                                 bnb_4bit_quant_type="nf4")
+        model = AutoModelForCausalLM.from_pretrained(MODEL, quantization_config=bnb,
+                                                     device_map="cuda").eval()
     vram = torch.cuda.memory_allocated() / 1e9
     nL = model.config.num_hidden_layers
     print(f"  loaded: {nL} layers, {vram:.2f} GB VRAM (4-bit)")
