@@ -20,7 +20,8 @@ import torch
 from engine import wire
 from engine.tensors import pack_activation, unpack_activation
 from engine.model import load_model, load_tokenizer
-from engine.stage_worker import KVOP_RESET
+from engine.stage_worker import KVOP_RESET, KVOP_TRUNCATE
+from engine.specdecode import speculative_greedy, GreedyDraft
 from engine.log import make_logger
 
 
@@ -76,6 +77,11 @@ class Coordinator:
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_RESET, 0))
 
+    def _kv_truncate(self, session: int, length: int):
+        for s in self.socks:
+            wire.write_frame(s, self.key, wire.KV_CTRL,
+                             struct.pack(">IBI", session, KVOP_TRUNCATE, length))
+
     @torch.no_grad()
     def generate(self, prompt: str, n_new: int = 20) -> Tuple[str, List[int]]:
         self._session += 1
@@ -95,6 +101,20 @@ class Coordinator:
             cur += 1
         return self.tok.decode(out), out
 
+    @torch.no_grad()
+    def generate_speculative(self, prompt: str, n_new: int = 24, K: int = 4,
+                             draft=None) -> Tuple[str, List[int]]:
+        """Speculative decode over the socket: local draft proposes, the split
+        stages (over the wire) verify. Output == greedy for any draft."""
+        self._session += 1
+        sid = self._session
+        ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+        target = SocketTarget(self, sid)
+        if draft is None:
+            draft = GreedyDraft(self._model, device=self.device)
+        out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device)
+        return self.tok.decode(out), out
+
     def close(self):
         for s in self.socks:
             try:
@@ -102,3 +122,30 @@ class Coordinator:
                 s.close()
             except OSError:
                 pass
+
+
+class SocketTarget:
+    """Target protocol for speculative_greedy backed by stage workers over the
+    wire. forward_tokens embeds locally, relays the (multi-token) hidden state
+    through the stages, and applies norm + lm_head locally; rollback sends a
+    KV_CTRL truncate to every stage. KV length is tracked locally (the stages
+    track their own; this just mirrors it for the scheduler)."""
+
+    def __init__(self, coord: "Coordinator", session: int):
+        self.coord = coord
+        self.session = session
+        self._kv = 0
+
+    def kv_len(self) -> int:
+        return self._kv
+
+    @torch.no_grad()
+    def forward_tokens(self, token_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+        hidden = self.coord.embed(token_ids)
+        hidden = self.coord._relay(self.session, start_pos, hidden)
+        self._kv = start_pos + token_ids.shape[1]
+        return self.coord.lm_head(self.coord.norm(hidden))
+
+    def rollback(self, length: int) -> None:
+        self.coord._kv_truncate(self.session, length)
+        self._kv = length
