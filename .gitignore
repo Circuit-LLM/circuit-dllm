@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Model weights / caches — never commit
+models/
+*.safetensors
+*.gguf
+.cache/
+hf-cache/
+
+# Logs / runtime
+*.log
+data/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
