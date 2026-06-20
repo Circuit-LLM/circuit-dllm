@@ -19,7 +19,9 @@ import torch
 
 from engine import wire
 from engine.tensors import pack_activation, unpack_activation
-from engine.model import load_model, load_tokenizer
+from engine.model import load_model, load_tokenizer, prune_to_layers
+from engine.stage import stage_for_range
+from engine.kv import StageKV
 from engine.stage_worker import KVOP_RESET, KVOP_TRUNCATE
 from engine.specdecode import speculative_greedy, GreedyDraft
 from engine.log import make_logger
@@ -43,25 +45,52 @@ def _connect(addr: Tuple[str, int], key: bytes, timeout: float = 60.0):
 
 class Coordinator:
     def __init__(self, model_id: str, stage_addrs: List[Tuple[str, int]],
-                 key: bytes, device: str = "cpu"):
+                 key: bytes, device: str = "cpu",
+                 local_layers: Optional[Tuple[int, int]] = None,
+                 draft_model_id: Optional[str] = None):
+        """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
+        so a big model loads once on this pod (layers + head) instead of a
+        coordinator and a stage worker each loading the whole model. The model
+        is pruned to [s,e)+head; remaining layers go to the remote stage workers.
+        draft_model_id: load a separate (small) draft for speculative decode —
+        required when local_layers prunes the model so it can't draft itself."""
         self.log = make_logger("coord")
         self.key = wire.normalize_key(key)
         self.device = device
-        self.log("INFO", "loading coordinator parts", model=model_id)
+        self.log("INFO", "loading coordinator parts", model=model_id, local_layers=local_layers)
         model = load_model(model_id, device=device)
-        self._model = model  # full model retained (its submodules are what we use)
+        self.local_stage = None
+        self._local_caches = {}
+        if local_layers is not None:
+            s, e = local_layers
+            prune_to_layers(model, s, e, keep_head=True)
+            self.local_stage = stage_for_range(model, s, e)
+            self.log("INFO", "co-located stage", layers=f"{s}:{e}")
+        self._model = model
+        self.config = model.config
         self.tok = load_tokenizer(model_id)
         self.embed = model.model.embed_tokens
         self.norm = model.model.norm
         self.lm_head = model.lm_head
+        self._draft_model = load_model(draft_model_id, device=device) if draft_model_id else None
         self.socks = []
         for addr in stage_addrs:
             self.log("INFO", "connecting stage", addr=f"{addr[0]}:{addr[1]}")
             self.socks.append(_connect(addr, self.key))
         self._session = 0
 
+    def _run_local(self, session: int, pos: int, hidden: torch.Tensor) -> torch.Tensor:
+        cache = self._local_caches.get(session)
+        if cache is None or pos == 0:
+            cache = StageKV(self.config)
+            self._local_caches[session] = cache
+        position_ids = (torch.arange(hidden.shape[1], device=self.device) + pos).unsqueeze(0)
+        return self.local_stage.forward(hidden, position_ids, past_key_values=cache, use_cache=True)
+
     def _relay(self, session: int, pos: int, hidden: torch.Tensor) -> torch.Tensor:
-        """Send the hidden state through each stage in order; return the last output."""
+        """Run the co-located stage (if any) then each remote stage in order."""
+        if self.local_stage is not None:
+            hidden = self._run_local(session, pos, hidden)
         for s in self.socks:
             wire.write_frame(s, self.key, wire.ACTIVATION,
                              pack_activation(session, pos, hidden.detach().cpu()))
@@ -73,11 +102,14 @@ class Coordinator:
         return hidden
 
     def _reset_sessions(self, session: int):
+        self._local_caches.pop(session, None)
         for s in self.socks:
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_RESET, 0))
 
     def _kv_truncate(self, session: int, length: int):
+        if session in self._local_caches:
+            self._local_caches[session].truncate_to(length)
         for s in self.socks:
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_TRUNCATE, length))
@@ -111,7 +143,9 @@ class Coordinator:
         ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
         target = SocketTarget(self, sid)
         if draft is None:
-            draft = GreedyDraft(self._model, device=self.device)
+            # use the separate draft model if loaded (the main model may be
+            # pruned for co-located stage 0 and can't draft itself)
+            draft = GreedyDraft(self._draft_model or self._model, device=self.device)
         out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device)
         return self.tok.decode(out), out
 

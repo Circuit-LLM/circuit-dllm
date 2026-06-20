@@ -12,10 +12,16 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def load_model(model_id: str, dtype=torch.float32, device: str = "cpu"):
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
-    model.eval().to(device)
-    return model
+def load_model(model_id: str, dtype=None, device: str = "cpu"):
+    # GPU: fp16 + device_map (required for quantized AWQ/GPTQ — can't .to() after
+    # load). CPU: fp32 + .to(). dtype defaults by device unless overridden.
+    if dtype is None:
+        dtype = torch.float16 if device != "cpu" else torch.float32
+    if device == "cpu":
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map=device)
+    return model.eval()
 
 
 def load_tokenizer(model_id: str):

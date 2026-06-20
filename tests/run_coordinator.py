@@ -29,11 +29,17 @@ PROMPT = os.environ.get("CIRCUIT_PROMPT", "The capital of France is")
 N = int(os.environ.get("CIRCUIT_N", "20"))
 DEVICE = os.environ.get("CIRCUIT_DEVICE", "cuda")
 SPEC = os.environ.get("CIRCUIT_SPEC") == "1"
+# CIRCUIT_LOCAL_LAYERS="0:32" runs those layers in-process (co-located stage 0)
+_ll = os.environ.get("CIRCUIT_LOCAL_LAYERS")
+LOCAL_LAYERS = tuple(int(x) for x in _ll.split(":")) if _ll else None
+DRAFT = os.environ.get("CIRCUIT_DRAFT") or None
 
 
 def main():
-    print(f"coordinator: model={MODEL} stages={STAGES} device={DEVICE} spec={SPEC}")
-    coord = Coordinator(MODEL, STAGES, KEY, device=DEVICE)
+    print(f"coordinator: model={MODEL} stages={STAGES} device={DEVICE} "
+          f"local={LOCAL_LAYERS} spec={SPEC}")
+    coord = Coordinator(MODEL, STAGES, KEY, device=DEVICE,
+                        local_layers=LOCAL_LAYERS, draft_model_id=DRAFT)
     t0 = time.time()
     if SPEC:
         text, toks = coord.generate_speculative(PROMPT, N)
