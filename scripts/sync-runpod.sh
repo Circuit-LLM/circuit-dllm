@@ -13,7 +13,10 @@ KEY=/home/watchtower/.ssh/id_ed25519
 REMOTE=/workspace/circuit-engine
 LOCAL="$(cd "$(dirname "$0")/.." && pwd)/"
 
-PORT="$(grep -A1 'Current SSH port' /home/watchtower/runpod.md | grep -oE '^[0-9]{4,6}' | head -1)"
+# The port sits inside a ``` code fence under "### Current SSH port", so scan a
+# few lines down and match digits anywhere. `|| true` so a miss hits the guard
+# below instead of tripping `set -e` silently.
+PORT="$(grep -A3 'Current SSH port' /home/watchtower/runpod.md | grep -oE '[0-9]{4,6}' | head -1 || true)"
 [ -n "$PORT" ] || { echo "could not read SSH port from runpod.md" >&2; exit 1; }
 SSH="ssh -p $PORT -i $KEY -o StrictHostKeyChecking=no -o ConnectTimeout=8"
 
