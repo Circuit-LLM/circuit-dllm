@@ -100,10 +100,14 @@ class Handler(BaseHTTPRequestHandler):
         log("INFO", "request", stream=stream, max_tokens=max_tokens, msgs=len(messages))
 
         if stream:
+            # un-chunked SSE has no length/chunk end-signal, so close the socket
+            # when done — otherwise keep-alive leaves the client hanging after the
+            # last token (never re-enabling input).
+            self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
             self.end_headers()
             n = 0
             try:
