@@ -79,6 +79,13 @@ class Stage:
         return hidden
 
 
+def stage_for_range(model, start: int, end: int) -> Stage:
+    """Build a single Stage holding global layers [start, end) of `model`."""
+    inner = model.model
+    idxs = list(range(start, end))
+    return Stage([inner.layers[i] for i in idxs], idxs, inner.rotary_emb, model.config)
+
+
 def split_model(model, boundaries: List[int]) -> List[Stage]:
     """
     Split a loaded Qwen2ForCausalLM into Stages by layer-index boundaries.
