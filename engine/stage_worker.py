@@ -71,7 +71,7 @@ def _serve_conn(conn, addr, key, stage, config, device, compute_lock, log):
 def serve(port: int, start: int, end: int, model_id: str, key: bytes,
           device: str = "cpu", host: str = "0.0.0.0",
           prune: bool = False, keep_head: bool = False,
-          shard: bool = False, other_device: str = "cpu"):
+          shard: bool = False, other_device: str = "cpu", on_listening=None):
     log = make_logger(f"stage[{start}:{end}]")
     log("INFO", "loading model", model=model_id, device=device, shard=shard)
     if shard:
@@ -96,6 +96,8 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
     srv.bind((host, port))
     srv.listen(16)
     log("INFO", "listening", port=port)
+    if on_listening is not None:       # control-client mode flips JOINING -> READY here
+        on_listening()
 
     # One handler thread per peer. A stalled or half-open peer (e.g. the
     # coordinator pod restarting and its old socket lingering through the RunPod
@@ -149,12 +151,77 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock):
             return
 
 
+# ── control-client mode: join a coordinator's mesh over HTTP ──────────────────
+
+def _control_post(url, obj, timeout=10):
+    import json as _json
+    import urllib.request as _u
+    data = _json.dumps(obj).encode()
+    req = _u.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with _u.urlopen(req, timeout=timeout) as r:
+        return r.status, _json.loads(r.read())
+
+
+def run_control_client(a):
+    """Join a coordinator's mesh: register over the control channel, receive an
+    assigned layer range + a per-node key, then serve those layers with that key
+    while heartbeating. Heartbeats start immediately (so the JOINING node isn't
+    reaped during the weight load); /ready flips it to READY once listening; /drain
+    on exit."""
+    clog = make_logger("node")
+    base = a.control_url.rstrip("/")
+    advertise = a.advertise_host or ("127.0.0.1" if a.host in ("0.0.0.0", "") else a.host)
+
+    code, resp = _control_post(base + "/register", {
+        "node_id": a.node_id,
+        "endpoint": [advertise, a.port],
+        "capacity_layers": a.capacity_layers,
+        "model_fp": a.model_fp,
+        "reachability": "public",
+        "payout_wallet": a.payout_wallet or "",
+    })
+    if code != 200:
+        raise SystemExit(f"register rejected ({code}): {resp}")
+    start, end = resp["assignment"]["start"], resp["assignment"]["end"]
+    key = wire.normalize_key(bytes.fromhex(resp["session_key"]))
+    clog("INFO", "joined mesh", node=a.node_id[:12], layers=f"{start}:{end}",
+         coordinator=resp.get("coordinator"))
+
+    stop = threading.Event()
+
+    def _heartbeat():
+        while not stop.is_set():
+            try:
+                _control_post(base + "/heartbeat", {"node_id": a.node_id}, timeout=5)
+            except Exception:
+                pass
+            stop.wait(a.hb_interval)
+
+    threading.Thread(target=_heartbeat, daemon=True).start()
+
+    def _on_listening():
+        try:
+            _control_post(base + "/ready", {"node_id": a.node_id}, timeout=5)
+            clog("INFO", "ready (serving)")
+        except Exception as e:
+            clog("WARN", "ready post failed", error=str(e))
+
+    try:
+        serve(a.port, start, end, a.model, key, device=a.device, host=a.host,
+              prune=a.prune, shard=a.shard, other_device=a.other_device,
+              on_listening=_on_listening)
+    finally:
+        stop.set()
+        try:
+            _control_post(base + "/drain", {"node_id": a.node_id}, timeout=5)
+        except Exception:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--layers", required=True, help="START:END (e.g. 0:12)")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--key", required=True, help="64-char hex cluster key")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--prune", action="store_true",
@@ -165,7 +232,29 @@ def main():
                     help="where non-owned modules go under --shard (cpu or meta)")
     ap.add_argument("--keep-head", action="store_true",
                     help="keep embed/norm/lm_head (for the coordinator-colocated stage)")
+    # ── static mode: a fixed layer range + the shared cluster key ──
+    ap.add_argument("--layers", help="START:END for static mode (e.g. 0:12)")
+    ap.add_argument("--key", help="64-char hex cluster key for static mode")
+    # ── control-client mode: join a coordinator's mesh; receive layers + a per-node key ──
+    ap.add_argument("--control-url", help="join the mesh via this coordinator control URL")
+    ap.add_argument("--node-id", help="this node's id (ed25519 pubkey hex)")
+    ap.add_argument("--capacity-layers", type=int, default=999,
+                    help="max contiguous layers this node can hold")
+    ap.add_argument("--model-fp", default="", help="fingerprint of the model this node loads")
+    ap.add_argument("--advertise-host", default="",
+                    help="host the coordinator dials to reach this node (defaults to --host)")
+    ap.add_argument("--payout-wallet", default="", help="where CIRC earnings settle")
+    ap.add_argument("--hb-interval", type=float, default=10.0)
     a = ap.parse_args()
+
+    if a.control_url:
+        if not a.node_id:
+            ap.error("--node-id is required with --control-url")
+        run_control_client(a)
+        return
+
+    if not a.layers or not a.key:
+        ap.error("--layers and --key are required in static mode (or use --control-url)")
     start, end = (int(x) for x in a.layers.split(":"))
     serve(a.port, start, end, a.model, wire.normalize_key(a.key), a.device, a.host,
           prune=a.prune, keep_head=a.keep_head, shard=a.shard, other_device=a.other_device)
