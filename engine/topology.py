@@ -1,0 +1,187 @@
+"""
+topology.py — the live source of truth for the pipeline mesh.
+
+Maps the model's transformer layers to the nodes that hold them, with replication,
+and answers the two questions the coordinator needs at runtime:
+
+  1. routing — for each pipeline stage, which healthy node serves it (+ fallbacks
+     for failover)?
+  2. health  — is the model fully covered, and which slots need more replicas?
+
+Pure logic: no torch, no sockets, no I/O. The same code drives the coordinator's
+per-token routing and the control service's (re)assignment, and it is unit- and
+chaos-testable without GPUs (see tests/test_topology.py).
+
+Model: the layers the coordinator does NOT hold — `[coordinator_end, num_layers)` —
+are split into `num_stages` contiguous, fixed SLOTS. Each slot needs `replication`
+healthy holders. A node is assigned to exactly one slot. Routing walks the slots in
+order and picks a healthy holder per slot; if a holder dies, the next healthy holder
+of that slot takes over (failover). The **coverage invariant** — every slot has at
+least one healthy holder — is the liveness condition for the whole mesh.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+# ── node states ──────────────────────────────────────────────────────────────
+JOINING = "joining"    # registered + assigned, still downloading its layer weights
+READY = "ready"        # weights loaded, serving (the only state we route NEW work to)
+SUSPECT = "suspect"    # missed a heartbeat / a request to it failed — transient
+DEAD = "dead"          # stably gone (past dead_after_s) — its slot may be reassigned
+DRAINING = "draining"  # leaving cleanly: finishes in-flight, takes no new sessions
+
+_ROUTABLE = (READY,)   # only READY nodes receive sessions / count toward coverage
+
+
+@dataclass
+class Node:
+    node_id: str                 # ed25519 pubkey (operator identity)
+    endpoint: Tuple              # ("host", port) for public, ("relay", relay_id) for NAT
+    capacity_layers: int         # how many contiguous layers it can hold (VRAM-derived)
+    model_fp: str                # fingerprint of the model the node loaded
+    reachability: str = "public" # public | relay
+    payout_wallet: str = ""       # where CIRC earnings settle
+    slot: Optional[int] = None    # assigned slot index
+    state: str = JOINING
+    last_hb: float = 0.0          # last heartbeat timestamp
+
+
+@dataclass
+class Slot:
+    index: int
+    start: int                            # layer range [start, end)
+    end: int
+    holders: List[str] = field(default_factory=list)  # node_ids assigned here
+
+
+class Topology:
+    def __init__(self, num_layers: int, coordinator_end: int, num_stages: int,
+                 model_fp: str, replication: int = 2, dead_after_s: float = 30.0):
+        if num_stages < 1:
+            raise ValueError("num_stages must be >= 1")
+        if not (0 <= coordinator_end < num_layers):
+            raise ValueError("coordinator_end must be in [0, num_layers)")
+        self.num_layers = num_layers
+        self.coordinator_end = coordinator_end
+        self.model_fp = model_fp
+        self.replication = replication
+        self.dead_after_s = dead_after_s
+        self.nodes: Dict[str, Node] = {}
+        # fixed contiguous slots over [coordinator_end, num_layers)
+        per = (num_layers - coordinator_end) // num_stages
+        self.slots: List[Slot] = []
+        s = coordinator_end
+        for i in range(num_stages):
+            e = num_layers if i == num_stages - 1 else s + per
+            self.slots.append(Slot(i, s, e))
+            s = e
+
+    def _slot_size(self, slot: Slot) -> int:
+        return slot.end - slot.start
+
+    def _ready_count(self, slot: Slot) -> int:
+        return sum(1 for h in slot.holders
+                   if h in self.nodes and self.nodes[h].state in _ROUTABLE)
+
+    # ── registration / assignment ────────────────────────────────────────────
+    def register(self, node: Node, now: float = 0.0) -> Slot:
+        """Admit a node and assign it the slot that needs replicas most and that it
+        has the capacity to hold. Raises on model mismatch / insufficient capacity."""
+        if node.model_fp != self.model_fp:
+            raise ValueError(f"model mismatch: node {node.model_fp!r} != mesh {self.model_fp!r}")
+        slot = self._pick_slot(node)
+        if slot is None:
+            raise ValueError("no slot this node can hold (capacity_layers too small)")
+        node.slot = slot.index
+        node.state = JOINING
+        node.last_hb = now
+        self.nodes[node.node_id] = node
+        slot.holders.append(node.node_id)
+        return slot
+
+    def _pick_slot(self, node: Node) -> Optional[Slot]:
+        cands = [s for s in self.slots if node.capacity_layers >= self._slot_size(s)]
+        if not cands:
+            return None
+        # most under-replicated first (fewest READY holders), tie-break by index
+        cands.sort(key=lambda s: (self._ready_count(s), s.index))
+        return cands[0]
+
+    # ── health ───────────────────────────────────────────────────────────────
+    def heartbeat(self, node_id: str, now: float) -> None:
+        n = self.nodes.get(node_id)
+        if n and n.state in (JOINING, READY, SUSPECT, DRAINING):
+            n.last_hb = now
+            if n.state == SUSPECT:          # a heartbeat clears a transient suspicion
+                n.state = READY
+
+    def mark_ready(self, node_id: str) -> None:
+        """Node finished downloading its layers and is serving."""
+        n = self.nodes.get(node_id)
+        if n and n.state == JOINING:
+            n.state = READY
+
+    def mark_suspect(self, node_id: str) -> None:
+        """A request to the node failed, or a beat was missed — don't route to it
+        until it recovers (heartbeat) or is reaped (dead)."""
+        n = self.nodes.get(node_id)
+        if n and n.state == READY:
+            n.state = SUSPECT
+
+    def drain(self, node_id: str) -> None:
+        n = self.nodes.get(node_id)
+        if n:
+            n.state = DRAINING
+
+    def reap(self, now: float) -> List[str]:
+        """Promote nodes silent past dead_after_s to DEAD (churn damping — only a
+        stably-gone node frees its slot). Returns the node_ids newly marked dead."""
+        dead = []
+        for n in self.nodes.values():
+            if n.state in (JOINING, READY, SUSPECT) and now - n.last_hb > self.dead_after_s:
+                n.state = DEAD
+                dead.append(n.node_id)
+        return dead
+
+    def remove(self, node_id: str) -> None:
+        n = self.nodes.pop(node_id, None)
+        if n and n.slot is not None and node_id in self.slots[n.slot].holders:
+            self.slots[n.slot].holders.remove(node_id)
+
+    # ── routing ──────────────────────────────────────────────────────────────
+    def holders(self, slot_index: int) -> List[Node]:
+        """Routable holders for a slot, primary first (freshest heartbeat). The
+        first is the primary; the rest are failover fallbacks for this session."""
+        slot = self.slots[slot_index]
+        live = [self.nodes[h] for h in slot.holders
+                if h in self.nodes and self.nodes[h].state in _ROUTABLE]
+        live.sort(key=lambda n: -n.last_hb)
+        return live
+
+    def route(self) -> List[Tuple[Slot, List[Node]]]:
+        """The full pipeline: each slot in order with its ordered routable holders.
+        Raises if ANY slot is uncovered — enforces the coverage invariant (a routing
+        with a hole would silently corrupt inference, so we refuse it)."""
+        plan = []
+        for slot in self.slots:
+            hs = self.holders(slot.index)
+            if not hs:
+                raise RuntimeError(
+                    f"coverage gap: slot {slot.index} (layers {slot.start}:{slot.end}) "
+                    f"has no healthy holder — model not fully covered")
+            plan.append((slot, hs))
+        return plan
+
+    # ── health summary (for the control service / re-balancer) ────────────────
+    def coverage_ok(self) -> bool:
+        return all(self.holders(s.index) for s in self.slots)
+
+    def under_replicated(self) -> List[Slot]:
+        return [s for s in self.slots if len(self.holders(s.index)) < self.replication]
+
+    def rebalance_targets(self) -> List[Slot]:
+        """Slots needing another holder, most-urgent first (uncovered before merely
+        under-replicated). The control service assigns new joiners to these."""
+        return sorted(self.under_replicated(), key=lambda s: len(self.holders(s.index)))

@@ -271,3 +271,80 @@ control plane, the shard-loader, and tonight's fault-tolerance groundwork. **Pha
 **The single most important thing to build first is Phase 2 (fault tolerance)** —
 the moment an outside node enters a series-circuit chain, reliability *is* the
 product.
+
+---
+
+## 13. Holistic review — gaps & invariants the first draft missed
+
+A second pass found these. Several are correctness-critical (get them wrong and
+inference returns garbage or stalls), not nice-to-haves.
+
+1. **Build order vs. priority.** "Build Phase 2 first" is about *importance*, but
+   replication/failover **runs on top of** the Phase-1 foundation (the dynamic
+   `Topology` + control service). Actual build order: **Phase-1 foundation →
+   Phase-2 reliability**. You can't fail over to a replica you have no way to
+   register and assign.
+
+2. **Model/version consistency (correctness-critical).** Every node in a pipeline
+   must run the **identical model — same weights, quantization, layer count,
+   tokenizer**. A joiner on a different model/version produces hidden states the
+   next stage misinterprets → silent garbage, no error. → The assignment carries a
+   **model fingerprint** (e.g. HF revision + quant + dtype hash); a node that can't
+   match it is rejected at registration.
+
+3. **Complete-coverage invariant (the liveness condition).** At every instant, the
+   set of *healthy* holders must cover `[coordinator_end, L)` **with no gap**.
+   A single uncovered layer = generation is impossible. Re-balancing/failover must
+   **never** leave a gap, even transiently; coverage is the property the whole mesh
+   lives or dies on. The `Topology` must be able to answer `coverage_ok()` at all
+   times and refuse to admit a routing that has a hole.
+
+4. **Two different trust questions — don't conflate them.** *Did the node do the
+   work?* is **coordinator-authoritative** — the coordinator routed the request, so
+   it knows exactly who served which layers; attribution (§8) is un-gameable without
+   any verification. *Did it do the work correctly?* is §9 (verification). Phase 3
+   (earning) only needs the first; Phase 5 (permissionless) needs the second.
+
+5. **Session affinity.** A generation session must **stick to the same holders**
+   for its lifetime (their KV is warm). Failover (re-prefill, §6) is the *exception*
+   path on a node death — not the normal one. Routing is per-session-sticky, not
+   per-token-random.
+
+6. **The coordinator is a special, central node — be honest about it.** It holds
+   `embed` + `lm_head` + the draft + the orchestration loop. In the permissioned
+   model it's **operator-run**; joiners take the middle/late *stages*. So this is
+   "**decentralized compute, coordinated orchestration**," not a flat p2p network.
+   Distributing/replicating the coordinator itself is a separate, harder problem
+   (leader election / stateless coordinators behind the gateway) — out of scope for
+   Phases 1–4, noted for later.
+
+7. **Weight distribution + provisioning latency.** A joiner needs the weights for
+   its assigned layers (~a stage's share = several GB to ~19 GB). Specify the
+   **source** (HF mirror / a Circuit weight server / P2P) and note that a node is
+   **not READY until its download completes** — provisioning is part of the
+   lifecycle, not instant. The shard-loader lets a node fetch *only* its range.
+
+8. **Churn damping (or the mesh thrashes).** Don't re-balance on every flap. Require
+   a node to be **stably DEAD** (missed K heartbeats over a window) before
+   reassigning its slot, and put a **cool-down** on re-balancing. Otherwise a
+   flickering node triggers endless re-assign + re-prefill storms.
+
+9. **The relay preserves end-to-end encryption.** The data wire is encrypted
+   coordinator↔node; a relay (for NAT'd nodes) only **multiplexes ciphertext** — it
+   never sees plaintext activations. The relay is itself a dependency for NAT nodes,
+   so it must be **redundant**.
+
+10. **Rolling upgrades.** Updating the model or engine across a heterogeneous mesh
+    without a full outage: version-tag the topology, **drain-and-replace** a stage's
+    holders one at a time, never mixing model versions within one pipeline.
+
+11. **Chaos testing is the only way to trust fault tolerance.** Build a **local
+    multi-node simulator** and **kill nodes mid-request** in CI. Failover code that
+    isn't chaos-tested is failover code that doesn't work. (This is where we start
+    below — the `Topology` is pure logic precisely so it's unit- and chaos-testable
+    without GPUs.)
+
+**Net:** the foundation to build first is the **`Topology` model + a control
+service** (registration → assignment → health → coverage/rebalance), with the
+**coverage invariant** and **model fingerprint** enforced from day one. Everything
+else — failover, attribution, relay — hangs off that. Starting there.
