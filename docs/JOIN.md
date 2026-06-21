@@ -348,3 +348,62 @@ inference returns garbage or stalls), not nice-to-haves.
 service** (registration → assignment → health → coverage/rebalance), with the
 **coverage invariant** and **model fingerprint** enforced from day one. Everything
 else — failover, attribution, relay — hangs off that. Starting there.
+
+---
+
+## 14. Build status & operator runbook (what's shipped)
+
+**Phases 1 & 2 are built, tested, and committed.** The control plane is library code
+that the live coordinator mounts behind a flag — `CIRCUIT_MESH=1`. With the flag
+unset the engine runs the original static path **byte-identically** (every change is
+gated and regression-tested), so turning the mesh on is a deliberate, reversible op.
+
+| Piece | Module | Test |
+|---|---|---|
+| Topology (slots, coverage invariant, holders, failover order, churn damping) | `engine/topology.py` | `test_topology` |
+| Registry (admission + model-fp, per-node derived keys, session-affine `route_snapshot`, thread-safe, attribution ledger) | `engine/registry.py` | `test_registry` |
+| Dynamic routing (session-pinned) + **mid-session failover + re-prefill** | `engine/coordinator.py` | `test_dynamic_relay`, **`test_failover`** |
+| HTTP control channel (register/ready/heartbeat/drain, ed25519, reaper) | `engine/control_server.py` | `test_control_channel` |
+| Stage-worker **control client** (join over the network) | `engine/stage_worker.py` | `test_node_join` |
+| **Mounted on the live API**, gated | `engine/api.py` | `test_mesh_api` |
+
+**Not yet built:** on-chain payout job (Phase 3 settlement — the ledger accrues, but
+`settle()` isn't wired to Token-2022 transfers yet); NAT relay (Phase 4);
+stake/redundant-compute verification (Phase 5); speculative-decode failover (greedy
+paths have it). Re-prefill on failover is *reset-all-stages + replay the sequence* —
+correct but O(sequence) on a death; fine while deaths are rare, optimize later.
+
+### Enable the mesh on a coordinator
+
+Set on the coordinator (alongside the usual `CIRCUIT_MODEL` / `CIRCUIT_KEY` /
+`CIRCUIT_LOCAL_LAYERS`):
+
+| Env | Meaning |
+|---|---|
+| `CIRCUIT_MESH=1` | turn the control plane on (default off) |
+| `CIRCUIT_MESH_LAYERS` | total model layers (e.g. `64`) |
+| `CIRCUIT_MESH_STAGES` | how many slots cover `[coordinator_end, LAYERS)` |
+| `CIRCUIT_MESH_FP` | model fingerprint a joiner must match |
+| `CIRCUIT_MESH_REPLICATION` | holders per slot (`R≥2` enables failover) |
+| `CIRCUIT_MESH_ALLOWLIST` | comma-sep node-ids; empty = open (private net) |
+| `CIRCUIT_MESH_SECRET` | hex master secret for per-node key derivation (defaults to `CIRCUIT_KEY`) |
+| `CIRCUIT_CONTROL_PORT` / `_HOST` | control channel bind (default `18932`/`0.0.0.0`) |
+| `CIRCUIT_MESH_VERIFY_SIG=1` | require ed25519 proof-of-key at registration |
+| `CIRCUIT_MESH_DEAD_AFTER` / `CIRCUIT_REAP_INTERVAL` | churn damping (s) |
+
+`coordinator_end` is taken from `CIRCUIT_LOCAL_LAYERS` (the co-located stage); the
+coordinator co-locates `[0, coordinator_end)` and the mesh serves the rest. `/health`
+and `/v1/workers` report the live topology when mesh mode is on.
+
+### Join as a node
+
+```
+python3 -m engine.stage_worker \
+  --control-url http://<coordinator>:18932 --node-id <ed25519-pubkey-hex> \
+  --model <same as coordinator> --model-fp <CIRCUIT_MESH_FP> \
+  --capacity-layers <N> --advertise-host <reachable-host> --device cuda
+```
+
+The node registers, receives a layer range + a derived per-node key, downloads/loads
+those layers, serves, and heartbeats; it posts `/drain` on exit. No coordinator
+config edit required — that's the whole point.
