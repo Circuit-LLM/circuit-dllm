@@ -28,6 +28,14 @@ from engine.specdecode import speculative_greedy, speculative_greedy_stream, Gre
 from engine.log import make_logger
 
 
+# Failover must fail FAST: a routed mesh holder is already READY (it posted /ready
+# after loading), so a healthy node connects instantly. Reaching a dead replica must
+# not block on the long startup-wait below — abandon it in seconds and fail over /
+# surface the coverage gap. (Startup, where a stage is still loading, keeps the long
+# wait via _ensure_connected.)
+_DYNAMIC_CONNECT_TIMEOUT = 8.0
+
+
 def _connect(addr: Tuple[str, int], key: bytes, timeout: float = 180.0):
     """Connect to a stage worker, retrying until it's up (it loads a model first)."""
     host, port = addr
@@ -181,7 +189,10 @@ class Coordinator:
         sock = self._conns.get(node.node_id)
         if sock is None:
             host, port = node.endpoint
-            sock = _connect((host, int(port)), self._node_key(node), timeout=300.0)
+            # short timeout — a routed holder is READY, so this connects instantly;
+            # a dead one must fail fast so failover can move on (not hang ~300s).
+            sock = _connect((host, int(port)), self._node_key(node),
+                            timeout=_DYNAMIC_CONNECT_TIMEOUT)
             self._conns[node.node_id] = sock
         return sock
 
