@@ -32,8 +32,10 @@ _coord: Coordinator = None
 _lock = threading.Lock()
 
 
-def _build_coordinator() -> Coordinator:
+def _build_coordinator(registry=None) -> Coordinator:
     key = bytes.fromhex(os.environ["CIRCUIT_KEY"])
+    # In mesh mode the stage list comes from the registry (live holders), not the
+    # static CIRCUIT_STAGES env — so it's empty there. The static path is unchanged.
     stages = [(h, int(p)) for h, p in
               (a.split(":") for a in os.environ.get("CIRCUIT_STAGES", "").split(",") if a)]
     ll = os.environ.get("CIRCUIT_LOCAL_LAYERS")
@@ -45,7 +47,49 @@ def _build_coordinator() -> Coordinator:
         draft_model_id=os.environ.get("CIRCUIT_DRAFT") or None,
         shard=os.environ.get("CIRCUIT_SHARD") == "1",
         other_device=os.environ.get("CIRCUIT_OTHER_DEVICE", "cpu"),
+        registry=registry,
     )
+
+
+def _build_mesh():
+    """Build the mesh control plane (Topology + Registry) from env — GATED on
+    CIRCUIT_MESH=1. Returns (registry, host, port, reap_interval, verify_sig), or
+    None when mesh mode is off (the live default → static path entirely untouched).
+
+    The coordinator runs its co-located stage over layers [0, coordinator_end) and
+    the mesh covers [coordinator_end, CIRCUIT_MESH_LAYERS) across CIRCUIT_MESH_STAGES
+    slots; joined nodes register, get a slot + a derived per-node key, and serve."""
+    if os.environ.get("CIRCUIT_MESH") != "1":
+        return None
+    from engine.topology import Topology
+    from engine.registry import Registry
+
+    ll = os.environ.get("CIRCUIT_LOCAL_LAYERS")
+    coordinator_end = int(ll.split(":")[1]) if ll else 0
+    layers = int(os.environ["CIRCUIT_MESH_LAYERS"])
+    n_stages = int(os.environ.get("CIRCUIT_MESH_STAGES", "1"))
+    fp = os.environ.get("CIRCUIT_MESH_FP", "")
+    repl = int(os.environ.get("CIRCUIT_MESH_REPLICATION", "1"))
+    dead_after = float(os.environ.get("CIRCUIT_MESH_DEAD_AFTER", "30"))
+    # a distinct mesh secret is best; fall back to the cluster key for a private net
+    secret = bytes.fromhex(os.environ.get("CIRCUIT_MESH_SECRET") or os.environ["CIRCUIT_KEY"])
+    allow = os.environ.get("CIRCUIT_MESH_ALLOWLIST", "").strip()
+    allowlist = {x.strip() for x in allow.split(",") if x.strip()} or None   # None = open
+    host = os.environ.get("CIRCUIT_CONTROL_HOST", "0.0.0.0")
+    port = int(os.environ.get("CIRCUIT_CONTROL_PORT", "18932"))
+    reap = float(os.environ.get("CIRCUIT_REAP_INTERVAL", "10"))
+    coord_ep = (os.environ.get("CIRCUIT_COORDINATOR_ADVERTISE", host), port)
+
+    topo = Topology(num_layers=layers, coordinator_end=coordinator_end,
+                    num_stages=n_stages, model_fp=fp, replication=repl,
+                    dead_after_s=dead_after)
+    reg = Registry(topo=topo, master_secret=secret, coordinator_endpoint=coord_ep,
+                   allowlist=allowlist)
+    verify_sig = None
+    if os.environ.get("CIRCUIT_MESH_VERIFY_SIG") == "1":
+        from engine.control_server import make_ed25519_verifier
+        verify_sig = make_ed25519_verifier()
+    return reg, host, port, reap, verify_sig
 
 
 def _prompt_from_messages(messages, tools=None):
@@ -99,15 +143,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            n_remote = len(_coord._stage_addrs)
-            n_stages = n_remote + (1 if _coord.local_stage is not None else 0)
-            self._json(200, {"status": "ok", "model": _coord.model_id,
-                             "stages": n_stages, "remote_stages": n_remote})
+            if _coord._dynamic:                       # mesh mode: report the live topology
+                snap = _coord.registry.snapshot()
+                self._json(200, {"status": "ok", "model": _coord.model_id, "mesh": True,
+                                 "stages": len(snap["slots"]),
+                                 "coverage_ok": snap["coverage_ok"]})
+            else:
+                n_remote = len(_coord._stage_addrs)
+                n_stages = n_remote + (1 if _coord.local_stage is not None else 0)
+                self._json(200, {"status": "ok", "model": _coord.model_id, "mesh": False,
+                                 "stages": n_stages, "remote_stages": n_remote})
         elif self.path == "/v1/models":
             self._json(200, {"object": "list", "data": [
                 {"id": _coord.model_id, "object": "model", "owned_by": "circuit"}]})
         elif self.path == "/v1/workers":
-            self._json(200, {"workers": _coord.stage_topology()})
+            # in mesh mode the holders come from the live registry, not the static list
+            workers = _coord.registry.snapshot() if _coord._dynamic else _coord.stage_topology()
+            self._json(200, {"workers": workers})
         else:
             self._json(404, {"error": "not found"})
 
@@ -192,11 +244,23 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global _coord
     log("INFO", "loading engine", model=os.environ.get("CIRCUIT_MODEL"))
-    _coord = _build_coordinator()
+    mesh = _build_mesh()                       # None unless CIRCUIT_MESH=1
+    _coord = _build_coordinator(registry=mesh[0] if mesh else None)
+
+    if mesh:
+        from engine.control_server import make_server
+        reg, chost, cport, reap, verify_sig = mesh
+        csrv = make_server(reg, host=chost, port=cport, reap_interval=reap,
+                           verify_sig=verify_sig)
+        threading.Thread(target=csrv.serve_forever, daemon=True).start()
+        log("INFO", "mesh control channel up — nodes may join", port=cport,
+            stages=len(reg.topo.slots), replication=reg.topo.replication,
+            allowlisted=(reg.allowlist is not None))
+
     port = int(os.environ.get("CIRCUIT_API_PORT", "18931"))
     host = os.environ.get("CIRCUIT_API_HOST", "0.0.0.0")
     srv = ThreadingHTTPServer((host, port), Handler)
-    log("INFO", "API ready", port=port, model=_coord.model_id)
+    log("INFO", "API ready", port=port, model=_coord.model_id, mesh=bool(mesh))
     srv.serve_forever()
 
 
