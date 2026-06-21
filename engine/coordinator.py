@@ -60,6 +60,9 @@ class Coordinator:
         self.device = device
         self.model_id = model_id
         self._local_range = local_layers
+        # cumulative speculative-decode counters (observability — see spec_stats()).
+        # Single-stream (one generation at a time under the API lock), so plain ints.
+        self._spec = {"calls": 0, "rounds": 0, "accepted": 0, "proposed": 0}
         self.log("INFO", "loading coordinator parts", model=model_id,
                  local_layers=local_layers, shard=shard)
         self.local_stage = None
@@ -359,7 +362,9 @@ class Coordinator:
                 # use the separate draft model if loaded (the main model may be
                 # pruned for co-located stage 0 and can't draft itself)
                 draft = GreedyDraft(self._draft_model or self._model, device=self.device)
-            out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device)
+            self._spec["calls"] += 1
+            out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device,
+                                     stats=self._spec)
             return self.tok.decode(out), out
         finally:
             self._reset_sessions(sid)
@@ -381,9 +386,10 @@ class Coordinator:
             draft = GreedyDraft(self._draft_model, device=self.device)
             produced: List[int] = []
             prev_text = ""
+            self._spec["calls"] += 1
             for tid in speculative_greedy_stream(target, draft, ids, n_new,
                                                  eos_ids=self._eos_ids, K=K,
-                                                 device=self.device):
+                                                 device=self.device, stats=self._spec):
                 produced.append(tid)
                 text = self.tok.decode(produced)
                 if len(text) > len(prev_text):
@@ -391,6 +397,22 @@ class Coordinator:
                     prev_text = text
         finally:
             self._reset_sessions(sid)
+
+    def spec_stats(self) -> dict:
+        """Cumulative speculative-decode health since start. `acceptance_rate` is the
+        fraction of proposed draft tokens the target accepted (healthy ~0.5–0.8 for a
+        good draft); `tokens_per_round` is mean tokens committed per pipeline pass
+        (1.0 = draft never helps, K+1 = always perfect). A draft silently going bad
+        shows up here as acceptance collapsing toward 0 / tokens_per_round toward 1."""
+        s = self._spec
+        proposed, rounds = s["proposed"], s["rounds"]
+        return {
+            "calls": s["calls"], "rounds": rounds,
+            "draft_tokens_proposed": proposed,
+            "draft_tokens_accepted": s["accepted"],
+            "acceptance_rate": round(s["accepted"] / proposed, 3) if proposed else None,
+            "tokens_per_round": round((s["accepted"] + rounds) / rounds, 2) if rounds else None,
+        }
 
     def close(self):
         if self._dynamic:

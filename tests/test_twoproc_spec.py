@@ -69,7 +69,16 @@ def main():
             print("  ref:", ref)
             print("  got:", got)
         assert match, "socket speculative decode diverged from greedy reference"
-        print("TWO-PROCESS SPECULATIVE DECODE PASSED")
+
+        # the coordinator accumulated draft-acceptance stats over the socket path —
+        # this is exactly what /health surfaces via coord.spec_stats().
+        stats = coord.spec_stats()
+        print(f"  spec_stats: {stats}")
+        assert stats["calls"] == 1 and stats["rounds"] > 0, stats
+        assert stats["draft_tokens_proposed"] > 0, stats
+        assert 0.0 <= stats["acceptance_rate"] <= 1.0, stats
+        assert 1.0 <= stats["tokens_per_round"] <= K + 1, stats
+        print("TWO-PROCESS SPECULATIVE DECODE PASSED  (+ /health spec_stats populated)")
     finally:
         if coord is not None:
             coord.close()

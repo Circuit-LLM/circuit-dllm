@@ -37,12 +37,12 @@ def _plain_greedy(model, ids, n_new):
     return out
 
 
-def _run(model, ids, perturb):
+def _run(model, ids, perturb, acc=None):
     stages = split_model(model, [model.config.num_hidden_layers // 2])
     target = SplitTarget(model, stages, device="cpu")
     draft = GreedyDraft(model, device="cpu")
     got = speculative_greedy(target, draft, ids, N_NEW, K=K, device="cpu",
-                             draft_perturb=perturb)
+                             draft_perturb=perturb, stats=acc)
     return got, speculative_greedy.last_stats
 
 
@@ -58,10 +58,14 @@ def main():
         ("all-reject", lambda i, t: (t + 1) % 1000),          # never the target's pick
         ("mixed",      lambda i, t: (t + 1) % 1000 if i % 2 else t),
     ]
+    cumulative = {"rounds": 0, "accepted": 0, "proposed": 0}   # the /health accumulator
+    expected = {"rounds": 0, "accepted": 0, "proposed": 0}
     for name, perturb in cases:
-        got, stats = _run(model, ids, perturb)
+        got, stats = _run(model, ids, perturb, acc=cumulative)
         ok = got == ref
         acc = stats["accepted"] / max(1, stats["proposed"])
+        for k in expected:
+            expected[k] += stats[k]
         print(f"  [{name:10s}] match={ok}  accept_rate={acc:4.0%}  "
               f"rounds={stats['rounds']} (tokens/round={N_NEW/stats['rounds']:.1f})")
         if not ok:
@@ -69,7 +73,16 @@ def main():
             print("     got:", tok.decode(got))
         assert ok, f"speculative output diverged from greedy in case '{name}'"
 
-    print("ALL SPECULATIVE-DECODE CHECKS PASSED  (output == greedy for every draft)")
+    # the cumulative accumulator (what coordinator.spec_stats() feeds /health) must
+    # equal the sum of per-call stats, and yield sane derived metrics.
+    assert cumulative == expected, f"accumulator drift: {cumulative} != {expected}"
+    rate = cumulative["accepted"] / cumulative["proposed"]
+    tpr = (cumulative["accepted"] + cumulative["rounds"]) / cumulative["rounds"]
+    assert 0.0 <= rate <= 1.0 and 1.0 <= tpr <= K + 1, (rate, tpr)
+    print(f"  [cumulative] acceptance_rate={rate:.3f}  tokens_per_round={tpr:.2f} "
+          f"(over {cumulative['rounds']} rounds, 3 calls)")
+    print("ALL SPECULATIVE-DECODE CHECKS PASSED  (output == greedy for every draft; "
+          "acceptance accounting consistent)")
 
 
 if __name__ == "__main__":

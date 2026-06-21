@@ -32,11 +32,27 @@ import torch
 from engine.kv import StageKV
 
 
+def _bump(local: dict, stats: Optional[dict], m: int, K: int) -> None:
+    """Record one verification round: m draft tokens accepted out of K proposed.
+    Updates the per-call `local` and, if given, a cumulative `stats` accumulator."""
+    for d in (local, stats):
+        if d is not None:
+            d["rounds"] += 1
+            d["accepted"] += m
+            d["proposed"] += K
+
+
 @torch.no_grad()
 def speculative_greedy(target, draft, prompt_ids: torch.Tensor, n_new: int,
                        K: int = 4, device: str = "cpu",
-                       draft_perturb: Optional[Callable[[int, int], int]] = None) -> List[int]:
-    """Run greedy speculative decoding. Returns the generated token ids."""
+                       draft_perturb: Optional[Callable[[int, int], int]] = None,
+                       stats: Optional[dict] = None) -> List[int]:
+    """Run greedy speculative decoding. Returns the generated token ids.
+
+    If `stats` is given (a dict with rounds/accepted/proposed keys), it is
+    INCREMENTED in place — the caller can pass a cumulative accumulator to track
+    the draft acceptance rate across many calls (an observability signal: a
+    silently-degrading draft shows up as acceptance collapsing toward 0)."""
     # prefill the target (its KV -> prompt length) and grab the first token
     logits = target.forward_tokens(prompt_ids, 0)
     draft.prefill(prompt_ids)
@@ -44,7 +60,7 @@ def speculative_greedy(target, draft, prompt_ids: torch.Tensor, n_new: int,
     out = [head]
     pos = target.kv_len()
 
-    stats = {"rounds": 0, "accepted": 0, "proposed": 0}
+    local = {"rounds": 0, "accepted": 0, "proposed": 0}
     while len(out) < n_new:
         drafts = draft.propose(head, K, pos, perturb=draft_perturb)
         batch = torch.tensor([[head] + drafts], device=device)
@@ -65,18 +81,17 @@ def speculative_greedy(target, draft, prompt_ids: torch.Tensor, n_new: int,
         head = extra
         pos = keep
 
-        stats["rounds"] += 1
-        stats["accepted"] += m
-        stats["proposed"] += K
+        _bump(local, stats, m, K)
 
-    speculative_greedy.last_stats = stats
+    speculative_greedy.last_stats = local
     return out[:n_new]
 
 
 @torch.no_grad()
 def speculative_greedy_stream(target, draft, prompt_ids: torch.Tensor, n_new: int,
                              eos_ids=(), K: int = 4, device: str = "cpu",
-                             draft_perturb: Optional[Callable[[int, int], int]] = None):
+                             draft_perturb: Optional[Callable[[int, int], int]] = None,
+                             stats: Optional[dict] = None):
     """Streaming variant of speculative_greedy: a generator that yields each
     committed token id in order.
 
@@ -110,6 +125,7 @@ def speculative_greedy_stream(target, draft, prompt_ids: torch.Tensor, n_new: in
         draft.rollback(keep)
         head = extra                                     # reused as next batch[0], not re-yielded
         pos = keep
+        _bump({"rounds": 0, "accepted": 0, "proposed": 0}, stats, m, K)
         for tok in committed:
             if tok in eos or produced >= n_new:
                 return

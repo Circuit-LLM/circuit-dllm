@@ -145,14 +145,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             if _coord._dynamic:                       # mesh mode: report the live topology
                 snap = _coord.registry.snapshot()
-                self._json(200, {"status": "ok", "model": _coord.model_id, "mesh": True,
-                                 "stages": len(snap["slots"]),
-                                 "coverage_ok": snap["coverage_ok"]})
+                health = {"status": "ok", "model": _coord.model_id, "mesh": True,
+                          "stages": len(snap["slots"]), "coverage_ok": snap["coverage_ok"]}
             else:
                 n_remote = len(_coord._stage_addrs)
                 n_stages = n_remote + (1 if _coord.local_stage is not None else 0)
-                self._json(200, {"status": "ok", "model": _coord.model_id, "mesh": False,
-                                 "stages": n_stages, "remote_stages": n_remote})
+                health = {"status": "ok", "model": _coord.model_id, "mesh": False,
+                          "stages": n_stages, "remote_stages": n_remote}
+            if _coord._draft_model is not None:       # speculative decode active → its health
+                health["speculative"] = _coord.spec_stats()
+            self._json(200, health)
         elif self.path == "/v1/models":
             self._json(200, {"object": "list", "data": [
                 {"id": _coord.model_id, "object": "model", "owned_by": "circuit"}]})
