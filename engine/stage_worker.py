@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import socket
 import struct
+import threading
 
 import torch
 
@@ -36,6 +37,35 @@ KVOP_TRUNCATE = 2
 
 def _position_ids(seq_len: int, start_pos: int, device):
     return (torch.arange(seq_len, device=device) + start_pos).unsqueeze(0)
+
+
+def _set_keepalive(conn):
+    """Enable TCP keepalive so the kernel eventually tears down a vanished peer
+    instead of leaving its handler blocked on a zombie socket (which is how a
+    coordinator restart wedged the worker before)."""
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, val in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+            opt = getattr(socket, name, None)
+            if opt is not None:
+                conn.setsockopt(socket.IPPROTO_TCP, opt, val)
+    except OSError:
+        pass
+
+
+def _serve_conn(conn, addr, key, stage, config, device, compute_lock, log):
+    """Serve one peer connection (its own session/KV space) until it closes."""
+    log("INFO", "peer connected", addr=f"{addr[0]}:{addr[1]}")
+    sessions: dict[int, StageKV] = {}
+    try:
+        _handle(conn, key, stage, config, device, sessions, log, compute_lock)
+    except (wire.WireError, OSError) as e:
+        log("WARN", "connection dropped", reason=str(e))
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 
 def serve(port: int, start: int, end: int, model_id: str, key: bytes,
@@ -59,28 +89,30 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
             log("INFO", "pruned to owned layers", keep_head=keep_head)
     stage = stage_for_range(model, start, end)
     config = model.config
-    sessions: dict[int, StageKV] = {}
+    compute_lock = threading.Lock()   # serialize model use across peer threads
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
-    srv.listen(8)
+    srv.listen(16)
     log("INFO", "listening", port=port)
 
+    # One handler thread per peer. A stalled or half-open peer (e.g. the
+    # coordinator pod restarting and its old socket lingering through the RunPod
+    # proxy) can no longer wedge the worker: the prior single-connection accept
+    # loop blocked forever on the dead socket and refused every new connection.
+    # Each peer thread keeps its own session/KV space; threads are daemons.
     while True:
         conn, addr = srv.accept()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # small frames: no Nagle
-        log("INFO", "peer connected", addr=f"{addr[0]}:{addr[1]}")
-        try:
-            _handle(conn, key, stage, config, device, sessions, log)
-        except wire.WireError as e:
-            log("WARN", "connection dropped", reason=str(e))
-        finally:
-            conn.close()
+        _set_keepalive(conn)
+        threading.Thread(target=_serve_conn,
+                         args=(conn, addr, key, stage, config, device, compute_lock, log),
+                         daemon=True).start()
 
 
 @torch.no_grad()
-def _handle(conn, key, stage, config, device, sessions, log):
+def _handle(conn, key, stage, config, device, sessions, log, compute_lock):
     while True:
         try:
             mt, payload = wire.read_frame_keyed(conn, key)
@@ -97,7 +129,8 @@ def _handle(conn, key, stage, config, device, sessions, log):
                 cache = StageKV(config)
                 sessions[session] = cache
             position_ids = _position_ids(hidden.shape[1], pos, device)
-            out = stage.forward(hidden, position_ids, past_key_values=cache, use_cache=True)
+            with compute_lock:                      # one model fwd at a time across peers
+                out = stage.forward(hidden, position_ids, past_key_values=cache, use_cache=True)
             wire.write_frame(conn, key, wire.RESULT, pack_activation(session, pos, out.cpu()))
 
         elif mt == wire.KV_CTRL:
