@@ -72,9 +72,29 @@ class Registry:
         with self._lock:
             self.topo.drain(node_id)
 
+    def mark_ready(self, node_id: str) -> None:
+        """Node finished downloading its layers and is serving (JOINING -> READY)."""
+        with self._lock:
+            self.topo.mark_ready(node_id)
+
     def mark_suspect(self, node_id: str) -> None:
         with self._lock:
             self.topo.mark_suspect(node_id)
+
+    def snapshot(self) -> dict:
+        """JSON-able view of the live mesh for ops / dashboards / the /topology route."""
+        with self._lock:
+            return {
+                "model_fp": self.topo.model_fp,
+                "replication": self.topo.replication,
+                "coverage_ok": self.topo.coverage_ok(),
+                "slots": [
+                    {"slot": s.index, "layers": [s.start, s.end],
+                     "holders": [{"node_id": h, "state": self.topo.nodes[h].state}
+                                 for h in s.holders if h in self.topo.nodes]}
+                    for s in self.topo.slots
+                ],
+            }
 
     def tick(self, now: float) -> dict:
         """Periodic maintenance: reap stably-dead nodes, surface re-balance needs +
