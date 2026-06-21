@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -47,9 +48,39 @@ def _build_coordinator() -> Coordinator:
     )
 
 
-def _prompt_from_messages(messages):
+def _prompt_from_messages(messages, tools=None):
+    # Qwen2.5's chat template formats `tools` into the prompt and handles the
+    # assistant tool_calls / role:"tool" result round-trip natively.
     return _coord.tok.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
+        messages, tools=tools or None, tokenize=False, add_generation_prompt=True)
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def _parse_tool_calls(text):
+    """Extract Qwen-style <tool_call>{...}</tool_call> blocks into OpenAI-shaped
+    tool_calls. Returns (content_or_None, tool_calls): content is whatever text
+    sits outside the tool-call blocks (None when nothing meaningful remains)."""
+    calls = []
+    for i, m in enumerate(_TOOL_CALL_RE.finditer(text)):
+        try:
+            obj = json.loads(m.group(1))
+        except Exception:
+            continue
+        name = obj.get("name")
+        if not name:
+            continue
+        args = obj.get("arguments", {})
+        # OpenAI expects function.arguments as a JSON *string*
+        args_str = args if isinstance(args, str) else json.dumps(args)
+        calls.append({
+            "id": f"call_{int(time.time()*1000)}_{i}",
+            "type": "function",
+            "function": {"name": name, "arguments": args_str},
+        })
+    leftover = _TOOL_CALL_RE.sub("", text).strip()
+    return (leftover or None), calls
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -91,13 +122,16 @@ class Handler(BaseHTTPRequestHandler):
 
         messages = body.get("messages", [])
         max_tokens = int(body.get("max_tokens") or 256)
-        stream = bool(body.get("stream", False))
-        prompt = _prompt_from_messages(messages)
+        tools = body.get("tools") or None
+        # tool calls are parsed from the full generation, so they always run
+        # non-stream (streaming partial tool-calls is deferred).
+        stream = bool(body.get("stream", False)) and not tools
+        prompt = _prompt_from_messages(messages, tools=tools)
         cid = f"chatcmpl-{int(time.time()*1000)}"
         created = int(time.time())
         model = _coord.model_id
         t0 = time.time()
-        log("INFO", "request", stream=stream, max_tokens=max_tokens, msgs=len(messages))
+        log("INFO", "request", stream=stream, max_tokens=max_tokens, msgs=len(messages), tools=bool(tools))
 
         if stream:
             # un-chunked SSE has no length/chunk end-signal, so close the socket
@@ -138,10 +172,18 @@ class Handler(BaseHTTPRequestHandler):
         else:
             with _lock:
                 text, toks = _coord.generate(prompt, max_tokens)
+            message = {"role": "assistant", "content": text}
+            finish = "stop"
+            if tools:
+                content, tool_calls = _parse_tool_calls(text)
+                message = {"role": "assistant", "content": content}
+                if tool_calls:
+                    message["tool_calls"] = tool_calls
+                    finish = "tool_calls"
             self._json(200, {
                 "id": cid, "object": "chat.completion", "created": created, "model": model,
-                "choices": [{"index": 0, "finish_reason": "stop",
-                             "message": {"role": "assistant", "content": text}}],
+                "choices": [{"index": 0, "finish_reason": finish,
+                             "message": message}],
                 "usage": {"completion_tokens": len(toks)},
             })
             log("INFO", "done", tokens=len(toks), secs=round(time.time() - t0, 2))
