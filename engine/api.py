@@ -29,7 +29,6 @@ from engine.log import make_logger  # noqa: E402
 
 log = make_logger("api")
 _coord: Coordinator = None
-_lock = threading.Lock()
 
 
 def _build_coordinator(registry=None) -> Coordinator:
@@ -48,6 +47,9 @@ def _build_coordinator(registry=None) -> Coordinator:
         shard=os.environ.get("CIRCUIT_SHARD") == "1",
         other_device=os.environ.get("CIRCUIT_OTHER_DEVICE", "cpu"),
         registry=registry,
+        # CIRCUIT_MAX_CONCURRENCY > 1 enables pipeline overlap (each request gets its
+        # own stage sockets); 1 (default) = single-stream, byte-identical to before.
+        max_concurrency=int(os.environ.get("CIRCUIT_MAX_CONCURRENCY", "1")),
     )
 
 
@@ -199,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             n = 0
             try:
-                with _lock:
+                with _coord.request_gate():
                     # speculative decode when a draft is loaded (CIRCUIT_DRAFT),
                     # else plain greedy — same output either way, draft only speeds
                     # it up by verifying K tokens per pipeline round-trip.
@@ -224,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
                 log("WARN", "client disconnected mid-stream")
             log("INFO", "done", chunks=n, secs=round(time.time() - t0, 2))
         else:
-            with _lock:
+            with _coord.request_gate():
                 text, toks = _coord.generate(prompt, max_tokens)
             message = {"role": "assistant", "content": text}
             finish = "stop"

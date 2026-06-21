@@ -10,10 +10,14 @@ Phase 1.
 
 from __future__ import annotations
 
+import contextvars
+import itertools
 import socket
 import struct
+import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from typing import List, Tuple
 
 import torch
@@ -52,12 +56,63 @@ def _connect(addr: Tuple[str, int], key: bytes, timeout: float = 180.0):
     raise ConnectionError(f"stage {host}:{port} never came up: {last}")
 
 
+# ── per-request connection isolation (pipeline overlap) ───────────────────────
+# Concurrent requests must not share a stage socket — the framed wire can't
+# interleave. Each in-flight request runs inside a connection scope that carries its
+# own _Conn (its own sockets); the relay path reads it from a contextvar, so nothing
+# is threaded through the failover signatures. Single-stream (max_concurrency=1) keeps
+# using the coordinator's default _Conn and is byte-identical to before.
+_current_conn = contextvars.ContextVar("circuit_conn", default=None)
+
+
+class _Conn:
+    """One request's connection set. `socks` = the static-path stage list (lazy);
+    `conns` = the dynamic-path node_id -> socket map. A coordinator uses one or the
+    other depending on mode; both live here so the relay code is mode-agnostic."""
+    __slots__ = ("socks", "conns")
+
+    def __init__(self):
+        self.socks = None
+        self.conns = {}
+
+
+class _ConnPool:
+    """Bounds concurrency and lends each in-flight request its own _Conn, reused (not
+    churned). Size 1 = a single connection set, serialised — i.e. today's single
+    stream. `all` keeps every _Conn ever lent so close() can shut them at teardown."""
+
+    def __init__(self, maxsize: int):
+        self._sem = threading.Semaphore(max(1, maxsize))
+        self._idle: List[_Conn] = []
+        self._lock = threading.Lock()
+        self.all: List[_Conn] = []
+
+    @contextmanager
+    def scope(self):
+        self._sem.acquire()
+        with self._lock:
+            if self._idle:
+                conn = self._idle.pop()
+            else:
+                conn = _Conn()
+                self.all.append(conn)
+        token = _current_conn.set(conn)
+        try:
+            yield conn
+        finally:
+            _current_conn.reset(token)
+            with self._lock:
+                self._idle.append(conn)
+            self._sem.release()
+
+
 class Coordinator:
     def __init__(self, model_id: str, stage_addrs: List[Tuple[str, int]],
                  key: bytes, device: str = "cpu",
                  local_layers: Optional[Tuple[int, int]] = None,
                  draft_model_id: Optional[str] = None,
-                 shard: bool = False, other_device: str = "cpu", registry=None):
+                 shard: bool = False, other_device: str = "cpu", registry=None,
+                 max_concurrency: int = 1):
         """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
         so a big model loads once on this pod (layers + head) instead of a
         coordinator and a stage worker each loading the whole model. The model
@@ -107,27 +162,45 @@ class Coordinator:
         self._eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         self._draft_model = load_model(draft_model_id, device=device) if draft_model_id else None
         self._stage_addrs = stage_addrs
-        self.socks = None            # lazy: connect on first request, not at startup
-        self._session = 0
+        # Per-request connection isolation (pipeline overlap). The default _Conn is
+        # used single-stream and for direct (un-scoped) calls; request_gate() lends a
+        # pooled _Conn per concurrent request so their stage sockets never interleave.
+        self._default_conn = _Conn()
+        self._max_conc = max(1, int(max_concurrency))
+        self._pool = _ConnPool(self._max_conc)
+        self._session_ids = itertools.count(1)    # atomic id source (no lock needed)
+        self._spec_lock = threading.Lock()        # guards the _spec counters/window
         # Optional dynamic mesh: when a registry is attached, route via its live
         # Topology + per-node keys instead of the static stage list. The static
         # path below is left exactly as-is (backward-compatible, zero risk).
         self.registry = registry
         self._dynamic = registry is not None
-        self._conns: dict = {}            # node_id -> socket (dynamic mode)
         self._session_routes: dict = {}   # session -> pinned [node per slot] (affinity)
 
+    def _active_conn(self) -> _Conn:
+        """The connection set for the current request: a per-request pooled _Conn when
+        inside request_gate() (concurrent mode), else the shared default (single-stream
+        / direct calls). Keyed off a contextvar, so the relay code stays signature-clean."""
+        return _current_conn.get() or self._default_conn
+
+    def request_gate(self):
+        """Wrap each API request in this: it bounds concurrency to max_concurrency and
+        lends the request its own connection set. At 1 it's a single serialised slot
+        with one reused connection — today's single-stream behaviour."""
+        return self._pool.scope()
+
     def _ensure_connected(self):
-        """Connect to remote stages on first use, so the API serves immediately
-        even if a stage is still loading at startup (no startup-ordering deadlock),
-        and reconnects after a drop (socks reset to None on relay error)."""
-        if self.socks is None:
+        """Connect this request's connection to the remote stages on first use, so the
+        API serves immediately even if a stage is still loading at startup (no
+        startup-ordering deadlock), and reconnects after a drop (socks reset to None)."""
+        conn = self._active_conn()
+        if conn.socks is None:
             socks = []
             for addr in self._stage_addrs:
                 self.log("INFO", "connecting stage", addr=f"{addr[0]}:{addr[1]}")
                 socks.append(_connect(addr, self.key, timeout=300.0))
-            self.socks = socks
-        return self.socks
+            conn.socks = socks
+        return conn.socks
 
     def stage_topology(self):
         """Describe the pipeline stages for /v1/workers (layerEnd inclusive)."""
@@ -174,7 +247,7 @@ class Coordinator:
                 _, _, _, hidden = unpack_activation(payload)
                 hidden = hidden.to(self.device)
         except (wire.WireError, OSError):
-            self.socks = None   # drop -> reconnect on the next request
+            self._active_conn().socks = None   # drop -> reconnect on the next request
             raise
         return hidden
 
@@ -186,18 +259,19 @@ class Coordinator:
         return wire.normalize_key(k) if k else self.key
 
     def _conn_for(self, node):
-        sock = self._conns.get(node.node_id)
+        conns = self._active_conn().conns
+        sock = conns.get(node.node_id)
         if sock is None:
             host, port = node.endpoint
             # short timeout — a routed holder is READY, so this connects instantly;
             # a dead one must fail fast so failover can move on (not hang ~300s).
             sock = _connect((host, int(port)), self._node_key(node),
                             timeout=_DYNAMIC_CONNECT_TIMEOUT)
-            self._conns[node.node_id] = sock
+            conns[node.node_id] = sock
         return sock
 
     def _drop_conn(self, node_id: str):
-        sock = self._conns.pop(node_id, None)
+        sock = self._active_conn().conns.pop(node_id, None)
         if sock is not None:
             try:
                 sock.close()
@@ -270,9 +344,10 @@ class Coordinator:
         just means that stage reclaims on its own restart, and a fresh session at
         pos==0 starts clean regardless."""
         self._local_caches.pop(session, None)
+        conn = self._active_conn()
         if self._dynamic:
             self._session_routes.pop(session, None)
-            for nid, sock in list(self._conns.items()):
+            for nid, sock in list(conn.conns.items()):
                 node = self.registry.topo.nodes.get(nid)
                 key = self._node_key(node) if node else self.key
                 try:
@@ -281,19 +356,20 @@ class Coordinator:
                 except OSError:
                     self._drop_conn(nid)
             return
-        for s in (self.socks or []):
+        for s in (conn.socks or []):
             try:
                 wire.write_frame(s, self.key, wire.KV_CTRL,
                                  struct.pack(">IBI", session, KVOP_RESET, 0))
             except OSError:
-                self.socks = None   # drop -> reconnect on the next request
+                conn.socks = None   # drop -> reconnect on the next request
                 break
 
     def _kv_truncate(self, session: int, length: int):
         if session in self._local_caches:
             self._local_caches[session].truncate_to(length)
+        conn = self._active_conn()
         if self._dynamic:
-            for nid, sock in list(self._conns.items()):
+            for nid, sock in list(conn.conns.items()):
                 node = self.registry.topo.nodes.get(nid)
                 key = self._node_key(node) if node else self.key
                 try:
@@ -302,14 +378,13 @@ class Coordinator:
                 except OSError:
                     self._drop_conn(nid)
             return
-        for s in (self.socks or []):
+        for s in (conn.socks or []):
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_TRUNCATE, length))
 
     @torch.no_grad()
     def generate(self, prompt: str, n_new: int = 20) -> Tuple[str, List[int]]:
-        self._session += 1
-        sid = self._session
+        sid = next(self._session_ids)
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             seq = ids.shape[1]
@@ -336,8 +411,7 @@ class Coordinator:
     @torch.no_grad()
     def generate_stream(self, prompt: str, n_new: int = 256, stop_on_eos: bool = True):
         """Greedy decode, yielding decoded text incrementally (for streaming APIs)."""
-        self._session += 1
-        sid = self._session
+        sid = next(self._session_ids)
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             cur = ids.shape[1]
@@ -367,8 +441,8 @@ class Coordinator:
                              draft=None) -> Tuple[str, List[int]]:
         """Speculative decode over the socket: local draft proposes, the split
         stages (over the wire) verify. Output == greedy for any draft."""
-        self._session += 1
-        sid = self._session
+        sid = next(self._session_ids)
+        local = {"rounds": 0, "accepted": 0, "proposed": 0, "window": []}
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             target = SocketTarget(self, sid)
@@ -376,11 +450,11 @@ class Coordinator:
                 # use the separate draft model if loaded (the main model may be
                 # pruned for co-located stage 0 and can't draft itself)
                 draft = GreedyDraft(self._draft_model or self._model, device=self.device)
-            self._spec["calls"] += 1
             out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device,
-                                     stats=self._spec)
+                                     stats=local)
             return self.tok.decode(out), out
         finally:
+            self._merge_spec(local)
             self._reset_sessions(sid)
 
     @torch.no_grad()
@@ -392,25 +466,37 @@ class Coordinator:
         cannot draft itself)."""
         if self._draft_model is None:
             raise RuntimeError("generate_speculative_stream requires a draft model (set CIRCUIT_DRAFT)")
-        self._session += 1
-        sid = self._session
+        sid = next(self._session_ids)
+        local = {"rounds": 0, "accepted": 0, "proposed": 0, "window": []}
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             target = SocketTarget(self, sid)
             draft = GreedyDraft(self._draft_model, device=self.device)
             produced: List[int] = []
             prev_text = ""
-            self._spec["calls"] += 1
             for tid in speculative_greedy_stream(target, draft, ids, n_new,
                                                  eos_ids=self._eos_ids, K=K,
-                                                 device=self.device, stats=self._spec):
+                                                 device=self.device, stats=local):
                 produced.append(tid)
                 text = self.tok.decode(produced)
                 if len(text) > len(prev_text):
                     yield text[len(prev_text):]
                     prev_text = text
         finally:
+            self._merge_spec(local)
             self._reset_sessions(sid)
+
+    def _merge_spec(self, local: dict):
+        """Fold one finished call's speculative stats into the cumulative counters.
+        Per-call accumulation is lock-free (a local dict); merging once at the end
+        under the lock keeps concurrent speculative requests consistent without
+        contending on the hot per-round path."""
+        with self._spec_lock:
+            self._spec["calls"] += 1
+            self._spec["rounds"] += local["rounds"]
+            self._spec["accepted"] += local["accepted"]
+            self._spec["proposed"] += local["proposed"]
+            self._spec["window"].extend(local["window"])   # deque(maxlen) auto-trims
 
     def spec_stats(self) -> dict:
         """Speculative-decode health. `acceptance_rate` is the fraction of proposed
@@ -419,24 +505,26 @@ class Coordinator:
         never helps, K+1 = always perfect). The lifetime figures go sticky, so
         `recent_acceptance_rate` (over the last ≤`window` rounds) is the one that
         actually surfaces a draft degrading late — watch it collapse toward 0."""
-        s = self._spec
-        proposed, rounds = s["proposed"], s["rounds"]
-        win = s["window"]
+        with self._spec_lock:
+            s = self._spec
+            proposed, rounds = s["proposed"], s["rounds"]
+            win = list(s["window"])
+            accepted, calls = s["accepted"], s["calls"]
         wk = sum(k for _, k in win)
         wa = sum(m for m, _ in win)
         return {
-            "calls": s["calls"], "rounds": rounds,
+            "calls": calls, "rounds": rounds,
             "draft_tokens_proposed": proposed,
-            "draft_tokens_accepted": s["accepted"],
-            "acceptance_rate": round(s["accepted"] / proposed, 3) if proposed else None,
-            "tokens_per_round": round((s["accepted"] + rounds) / rounds, 2) if rounds else None,
+            "draft_tokens_accepted": accepted,
+            "acceptance_rate": round(accepted / proposed, 3) if proposed else None,
+            "tokens_per_round": round((accepted + rounds) / rounds, 2) if rounds else None,
             "recent_acceptance_rate": round(wa / wk, 3) if wk else None,
             "recent_rounds": len(win),
         }
 
-    def close(self):
+    def _close_conn(self, conn: _Conn):
         if self._dynamic:
-            for nid, sock in list(self._conns.items()):
+            for nid, sock in list(conn.conns.items()):
                 node = self.registry.topo.nodes.get(nid)
                 key = self._node_key(node) if node else self.key
                 try:
@@ -444,14 +532,23 @@ class Coordinator:
                     sock.close()
                 except OSError:
                     pass
-            self._conns.clear()
-            return
-        for s in (self.socks or []):
-            try:
-                wire.write_frame(s, self.key, wire.BYE, b"")
-                s.close()
-            except OSError:
-                pass
+            conn.conns.clear()
+        else:
+            for s in (conn.socks or []):
+                try:
+                    wire.write_frame(s, self.key, wire.BYE, b"")
+                    s.close()
+                except OSError:
+                    pass
+            conn.socks = None
+
+    def close(self):
+        # shut every connection set ever used: the default plus all pooled ones
+        seen = set()
+        for conn in [self._default_conn, *self._pool.all]:
+            if id(conn) not in seen:
+                seen.add(id(conn))
+                self._close_conn(conn)
 
 
 class SocketTarget:
