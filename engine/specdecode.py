@@ -125,7 +125,7 @@ def speculative_greedy_stream(target, draft, prompt_ids: torch.Tensor, n_new: in
         draft.rollback(keep)
         head = extra                                     # reused as next batch[0], not re-yielded
         pos = keep
-        _bump({"rounds": 0, "accepted": 0, "proposed": 0}, stats, m, K)
+        _bump(None, stats, m, K)                         # stream has no per-call last_stats
         for tok in committed:
             if tok in eos or produced >= n_new:
                 return
