@@ -54,6 +54,10 @@ def main():
         topo.mark_ready(nid)
         reg.heartbeat(nid, 100.0)
 
+    # route snapshot: the primary holder per slot, in order (what the coordinator pins)
+    snap = reg.route_snapshot()
+    assert [n.node_id for n in snap] == ["n1", "n2"], "snapshot = primary holder per slot"
+
     # ── attribution: split a payment ∝ layers·tokens, minus fee, conserved ──────
     # two stages served: n1 did 16 layers, n2 did 16 layers, both over 10 tokens.
     paid = 1000  # CIRC raw
@@ -83,7 +87,14 @@ def main():
     assert status["coverage_ok"] is False, "slot0 lost its only ready holder"
     assert any(h["slot"] == 0 for h in status["needs_holders"]), "slot0 needs a holder"
 
-    print("REGISTRY TESTS PASSED — admission, per-node keys, attribution split, settlement, tick")
+    # with slot0 uncovered, route_snapshot must refuse (coverage invariant)
+    try:
+        reg.route_snapshot()
+        assert False, "route_snapshot must refuse an uncovered pipeline"
+    except RuntimeError:
+        pass
+
+    print("REGISTRY TESTS PASSED — admission, per-node keys, route snapshot, attribution, settlement, tick")
 
 
 if __name__ == "__main__":

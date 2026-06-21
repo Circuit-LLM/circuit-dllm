@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -42,41 +43,60 @@ class Registry:
     fee_bps: int = 1000                          # protocol fee, basis points (10%)
     accrued: Dict[str, int] = field(default_factory=dict)  # node_id -> CIRC raw owed
     wallets: Dict[str, str] = field(default_factory=dict)  # node_id -> payout wallet
+    # one lock serializes control-plane mutations (control-server threads) against
+    # the coordinator reading a route snapshot (inference thread).
+    _lock: object = field(default_factory=threading.RLock, repr=False, compare=False)
 
     # ── admission ─────────────────────────────────────────────────────────────
     def register(self, node: Node, now: float = 0.0) -> dict:
-        if self.allowlist is not None and node.node_id not in self.allowlist:
-            raise PermissionError(f"node {node.node_id} not on allowlist")
-        slot = self.topo.register(node, now)      # raises on model mismatch / capacity
-        key = derive_node_key(self.master_secret, node.node_id)
-        node.wire_key = key                        # coordinator uses this to talk to the node
-        self.wallets[node.node_id] = node.payout_wallet
-        return {
-            "assignment": {"start": slot.start, "end": slot.end},
-            "model_fp": self.topo.model_fp,
-            "session_key": key.hex(),
-            "coordinator": self.coordinator_endpoint,
-            "replication": self.topo.replication,
-        }
+        with self._lock:
+            if self.allowlist is not None and node.node_id not in self.allowlist:
+                raise PermissionError(f"node {node.node_id} not on allowlist")
+            slot = self.topo.register(node, now)   # raises on model mismatch / capacity
+            key = derive_node_key(self.master_secret, node.node_id)
+            node.wire_key = key                    # coordinator uses this to talk to the node
+            self.wallets[node.node_id] = node.payout_wallet
+            return {
+                "assignment": {"start": slot.start, "end": slot.end},
+                "model_fp": self.topo.model_fp,
+                "session_key": key.hex(),
+                "coordinator": self.coordinator_endpoint,
+                "replication": self.topo.replication,
+            }
 
     def heartbeat(self, node_id: str, now: float) -> None:
-        self.topo.heartbeat(node_id, now)
+        with self._lock:
+            self.topo.heartbeat(node_id, now)
 
     def drain(self, node_id: str) -> None:
-        self.topo.drain(node_id)
+        with self._lock:
+            self.topo.drain(node_id)
+
+    def mark_suspect(self, node_id: str) -> None:
+        with self._lock:
+            self.topo.mark_suspect(node_id)
 
     def tick(self, now: float) -> dict:
         """Periodic maintenance: reap stably-dead nodes, surface re-balance needs +
         coverage status (for the operator / alerts / joiner placement)."""
-        reaped = self.topo.reap(now)
-        targets = self.topo.rebalance_targets()
-        return {
-            "reaped": reaped,
-            "needs_holders": [{"slot": s.index, "layers": [s.start, s.end],
-                               "have": len(self.topo.holders(s.index)),
-                               "want": self.topo.replication} for s in targets],
-            "coverage_ok": self.topo.coverage_ok(),
-        }
+        with self._lock:
+            reaped = self.topo.reap(now)
+            targets = self.topo.rebalance_targets()
+            return {
+                "reaped": reaped,
+                "needs_holders": [{"slot": s.index, "layers": [s.start, s.end],
+                                   "have": len(self.topo.holders(s.index)),
+                                   "want": self.topo.replication} for s in targets],
+                "coverage_ok": self.topo.coverage_ok(),
+            }
+
+    # ── routing (read) ────────────────────────────────────────────────────────
+    def route_snapshot(self) -> List[Node]:
+        """Thread-safe snapshot of the pipeline: the PRIMARY healthy holder for each
+        slot, in order. The coordinator pins this for a session's lifetime (session
+        affinity → warm KV). Raises if any slot is uncovered (the coverage invariant)."""
+        with self._lock:
+            return [holders[0] for _slot, holders in self.topo.route()]
 
     # ── attribution + payout ──────────────────────────────────────────────────
     def record_work(self, route: List[Tuple[str, int, int]], paid_raw: int) -> None:
@@ -91,21 +111,23 @@ class Registry:
         total = sum(w for _, w in weights)
         if total <= 0:
             return
-        assigned = 0
-        for i, (nid, w) in enumerate(weights):
-            # integer split; the last server gets the rounding remainder so the pool
-            # is conserved exactly (no lost lamports)
-            share = (pool * w // total) if i < len(weights) - 1 else (pool - assigned)
-            self.accrued[nid] = self.accrued.get(nid, 0) + share
-            assigned += share
+        with self._lock:
+            assigned = 0
+            for i, (nid, w) in enumerate(weights):
+                # integer split; the last server gets the rounding remainder so the
+                # pool is conserved exactly (no lost lamports)
+                share = (pool * w // total) if i < len(weights) - 1 else (pool - assigned)
+                self.accrued[nid] = self.accrued.get(nid, 0) + share
+                assigned += share
 
     def settle(self, min_payout_raw: int) -> List[Tuple[str, int]]:
         """Return the batch of (wallet, amount_raw) for nodes whose accrued balance
         is >= min_payout_raw, zeroing those. The caller does the on-chain Token-2022
         transfers. Below-threshold balances roll over (avoids dust-gas churn)."""
-        batch = []
-        for nid, amount in list(self.accrued.items()):
-            if amount >= min_payout_raw and self.wallets.get(nid):
-                batch.append((self.wallets[nid], amount))
-                self.accrued[nid] = 0
-        return batch
+        with self._lock:
+            batch = []
+            for nid, amount in list(self.accrued.items()):
+                if amount >= min_payout_raw and self.wallets.get(nid):
+                    batch.append((self.wallets[nid], amount))
+                    self.accrued[nid] = 0
+            return batch

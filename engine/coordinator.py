@@ -100,7 +100,8 @@ class Coordinator:
         # path below is left exactly as-is (backward-compatible, zero risk).
         self.registry = registry
         self._dynamic = registry is not None
-        self._conns: dict = {}       # node_id -> socket (dynamic mode)
+        self._conns: dict = {}            # node_id -> socket (dynamic mode)
+        self._session_routes: dict = {}   # session -> pinned [node per slot] (affinity)
 
     def _ensure_connected(self):
         """Connect to remote stages on first use, so the API serves immediately
@@ -187,12 +188,17 @@ class Coordinator:
                 pass
 
     def _relay_dynamic(self, session: int, pos: int, hidden: torch.Tensor) -> torch.Tensor:
-        """Route through the live mesh: walk the pipeline slots in order, sending to
-        each slot's primary healthy holder with that node's key. On a hop failure,
-        drop the connection + mark the node suspect (Phase-2 failover will retry the
-        next holder; until then the request fails and the next one re-routes)."""
-        for _slot, holders in self.registry.topo.route():
-            node = holders[0]
+        """Route through the live mesh, PINNING the route for the session's lifetime
+        (session affinity → the chosen holders keep this session's KV warm). The pin
+        is taken (thread-safe snapshot) at the session's first hop and reused for
+        every later token; on a hop failure we drop the pin so the next session
+        re-routes cleanly (Phase 2 adds mid-session failover + re-prefill onto a
+        replica)."""
+        route = self._session_routes.get(session)
+        if route is None or pos == 0:
+            route = self.registry.route_snapshot()   # locked; raises on a coverage gap
+            self._session_routes[session] = route
+        for node in route:
             key = self._node_key(node)
             try:
                 sock = self._conn_for(node)
@@ -205,7 +211,8 @@ class Coordinator:
                 hidden = hidden.to(self.device)
             except (wire.WireError, OSError):
                 self._drop_conn(node.node_id)
-                self.registry.topo.mark_suspect(node.node_id)
+                self.registry.mark_suspect(node.node_id)
+                self._session_routes.pop(session, None)
                 raise
         return hidden
 
@@ -217,6 +224,7 @@ class Coordinator:
         pos==0 starts clean regardless."""
         self._local_caches.pop(session, None)
         if self._dynamic:
+            self._session_routes.pop(session, None)
             for nid, sock in list(self._conns.items()):
                 node = self.registry.topo.nodes.get(nid)
                 key = self._node_key(node) if node else self.key

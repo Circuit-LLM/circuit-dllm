@@ -82,9 +82,12 @@ class Topology:
     def _slot_size(self, slot: Slot) -> int:
         return slot.end - slot.start
 
-    def _ready_count(self, slot: Slot) -> int:
+    def _committed_count(self, slot: Slot) -> int:
+        # holders committed to a slot (not yet DEAD) — a JOINING node counts, since it
+        # is provisioning for this slot even before it's READY to route. Counting only
+        # READY would pile concurrent joiners into one slot while the rest provision.
         return sum(1 for h in slot.holders
-                   if h in self.nodes and self.nodes[h].state in _ROUTABLE)
+                   if h in self.nodes and self.nodes[h].state != DEAD)
 
     # ── registration / assignment ────────────────────────────────────────────
     def register(self, node: Node, now: float = 0.0) -> Slot:
@@ -106,8 +109,9 @@ class Topology:
         cands = [s for s in self.slots if node.capacity_layers >= self._slot_size(s)]
         if not cands:
             return None
-        # most under-replicated first (fewest READY holders), tie-break by index
-        cands.sort(key=lambda s: (self._ready_count(s), s.index))
+        # fill the least-committed slot first (JOINING counts, so concurrent joiners
+        # spread across slots instead of piling into one), tie-break by index
+        cands.sort(key=lambda s: (self._committed_count(s), s.index))
         return cands[0]
 
     # ── health ───────────────────────────────────────────────────────────────
