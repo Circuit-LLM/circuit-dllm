@@ -92,47 +92,122 @@ stage workers and concurrent threads; the throughput win itself is measured on t
 
 ---
 
-## 3. Win B — intra-step batching (Phase 2 sketch)
+## 3. Win B — intra-step batching (full design)
 
-The real rewrite, recorded so Win A is built pointing the right way:
+### 3.1 The shift
+Win A runs **B independent pipelines** — B sequences, B sockets, B separate forwards;
+it fills the pipeline *bubble* but every forward still processes one sequence, so the
+GPU does B small matmuls. Win B runs **one pipeline over a batch** — the active
+sequences are packed into a single `[B, …]` forward per stage, so the GPU does one
+large, efficient matmul. That's the vLLM-class throughput multiplier; its ceiling is
+GPU compute/memory, not pipeline idle. The two compose (batch the sequences, overlap a
+second batch to hide the bubble) but Win B is where the throughput lives.
 
-1. **Batched wire.** ACTIVATION carries `[B, T, D]` for B sequences; RESULT likewise.
-2. **Ragged KV per stage.** Sequences sit at different positions/lengths. Either pad +
-   attention-mask, or **paged attention** (block KV) for memory efficiency — paged is
-   the right long-term answer (no fragmentation, supports large B).
-3. **Continuous-batching scheduler** (coordinator): one loop that each step admits new
-   requests (prefill), runs a batched decode for all active sequences, and evicts
-   finished ones. Prefill vs decode shapes differ — separate phases or chunked-prefill.
-4. **Pipeline × batch (the hard part).** Micro-batch / 1F1B scheduling so both pipeline
-   stages stay busy with the batch instead of bubbling. This is where pipeline-parallel
-   batching is genuinely harder than single-GPU batching.
+### 3.2 Why it's hard in THIS engine
+- **Per-session KV.** `StageKV` (a HF `DynamicCache`) holds ONE sequence's K/V.
+  Batching needs a cache holding B sequences whose lengths differ (one at token 12,
+  another at 200) and whose membership changes every step (sequences finish, new admit).
+- **Ragged decode.** Each active sequence emits one token → the batch is `[B, 1, D]`,
+  clean in time but ragged in KV length; attention must let each row see only its own KV.
+- **Prefill ≠ decode.** A new prompt is `[1, P, D]` (P tokens at once); a decode step is
+  `[B, 1, D]`. Mixing them is the continuous-batching scheduling problem.
+- **Speculative × batch.** Each sequence accepts a different number of draft tokens per
+  verify → the batch desyncs and KV rolls back per-row. Batched speculative is research-grade.
+- **Pipeline.** The batch must traverse the stages in a stable row order each step; the
+  bubble still exists per batched step (Win A overlap optionally hides it).
 
-High value, high risk, multi-week, from-scratch (no vLLM to lean on). Gated behind the
-same `max_concurrency` / a batch-size knob; same token-identical correctness contract.
+### 3.3 Design decisions (best-practice scoping)
+1. **Padded batching first; paged later.** Hold `[B, heads, max_len, dim]` + per-row
+   lengths + a 4D mask hiding padding. Correct with the **stock HF attention — no custom
+   kernel**. Wastes compute on padding (∝ length variance), so it's the right MVP, with
+   **paged attention** (block KV + block tables) as the efficiency follow-up. We do NOT
+   write a paged kernel up front — that's the single biggest risk multiplier.
+2. **Batched greedy first; speculative deferred.** Run batched plain decode. Speculation's
+   edge shrinks as batch grows (large batch is already compute-bound), and batched
+   speculative is a separate hard project. Keep single-stream speculative for the
+   low-concurrency latency path; batched mode trades it for throughput.
+3. **Separate prefill first; chunked later.** Prefill a newcomer on the existing single-seq
+   path, then admit its KV row into the decode batch. Chunked prefill is a later optimization.
+4. **A scheduler owns the loop.** Replace per-request `generate*` with one coordinator
+   **scheduler**: holds active sequences, each step forms the decode batch, runs one batched
+   pipeline pass, samples B tokens, evicts finished, admits prefilled newcomers. Requests
+   enqueue and receive tokens via per-request output queues.
+5. **One connection per stage in batched mode.** The scheduler is the single producer; a
+   batched ACTIVATION multiplexes B sequences over one socket per stage (Win A's per-request
+   sockets are for the overlap mode). Simpler, and the right model for batching.
+6. **Gated, token-identical, reversible.** A mode flag (`CIRCUIT_BATCH` / `CIRCUIT_MAX_BATCH`);
+   default = today. Batched output MUST be token-identical to sequential greedy per
+   sequence — a mask/index bug is a *silent* wrong-output, the central correctness risk.
+
+### 3.4 Components (new + changed)
+- **`BatchKV` (new) — the crux.** K/V for B rows at `[B, heads, max_len, dim]` per layer,
+  per-row length, **slot management** (free a finished row, place a newcomer's prefilled KV),
+  the 4D mask + per-row `position_ids`. Generalises `StageKV`.
+- **`stage_worker` (changed).** Batched ACTIVATION → gather B rows' KV → one
+  `stage.forward([B,1,D], mask, positions, BatchKV)` → scatter new K/V back → return
+  `[B,1,D]`. Plus a prefill/admit op.
+- **wire / tensors (changed).** Batched ACTIVATION frame: header of B×(session,pos) + the
+  `[B,T,D]` tensor; RESULT mirrors. KV_CTRL gains slot free/admit.
+- **`Scheduler` (new, coordinator).** The continuous-batching loop (admit/prefill/decode/
+  sample/evict) + per-request output queues + max-batch/memory bounds + fairness.
+- **`api.py` (changed).** Concurrent requests enqueue into the scheduler and stream from
+  their queue, instead of each holding a `request_gate`.
+- **Tests (new).** Token-identical-to-sequential for a mixed-length batch; dynamic
+  admit/evict mid-batch; prefill-then-join; back-pressure at max batch.
+
+### 3.5 Phased plan
+- **B1 — `BatchKV` + batched stage forward (in-process).** Prove a batched forward with
+  ragged padded KV is token-identical to N sequential forwards, no sockets. *The
+  correctness foundation; everything rides on mask/positions being exact.*
+- **B2 — batched wire + stage-worker batched path.** Two-process batched decode == reference.
+- **B3 — scheduler + API.** Continuous admit/decode/evict + per-request streaming; M
+  concurrent requests through one batched pipeline, each token-identical.
+- **B4 — overlap a 2nd batch (compose with Win A) + chunked prefill.** Hide the bubble.
+- **B5 (later) — paged attention.** Block KV for memory efficiency at large B; only if
+  padded batching hits memory limits. The hardest piece, a project of its own.
+
+### 3.6 Honest size & risk
+This is **the largest single build in the project — bigger than the whole node-join
+system** (topology + registry + control server + failover combined):
+- **B1–B3 (the MVP that actually batches):** a new `BatchKV`, a batched wire format, a
+  stage-worker batched path, a scheduler + API rework — order of **~1.5–2.5k lines of core
+  code plus a heavy test suite**, built incrementally. Realistically a **focused multi-week
+  effort**, with **higher correctness risk than anything so far** — a silent mask/index bug
+  yields plausible-but-wrong text, caught only by exact token-equality tests on the GPU
+  (CPU validates correctness, never the tok/s).
+- **B4:** another meaningful chunk (overlap + chunked prefill).
+- **B5 (paged):** the wildcard that can balloon; deferred behind padded batching.
+- **Payoff is GPU-only.** CPU proves correctness; the throughput and the right
+  `max_batch` vs VRAM are measured on the L4s.
+
+Biggest risk = B5/paged (deferred by design). Second = silent correctness in B1's
+mask/positions (front-loaded as the first fully-tested milestone). Same discipline as
+everything else: gated default-off, token-identical contract, incremental + tested,
+never a silent change to the running engine.
 
 ---
 
 ## 4. What needs the live hardware (can't be settled on CPU)
 
-- **Bottleneck measurement (do first).** Is 11 tok/s pipeline-bubble-bound (→ overlap
-  buys a lot) or genuinely compute-bound (→ overlap buys little, go straight to B)?
-  A short profiling pass on the 32B: per-stage time, the idle gap per token, prefill vs
-  decode split. This number decides how much to invest in A vs B.
-- **Throughput + memory validation.** Real tok/s under concurrent load and the per-session
-  KV footprint that sets `max_concurrency` — only measurable on the L4s.
+- **Bottleneck measurement — DONE (2026-06-21).** Win A deployed and measured: **1.40×**
+  at 3 concurrent (14.2 → 19.9 tok/s aggregate), single-request latency unchanged. The
+  engine **is pipeline-bubble-bound**, so batching (Win B) has real headroom toward 2×+.
+- **Throughput + memory validation (Win B).** Real batched tok/s and the per-row KV
+  footprint that sets `CIRCUIT_MAX_BATCH` vs VRAM — only measurable on the L4s.
 
 ---
 
 ## 5. Rollout (and why this order)
 
-0. **Design (this doc) + a profiling deploy** to measure the real bottleneck.
-1. **Win A — overlap.** Connection pool + concurrency semaphore + thread-safe state,
-   gated `CIRCUIT_MAX_CONCURRENCY` (default 1 = byte-identical), CPU correctness test.
-   Deploy, raise concurrency cautiously, measure.
-2. **Win B — intra-step batching.** Batched wire + ragged/paged KV + continuous
-   scheduler. Deploy, measure, tune batch size against memory.
+0. **Design + profiling deploy** — DONE; measured Win A = 1.40×, engine bubble-bound.
+1. **Win A — overlap.** Per-request connection isolation (contextvar + `_ConnPool`),
+   gated `CIRCUIT_MAX_CONCURRENCY` (default 1). **DONE — live on both pods at 4, correct,
+   1.40×.**
+2. **Win B — intra-step batching.** Phases B1–B5 (§3.5). B1 (`BatchKV` + batched forward,
+   in-process, token-identical) is the correctness foundation and the right first step;
+   B5 (paged) is deferred behind padded batching. Gated `CIRCUIT_BATCH` / `CIRCUIT_MAX_BATCH`.
 
-**Invariant throughout:** default config = today's behaviour, byte-identical; output is
-always token-identical to sequential greedy; the live engine changes only on a
-deliberate, measured deploy. Same discipline as the mesh work — gated, regression-tested,
-never a silent change to the running system.
+**Invariant throughout:** default config = today's behaviour; output always token-identical
+to sequential greedy; the live engine changes only on a deliberate, measured deploy. Same
+discipline as the mesh work — gated, regression-tested, never a silent change to the
+running system.
