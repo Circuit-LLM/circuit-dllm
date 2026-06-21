@@ -156,10 +156,19 @@ class Coordinator:
         return hidden
 
     def _reset_sessions(self, session: int):
+        """Free a finished session's KV everywhere: drop the coordinator's local
+        cache and tell each remote stage to free its per-session cache. Called in
+        a finally on every generation path, so it must never raise — a dead socket
+        just means that stage reclaims on its own restart, and a fresh session at
+        pos==0 starts clean regardless."""
         self._local_caches.pop(session, None)
         for s in (self.socks or []):
-            wire.write_frame(s, self.key, wire.KV_CTRL,
-                             struct.pack(">IBI", session, KVOP_RESET, 0))
+            try:
+                wire.write_frame(s, self.key, wire.KV_CTRL,
+                                 struct.pack(">IBI", session, KVOP_RESET, 0))
+            except OSError:
+                self.socks = None   # drop -> reconnect on the next request
+                break
 
     def _kv_truncate(self, session: int, length: int):
         if session in self._local_caches:
@@ -172,47 +181,53 @@ class Coordinator:
     def generate(self, prompt: str, n_new: int = 20) -> Tuple[str, List[int]]:
         self._session += 1
         sid = self._session
-        ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
-        seq = ids.shape[1]
+        try:
+            ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+            seq = ids.shape[1]
 
-        # prefill (pos=0 tells the stages to begin a fresh sequence)
-        hidden = self._relay(sid, 0, self.embed(ids))
-        nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-        out = []
-        cur = seq
-        for _ in range(n_new):
-            tid = int(nxt)
-            if tid in self._eos_ids:
-                break
-            out.append(tid)
-            hidden = self._relay(sid, cur, self.embed(nxt))
+            # prefill (pos=0 tells the stages to begin a fresh sequence)
+            hidden = self._relay(sid, 0, self.embed(ids))
             nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-            cur += 1
-        return self.tok.decode(out), out
+            out = []
+            cur = seq
+            for _ in range(n_new):
+                tid = int(nxt)
+                if tid in self._eos_ids:
+                    break
+                out.append(tid)
+                hidden = self._relay(sid, cur, self.embed(nxt))
+                nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
+                cur += 1
+            return self.tok.decode(out), out
+        finally:
+            self._reset_sessions(sid)
 
     @torch.no_grad()
     def generate_stream(self, prompt: str, n_new: int = 256, stop_on_eos: bool = True):
         """Greedy decode, yielding decoded text incrementally (for streaming APIs)."""
         self._session += 1
         sid = self._session
-        ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
-        cur = ids.shape[1]
-        hidden = self._relay(sid, 0, self.embed(ids))
-        nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-        produced: List[int] = []
-        prev_text = ""
-        for _ in range(n_new):
-            tid = int(nxt)
-            if stop_on_eos and tid in self._eos_ids:
-                break
-            produced.append(tid)
-            text = self.tok.decode(produced)
-            if len(text) > len(prev_text):
-                yield text[len(prev_text):]
-                prev_text = text
-            hidden = self._relay(sid, cur, self.embed(nxt))
+        try:
+            ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+            cur = ids.shape[1]
+            hidden = self._relay(sid, 0, self.embed(ids))
             nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-            cur += 1
+            produced: List[int] = []
+            prev_text = ""
+            for _ in range(n_new):
+                tid = int(nxt)
+                if stop_on_eos and tid in self._eos_ids:
+                    break
+                produced.append(tid)
+                text = self.tok.decode(produced)
+                if len(text) > len(prev_text):
+                    yield text[len(prev_text):]
+                    prev_text = text
+                hidden = self._relay(sid, cur, self.embed(nxt))
+                nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
+                cur += 1
+        finally:
+            self._reset_sessions(sid)
 
     @torch.no_grad()
     def generate_speculative(self, prompt: str, n_new: int = 24, K: int = 4,
@@ -221,14 +236,17 @@ class Coordinator:
         stages (over the wire) verify. Output == greedy for any draft."""
         self._session += 1
         sid = self._session
-        ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
-        target = SocketTarget(self, sid)
-        if draft is None:
-            # use the separate draft model if loaded (the main model may be
-            # pruned for co-located stage 0 and can't draft itself)
-            draft = GreedyDraft(self._draft_model or self._model, device=self.device)
-        out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device)
-        return self.tok.decode(out), out
+        try:
+            ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+            target = SocketTarget(self, sid)
+            if draft is None:
+                # use the separate draft model if loaded (the main model may be
+                # pruned for co-located stage 0 and can't draft itself)
+                draft = GreedyDraft(self._draft_model or self._model, device=self.device)
+            out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device)
+            return self.tok.decode(out), out
+        finally:
+            self._reset_sessions(sid)
 
     @torch.no_grad()
     def generate_speculative_stream(self, prompt: str, n_new: int = 256, K: int = 4):
@@ -241,19 +259,22 @@ class Coordinator:
             raise RuntimeError("generate_speculative_stream requires a draft model (set CIRCUIT_DRAFT)")
         self._session += 1
         sid = self._session
-        ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
-        target = SocketTarget(self, sid)
-        draft = GreedyDraft(self._draft_model, device=self.device)
-        produced: List[int] = []
-        prev_text = ""
-        for tid in speculative_greedy_stream(target, draft, ids, n_new,
-                                             eos_ids=self._eos_ids, K=K,
-                                             device=self.device):
-            produced.append(tid)
-            text = self.tok.decode(produced)
-            if len(text) > len(prev_text):
-                yield text[len(prev_text):]
-                prev_text = text
+        try:
+            ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+            target = SocketTarget(self, sid)
+            draft = GreedyDraft(self._draft_model, device=self.device)
+            produced: List[int] = []
+            prev_text = ""
+            for tid in speculative_greedy_stream(target, draft, ids, n_new,
+                                                 eos_ids=self._eos_ids, K=K,
+                                                 device=self.device):
+                produced.append(tid)
+                text = self.tok.decode(produced)
+                if len(text) > len(prev_text):
+                    yield text[len(prev_text):]
+                    prev_text = text
+        finally:
+            self._reset_sessions(sid)
 
     def close(self):
         for s in (self.socks or []):
