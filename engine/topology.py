@@ -150,6 +150,17 @@ class Topology:
                 dead.append(n.node_id)
         return dead
 
+    def purge(self, now: float) -> List[str]:
+        """Drop nodes that have been DEAD long enough to retire from the topology.
+        reap() only *marks* DEAD (kept visible for ops for one more dead_after_s
+        window); purge then removes them, so holder lists / the node table don't grow
+        without bound under long-running churn. Returns the purged node_ids."""
+        gone = [nid for nid, n in self.nodes.items()
+                if n.state == DEAD and now - n.last_hb > 2 * self.dead_after_s]
+        for nid in gone:
+            self.remove(nid)
+        return gone
+
     def remove(self, node_id: str) -> None:
         n = self.nodes.pop(node_id, None)
         if n and n.slot is not None and node_id in self.slots[n.slot].holders:

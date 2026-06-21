@@ -101,9 +101,11 @@ class Registry:
         coverage status (for the operator / alerts / joiner placement)."""
         with self._lock:
             reaped = self.topo.reap(now)
+            purged = self.topo.purge(now)
             targets = self.topo.rebalance_targets()
             return {
                 "reaped": reaped,
+                "purged": purged,
                 "needs_holders": [{"slot": s.index, "layers": [s.start, s.end],
                                    "have": len(self.topo.holders(s.index)),
                                    "want": self.topo.replication} for s in targets],

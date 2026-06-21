@@ -133,6 +133,8 @@ def make_server(registry, host="0.0.0.0", port=18932, reap_interval=10.0,
                 st = registry.tick(now_fn())
                 if st["reaped"]:
                     log("WARN", "reaped dead nodes", nodes=st["reaped"])
+                if st.get("purged"):
+                    log("INFO", "purged retired nodes", nodes=st["purged"])
                 if not st["coverage_ok"]:
                     log("WARN", "COVERAGE GAP", needs=st["needs_holders"])
                 elif st["needs_holders"]:
