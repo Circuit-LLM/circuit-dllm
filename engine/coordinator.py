@@ -13,6 +13,7 @@ from __future__ import annotations
 import socket
 import struct
 import time
+from collections import deque
 from typing import List, Tuple
 
 import torch
@@ -60,9 +61,11 @@ class Coordinator:
         self.device = device
         self.model_id = model_id
         self._local_range = local_layers
-        # cumulative speculative-decode counters (observability — see spec_stats()).
-        # Single-stream (one generation at a time under the API lock), so plain ints.
-        self._spec = {"calls": 0, "rounds": 0, "accepted": 0, "proposed": 0}
+        # speculative-decode counters (observability — see spec_stats()). Lifetime
+        # totals + a bounded window of recent rounds so late draft drift is visible
+        # (a lifetime average goes sticky). Single-stream under the API lock → plain.
+        self._spec = {"calls": 0, "rounds": 0, "accepted": 0, "proposed": 0,
+                      "window": deque(maxlen=400)}
         self.log("INFO", "loading coordinator parts", model=model_id,
                  local_layers=local_layers, shard=shard)
         self.local_stage = None
@@ -399,19 +402,25 @@ class Coordinator:
             self._reset_sessions(sid)
 
     def spec_stats(self) -> dict:
-        """Cumulative speculative-decode health since start. `acceptance_rate` is the
-        fraction of proposed draft tokens the target accepted (healthy ~0.5–0.8 for a
-        good draft); `tokens_per_round` is mean tokens committed per pipeline pass
-        (1.0 = draft never helps, K+1 = always perfect). A draft silently going bad
-        shows up here as acceptance collapsing toward 0 / tokens_per_round toward 1."""
+        """Speculative-decode health. `acceptance_rate` is the fraction of proposed
+        draft tokens the target accepted (healthy ~0.5–0.8 for a good draft);
+        `tokens_per_round` is mean tokens committed per pipeline pass (1.0 = draft
+        never helps, K+1 = always perfect). The lifetime figures go sticky, so
+        `recent_acceptance_rate` (over the last ≤`window` rounds) is the one that
+        actually surfaces a draft degrading late — watch it collapse toward 0."""
         s = self._spec
         proposed, rounds = s["proposed"], s["rounds"]
+        win = s["window"]
+        wk = sum(k for _, k in win)
+        wa = sum(m for m, _ in win)
         return {
             "calls": s["calls"], "rounds": rounds,
             "draft_tokens_proposed": proposed,
             "draft_tokens_accepted": s["accepted"],
             "acceptance_rate": round(s["accepted"] / proposed, 3) if proposed else None,
             "tokens_per_round": round((s["accepted"] + rounds) / rounds, 2) if rounds else None,
+            "recent_acceptance_rate": round(wa / wk, 3) if wk else None,
+            "recent_rounds": len(win),
         }
 
     def close(self):

@@ -34,12 +34,18 @@ from engine.kv import StageKV
 
 def _bump(local: dict, stats: Optional[dict], m: int, K: int) -> None:
     """Record one verification round: m draft tokens accepted out of K proposed.
-    Updates the per-call `local` and, if given, a cumulative `stats` accumulator."""
+    Updates the per-call `local` and, if given, a cumulative `stats` accumulator.
+    If `stats` carries a bounded "window" deque, the round is also appended there so
+    a caller can report RECENT acceptance (a lifetime average hides late drift)."""
     for d in (local, stats):
         if d is not None:
             d["rounds"] += 1
             d["accepted"] += m
             d["proposed"] += K
+    if stats is not None:
+        w = stats.get("window")
+        if w is not None:
+            w.append((m, K))
 
 
 @torch.no_grad()

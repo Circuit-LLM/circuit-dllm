@@ -78,7 +78,10 @@ def main():
         assert stats["draft_tokens_proposed"] > 0, stats
         assert 0.0 <= stats["acceptance_rate"] <= 1.0, stats
         assert 1.0 <= stats["tokens_per_round"] <= K + 1, stats
-        print("TWO-PROCESS SPECULATIVE DECODE PASSED  (+ /health spec_stats populated)")
+        # the recent-window rate (the one that catches late drift) must populate too
+        assert stats["recent_rounds"] == stats["rounds"], stats
+        assert 0.0 <= stats["recent_acceptance_rate"] <= 1.0, stats
+        print("TWO-PROCESS SPECULATIVE DECODE PASSED  (+ /health spec_stats: lifetime + recent)")
     finally:
         if coord is not None:
             coord.close()
