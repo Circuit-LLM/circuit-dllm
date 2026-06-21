@@ -48,11 +48,13 @@ class Registry:
         if self.allowlist is not None and node.node_id not in self.allowlist:
             raise PermissionError(f"node {node.node_id} not on allowlist")
         slot = self.topo.register(node, now)      # raises on model mismatch / capacity
+        key = derive_node_key(self.master_secret, node.node_id)
+        node.wire_key = key                        # coordinator uses this to talk to the node
         self.wallets[node.node_id] = node.payout_wallet
         return {
             "assignment": {"start": slot.start, "end": slot.end},
             "model_fp": self.topo.model_fp,
-            "session_key": derive_node_key(self.master_secret, node.node_id).hex(),
+            "session_key": key.hex(),
             "coordinator": self.coordinator_endpoint,
             "replication": self.topo.replication,
         }

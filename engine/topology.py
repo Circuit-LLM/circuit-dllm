@@ -46,6 +46,7 @@ class Node:
     slot: Optional[int] = None    # assigned slot index
     state: str = JOINING
     last_hb: float = 0.0          # last heartbeat timestamp
+    wire_key: Optional[bytes] = None  # per-node data-wire key (issued at registration)
 
 
 @dataclass

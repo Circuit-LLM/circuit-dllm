@@ -48,7 +48,7 @@ class Coordinator:
                  key: bytes, device: str = "cpu",
                  local_layers: Optional[Tuple[int, int]] = None,
                  draft_model_id: Optional[str] = None,
-                 shard: bool = False, other_device: str = "cpu"):
+                 shard: bool = False, other_device: str = "cpu", registry=None):
         """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
         so a big model loads once on this pod (layers + head) instead of a
         coordinator and a stage worker each loading the whole model. The model
@@ -95,6 +95,12 @@ class Coordinator:
         self._stage_addrs = stage_addrs
         self.socks = None            # lazy: connect on first request, not at startup
         self._session = 0
+        # Optional dynamic mesh: when a registry is attached, route via its live
+        # Topology + per-node keys instead of the static stage list. The static
+        # path below is left exactly as-is (backward-compatible, zero risk).
+        self.registry = registry
+        self._dynamic = registry is not None
+        self._conns: dict = {}       # node_id -> socket (dynamic mode)
 
     def _ensure_connected(self):
         """Connect to remote stages on first use, so the API serves immediately
@@ -141,6 +147,8 @@ class Coordinator:
         """Run the co-located stage (if any) then each remote stage in order."""
         if self.local_stage is not None:
             hidden = self._run_local(session, pos, hidden)
+        if self._dynamic:
+            return self._relay_dynamic(session, pos, hidden)
         try:
             for s in self._ensure_connected():
                 wire.write_frame(s, self.key, wire.ACTIVATION,
@@ -155,6 +163,52 @@ class Coordinator:
             raise
         return hidden
 
+    # ── dynamic mesh routing (used only when a registry is attached) ───────────
+    def _node_key(self, node) -> bytes:
+        """Per-node data-wire key issued at registration; falls back to the cluster
+        key for nodes seeded without one (e.g. the static-compatible test path)."""
+        k = getattr(node, "wire_key", None)
+        return wire.normalize_key(k) if k else self.key
+
+    def _conn_for(self, node):
+        sock = self._conns.get(node.node_id)
+        if sock is None:
+            host, port = node.endpoint
+            sock = _connect((host, int(port)), self._node_key(node), timeout=300.0)
+            self._conns[node.node_id] = sock
+        return sock
+
+    def _drop_conn(self, node_id: str):
+        sock = self._conns.pop(node_id, None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _relay_dynamic(self, session: int, pos: int, hidden: torch.Tensor) -> torch.Tensor:
+        """Route through the live mesh: walk the pipeline slots in order, sending to
+        each slot's primary healthy holder with that node's key. On a hop failure,
+        drop the connection + mark the node suspect (Phase-2 failover will retry the
+        next holder; until then the request fails and the next one re-routes)."""
+        for _slot, holders in self.registry.topo.route():
+            node = holders[0]
+            key = self._node_key(node)
+            try:
+                sock = self._conn_for(node)
+                wire.write_frame(sock, key, wire.ACTIVATION,
+                                 pack_activation(session, pos, hidden.detach().cpu()))
+                mt, payload = wire.read_frame_keyed(sock, key)
+                if mt != wire.RESULT:
+                    raise wire.WireError(f"expected RESULT, got {wire.msg_name(mt)}")
+                _, _, _, hidden = unpack_activation(payload)
+                hidden = hidden.to(self.device)
+            except (wire.WireError, OSError):
+                self._drop_conn(node.node_id)
+                self.registry.topo.mark_suspect(node.node_id)
+                raise
+        return hidden
+
     def _reset_sessions(self, session: int):
         """Free a finished session's KV everywhere: drop the coordinator's local
         cache and tell each remote stage to free its per-session cache. Called in
@@ -162,6 +216,16 @@ class Coordinator:
         just means that stage reclaims on its own restart, and a fresh session at
         pos==0 starts clean regardless."""
         self._local_caches.pop(session, None)
+        if self._dynamic:
+            for nid, sock in list(self._conns.items()):
+                node = self.registry.topo.nodes.get(nid)
+                key = self._node_key(node) if node else self.key
+                try:
+                    wire.write_frame(sock, key, wire.KV_CTRL,
+                                     struct.pack(">IBI", session, KVOP_RESET, 0))
+                except OSError:
+                    self._drop_conn(nid)
+            return
         for s in (self.socks or []):
             try:
                 wire.write_frame(s, self.key, wire.KV_CTRL,
@@ -173,6 +237,16 @@ class Coordinator:
     def _kv_truncate(self, session: int, length: int):
         if session in self._local_caches:
             self._local_caches[session].truncate_to(length)
+        if self._dynamic:
+            for nid, sock in list(self._conns.items()):
+                node = self.registry.topo.nodes.get(nid)
+                key = self._node_key(node) if node else self.key
+                try:
+                    wire.write_frame(sock, key, wire.KV_CTRL,
+                                     struct.pack(">IBI", session, KVOP_TRUNCATE, length))
+                except OSError:
+                    self._drop_conn(nid)
+            return
         for s in (self.socks or []):
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_TRUNCATE, length))
@@ -277,6 +351,17 @@ class Coordinator:
             self._reset_sessions(sid)
 
     def close(self):
+        if self._dynamic:
+            for nid, sock in list(self._conns.items()):
+                node = self.registry.topo.nodes.get(nid)
+                key = self._node_key(node) if node else self.key
+                try:
+                    wire.write_frame(sock, key, wire.BYE, b"")
+                    sock.close()
+                except OSError:
+                    pass
+            self._conns.clear()
+            return
         for s in (self.socks or []):
             try:
                 wire.write_frame(s, self.key, wire.BYE, b"")
