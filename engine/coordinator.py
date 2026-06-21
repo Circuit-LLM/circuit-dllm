@@ -191,9 +191,9 @@ class Coordinator:
         """Route through the live mesh, PINNING the route for the session's lifetime
         (session affinity → the chosen holders keep this session's KV warm). The pin
         is taken (thread-safe snapshot) at the session's first hop and reused for
-        every later token; on a hop failure we drop the pin so the next session
-        re-routes cleanly (Phase 2 adds mid-session failover + re-prefill onto a
-        replica)."""
+        every later token; on a hop failure we drop the dead conn, mark the holder
+        SUSPECT, drop the pin, and raise — the caller (_relay_with_failover) then
+        re-prefills the session onto a replica and retries (mid-session failover)."""
         route = self._session_routes.get(session)
         if route is None or pos == 0:
             route = self.registry.route_snapshot()   # locked; raises on a coverage gap
@@ -215,6 +215,36 @@ class Coordinator:
                 self._session_routes.pop(session, None)
                 raise
         return hidden
+
+    def _reprefill(self, session: int, token_ids):
+        """Rebuild a session's KV after a mid-session holder death: reset every stage's
+        KV (+ the local cache + the pinned route), then re-run the whole sequence so
+        far at pos=0 on a fresh route — the dead holder is now SUSPECT, so the route
+        snapshot picks its replica. Wasteful (the survivors re-process) but exactly
+        correct: you cannot rebuild one stage's KV without the inputs the survivors
+        already consumed. token_ids = the [1, L] tokens for positions 0..L-1."""
+        self._reset_sessions(session)                    # RESET KV everywhere + drop the pin
+        if token_ids is not None and token_ids.shape[1] > 0:
+            self._relay(session, 0, self.embed(token_ids))   # re-pins route, rebuilds KV 0..L-1
+
+    def _relay_with_failover(self, session: int, pos: int, embed_input, prefill_ids,
+                             max_failovers: int = 2):
+        """Relay one hop, surviving a holder dying mid-session by failing over to a
+        replica. On a wire error _relay has already dropped the dead conn, marked the
+        node SUSPECT, and dropped the pin; we re-prefill the session on a fresh route
+        and retry the hop. Static mode (no replicas) is a plain relay."""
+        if not self._dynamic:
+            return self._relay(session, pos, embed_input)
+        last = None
+        for attempt in range(max_failovers + 1):
+            try:
+                if attempt > 0:   # a prior hop failed — rebuild KV on a fresh route first
+                    self.log("WARN", "stage failed mid-session, failing over", pos=pos, attempt=attempt)
+                    self._reprefill(session, prefill_ids)
+                return self._relay(session, pos, embed_input)
+            except (wire.WireError, OSError) as e:
+                last = e
+        raise last
 
     def _reset_sessions(self, session: int):
         """Free a finished session's KV everywhere: drop the coordinator's local
@@ -266,9 +296,10 @@ class Coordinator:
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             seq = ids.shape[1]
+            seq_ids = ids                            # tokens for the positions already in KV
 
             # prefill (pos=0 tells the stages to begin a fresh sequence)
-            hidden = self._relay(sid, 0, self.embed(ids))
+            hidden = self._relay_with_failover(sid, 0, self.embed(ids), seq_ids[:, :0])
             nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
             out = []
             cur = seq
@@ -277,7 +308,8 @@ class Coordinator:
                 if tid in self._eos_ids:
                     break
                 out.append(tid)
-                hidden = self._relay(sid, cur, self.embed(nxt))
+                hidden = self._relay_with_failover(sid, cur, self.embed(nxt), seq_ids)
+                seq_ids = torch.cat([seq_ids, nxt], dim=1)
                 nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
                 cur += 1
             return self.tok.decode(out), out
@@ -292,7 +324,8 @@ class Coordinator:
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             cur = ids.shape[1]
-            hidden = self._relay(sid, 0, self.embed(ids))
+            seq_ids = ids                            # tokens for the positions already in KV
+            hidden = self._relay_with_failover(sid, 0, self.embed(ids), seq_ids[:, :0])
             nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
             produced: List[int] = []
             prev_text = ""
@@ -305,7 +338,8 @@ class Coordinator:
                 if len(text) > len(prev_text):
                     yield text[len(prev_text):]
                     prev_text = text
-                hidden = self._relay(sid, cur, self.embed(nxt))
+                hidden = self._relay_with_failover(sid, cur, self.embed(nxt), seq_ids)
+                seq_ids = torch.cat([seq_ids, nxt], dim=1)
                 nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
                 cur += 1
         finally:
