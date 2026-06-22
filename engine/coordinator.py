@@ -432,37 +432,42 @@ class Coordinator:
                 pass
 
     @torch.no_grad()
-    def generate_batch(self, prompts: List[str], n_new: int = 64,
-                       stop_on_eos: bool = True) -> List[List[int]]:
+    def generate_batch_stream(self, prompts: List[str], n_new=64, stop_on_eos: bool = True):
         """Decode a fixed batch of prompts together — one batched forward per step —
-        and return each prompt's generated token ids. Token-identical to running each
-        prompt through generate() alone. A sequence that hits EOS stops contributing to
-        the output but rides along until the batch drains (static batching; the
-        scheduler adds dynamic admit/evict)."""
+        yielding (row_index, token_id) as each token is produced, until every sequence
+        finishes (EOS or its own token cap). The per-row stream is token-identical to
+        running that prompt through generate() alone. `n_new` is an int (same cap for
+        all) or a per-row list. A finished row rides along until the batch drains
+        (static batching; dynamic admit/evict is the next step)."""
         bid = next(self._batch_ids)
+        B = len(prompts)
+        caps = list(n_new) if isinstance(n_new, (list, tuple)) else [n_new] * B
+        done = [False] * B
+        count = [0] * B
         try:
             ids, attn = self._batch_inputs(prompts)
-            B = ids.shape[0]
             pos = (attn.long().cumsum(-1) - 1).clamp(min=0)
             hidden = self._relay_batch(bid, 0, self.embed(ids), pos, attn)
             nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)   # [B,1]
             lengths = attn.long().sum(-1)
-            outs: List[List[int]] = [[] for _ in range(B)]
-            done = [False] * B
 
-            def record(tok_col):
+            def emit():
                 for b in range(B):
-                    if done[b]:
+                    if done[b] or count[b] >= caps[b]:
+                        done[b] = True
                         continue
-                    t = int(tok_col[b])
+                    t = int(nxt[b])
                     if stop_on_eos and t in self._eos_ids:
                         done[b] = True
                     else:
-                        outs[b].append(t)
+                        count[b] += 1
+                        yield b, t
+                        if count[b] >= caps[b]:
+                            done[b] = True
 
-            record(nxt)
+            yield from emit()
             cur_attn = attn
-            for step in range(n_new - 1):
+            for step in range(max(caps) - 1):
                 if all(done):
                     break
                 ones = torch.ones(B, 1, dtype=attn.dtype, device=self.device)
@@ -471,10 +476,18 @@ class Coordinator:
                                            lengths.unsqueeze(1), cur_attn)
                 nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
                 lengths = lengths + 1
-                record(nxt)
-            return outs
+                yield from emit()
         finally:
             self._reset_batch(bid)
+
+    @torch.no_grad()
+    def generate_batch(self, prompts: List[str], n_new=64,
+                       stop_on_eos: bool = True) -> List[List[int]]:
+        """Collect generate_batch_stream into per-prompt token lists (non-streaming)."""
+        outs: List[List[int]] = [[] for _ in prompts]
+        for b, t in self.generate_batch_stream(prompts, n_new, stop_on_eos):
+            outs[b].append(t)
+        return outs
 
     @torch.no_grad()
     def generate(self, prompt: str, n_new: int = 20) -> Tuple[str, List[int]]:
