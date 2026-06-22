@@ -203,11 +203,13 @@ def _resolve_node_identity(a):
             try:
                 d = os.path.dirname(kf)
                 if d:
-                    os.makedirs(d, exist_ok=True)
+                    os.makedirs(d, mode=0o700, exist_ok=True)
                 raw = sk.private_bytes(RAW, RAWPRIV, serialization.NoEncryption())
-                with open(kf, "w") as f:
+                # Create the key file 0600 atomically (O_EXCL) — no world-readable
+                # window between create and chmod for this private-key credential.
+                fd = os.open(kf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as f:
                     f.write(raw.hex())
-                os.chmod(kf, 0o600)
             except OSError:
                 pass
     node_id = sk.public_key().public_bytes(RAW, serialization.PublicFormat.Raw).hex()
