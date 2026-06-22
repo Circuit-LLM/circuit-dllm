@@ -32,8 +32,10 @@ export CIRCUIT_CONTROL_HOST=0.0.0.0
 export CIRCUIT_CONTROL_PORT="${CIRCUIT_CONTROL_PORT:-18932}"   # exposed so clients can /register
 # CIRCUIT_COORDINATOR_ADVERTISE: public host:port nodes are told to reach the coordinator at.
 export CIRCUIT_COORDINATOR_ADVERTISE="${CIRCUIT_COORDINATOR_ADVERTISE:-}"
-# CIRCUIT_MESH_SECRET falls back to CIRCUIT_KEY (private net). Signature enforcement
-# (CIRCUIT_MESH_VERIFY_SIG=1) is OFF until the client signs its registration — run
-# permissioned on a private net until then (see docs/UNIFIED_NODE.md Phase 2).
+# CIRCUIT_MESH_SECRET falls back to CIRCUIT_KEY (private net).
+# ENFORCE ed25519: clients (run-mesh.sh) now sign their /register, so a node must prove
+# it holds the private key behind its node_id (no impersonation). Set 0 to allow
+# unsigned joins (legacy/debug).
+export CIRCUIT_MESH_VERIFY_SIG="${CIRCUIT_MESH_VERIFY_SIG:-1}"
 
 exec python3 -u -m engine.api

@@ -10,7 +10,8 @@
 #
 # Env (set by the node-client supervisor, or per-pod for tests):
 #   CIRCUIT_CONTROL_URL    coordinator control endpoint, e.g. http://1.2.3.4:18932   (required)
-#   CIRCUIT_NODE_ID        this node's id (ed25519 pubkey hex; unique per node)        (required)
+#   CIRCUIT_NODE_KEY       ed25519 private key hex; node id derives from it & signs /register (optional)
+#   CIRCUIT_NODE_KEY_FILE  where the node key is persisted/generated (default /workspace/node_key.hex)
 #   CIRCUIT_MODEL_FP       must equal the coordinator's CIRCUIT_MESH_FP                (default qwen2.5-32b-awq)
 #   CIRCUIT_CAPACITY_LAYERS max contiguous layers this GPU can hold                    (default 64)
 #   CIRCUIT_ADVERTISE_HOST / CIRCUIT_ADVERTISE_PORT  public host:port the coordinator dials (proxy)
@@ -25,12 +26,14 @@ export HF_HOME=/dev/shm/hf-cache
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
 
 : "${CIRCUIT_CONTROL_URL:?CIRCUIT_CONTROL_URL (http://coord-host:18932) must be set}"
-: "${CIRCUIT_NODE_ID:?CIRCUIT_NODE_ID (ed25519 pubkey hex) must be set}"
 
+# node id derives from the ed25519 key (--node-key if given, else persisted/generated at
+# --node-key-file) and signs /register, so the coordinator can enforce CIRCUIT_MESH_VERIFY_SIG.
 exec python3 -u -m engine.stage_worker \
   --port 19210 --model "$CIRCUIT_MODEL" --device cuda --host 0.0.0.0 --prune \
   --control-url   "$CIRCUIT_CONTROL_URL" \
-  --node-id       "$CIRCUIT_NODE_ID" \
+  --node-key      "${CIRCUIT_NODE_KEY:-}" \
+  --node-key-file "${CIRCUIT_NODE_KEY_FILE:-/workspace/node_key.hex}" \
   --capacity-layers "${CIRCUIT_CAPACITY_LAYERS:-64}" \
   --model-fp      "${CIRCUIT_MODEL_FP:-qwen2.5-32b-awq}" \
   --advertise-host "${CIRCUIT_ADVERTISE_HOST:-}" \

@@ -182,6 +182,38 @@ def _control_post(url, obj, timeout=10):
         return r.status, _json.loads(r.read())
 
 
+def _resolve_node_identity(a):
+    """Resolve this node's ed25519 keypair for SIGNED registration and return
+    (private_key, node_id_hex). Priority: --node-key hex, else a persisted key file
+    (stable identity across restarts), else generate one and save it. node_id is the
+    public key hex — the coordinator's ed25519 verifier proves the registrant holds
+    the matching private key, so a node can't impersonate another's id."""
+    import os
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    RAW, RAWPRIV = serialization.Encoding.Raw, serialization.PrivateFormat.Raw
+    if a.node_key:
+        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(a.node_key.strip()))
+    else:
+        kf = a.node_key_file or os.environ.get("CIRCUIT_NODE_KEY_FILE") or "/workspace/node_key.hex"
+        if os.path.exists(kf):
+            sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(open(kf).read().strip()))
+        else:
+            sk = Ed25519PrivateKey.generate()
+            try:
+                d = os.path.dirname(kf)
+                if d:
+                    os.makedirs(d, exist_ok=True)
+                raw = sk.private_bytes(RAW, RAWPRIV, serialization.NoEncryption())
+                with open(kf, "w") as f:
+                    f.write(raw.hex())
+                os.chmod(kf, 0o600)
+            except OSError:
+                pass
+    node_id = sk.public_key().public_bytes(RAW, serialization.PublicFormat.Raw).hex()
+    return sk, node_id
+
+
 def run_control_client(a):
     """Join a coordinator's mesh: register over the control channel, receive an
     assigned layer range + a per-node key, then serve those layers with that key
@@ -196,14 +228,23 @@ def run_control_client(a):
     # externally-reachable port when given, else the bind port.
     advertise_port = a.advertise_port or a.port
 
-    code, resp = _control_post(base + "/register", {
+    import json as _json, time as _time
+    reg = {
         "node_id": a.node_id,
         "endpoint": [advertise, advertise_port],
         "capacity_layers": a.capacity_layers,
         "model_fp": a.model_fp,
         "reachability": "public",
         "payout_wallet": a.payout_wallet or "",
-    })
+        "ts": int(_time.time()),
+    }
+    # Sign the canonical body (minus sig) so the coordinator's ed25519 verifier can
+    # prove we hold the private key behind node_id. Unsigned only if no key resolved
+    # (legacy/private-net with CIRCUIT_MESH_VERIFY_SIG off).
+    if getattr(a, "_signing_key", None) is not None:
+        msg = _json.dumps(reg, sort_keys=True, separators=(",", ":")).encode()
+        reg["sig"] = a._signing_key.sign(msg).hex()
+    code, resp = _control_post(base + "/register", reg)
     if code != 200:
         raise SystemExit(f"register rejected ({code}): {resp}")
     start, end = resp["assignment"]["start"], resp["assignment"]["end"]
@@ -261,7 +302,9 @@ def main():
     ap.add_argument("--key", help="64-char hex cluster key for static mode")
     # ── control-client mode: join a coordinator's mesh; receive layers + a per-node key ──
     ap.add_argument("--control-url", help="join the mesh via this coordinator control URL")
-    ap.add_argument("--node-id", help="this node's id (ed25519 pubkey hex)")
+    ap.add_argument("--node-id", help="this node's id (ed25519 pubkey hex); derived from the key if a key is resolved")
+    ap.add_argument("--node-key", help="ed25519 private key hex; node-id derives from it (signs /register)")
+    ap.add_argument("--node-key-file", help="persist/load the node key here (default /workspace/node_key.hex) for a stable identity across restarts")
     ap.add_argument("--capacity-layers", type=int, default=999,
                     help="max contiguous layers this node can hold")
     ap.add_argument("--model-fp", default="", help="fingerprint of the model this node loads")
@@ -275,8 +318,11 @@ def main():
     a = ap.parse_args()
 
     if a.control_url:
-        if not a.node_id:
-            ap.error("--node-id is required with --control-url")
+        sk, node_id = _resolve_node_identity(a)
+        if a.node_id and a.node_id != node_id:
+            ap.error(f"--node-id does not match the resolved key's pubkey ({node_id})")
+        a.node_id = node_id
+        a._signing_key = sk
         run_control_client(a)
         return
 
