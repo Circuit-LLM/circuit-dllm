@@ -48,11 +48,11 @@ class Stage:
         lt = getattr(self.config, "layer_types", None)
         return lt[global_idx] if lt else "full_attention"
 
-    def _masks(self, hidden, position_ids, past_key_values):
+    def _masks(self, hidden, position_ids, past_key_values, attention_mask=None):
         mask_kwargs = dict(
             config=self.config,
             inputs_embeds=hidden,
-            attention_mask=None,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -63,10 +63,16 @@ class Stage:
 
     @torch.no_grad()
     def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor,
-                past_key_values=None, use_cache: bool = False) -> torch.Tensor:
-        """Run this stage's layer block. Returns the updated hidden state."""
+                past_key_values=None, use_cache: bool = False,
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run this stage's layer block. Returns the updated hidden state.
+
+        attention_mask: optional 2D padding mask [B, kv_len] (1=real, 0=pad) for
+        ragged batched decode — create_causal_mask folds it into the causal mask so
+        each row attends only to its own real KV. None (default) = pure causal,
+        byte-identical to the single-sequence path."""
         position_embeddings = self.rotary_emb(hidden, position_ids)
-        masks = self._masks(hidden, position_ids, past_key_values)
+        masks = self._masks(hidden, position_ids, past_key_values, attention_mask)
         for gidx, layer in zip(self.layer_indices, self.layers):
             hidden = layer(
                 hidden,
