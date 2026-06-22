@@ -25,10 +25,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.coordinator import Coordinator  # noqa: E402
+from engine.scheduler import BatchScheduler  # noqa: E402
 from engine.log import make_logger  # noqa: E402
 
 log = make_logger("api")
 _coord: Coordinator = None
+_sched: BatchScheduler = None    # set when CIRCUIT_BATCH=1 (intra-step batching)
 
 
 def _build_coordinator(registry=None) -> Coordinator:
@@ -167,6 +169,78 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    def _serve_batched(self, prompt, max_tokens, stream, tools, cid, created, model, t0):
+        """Serve a request through the batch scheduler: submit it, drain its token
+        queue, shape the OpenAI response (SSE or one JSON). Batched greedy — no
+        speculative draft in this mode (the design trades it for throughput)."""
+        out_q = _sched.submit(prompt, max_tokens)
+        produced = []
+
+        if stream:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            prev_text = ""
+            n = 0
+            try:
+                while True:
+                    item = out_q.get()
+                    if item is BatchScheduler.DONE:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    produced.append(item)
+                    text = _coord.tok.decode(produced)
+                    if len(text) > len(prev_text):
+                        chunk = {"id": cid, "object": "chat.completion.chunk",
+                                 "created": created, "model": model,
+                                 "choices": [{"index": 0, "delta": {"content": text[len(prev_text):]},
+                                              "finish_reason": None}]}
+                        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                        self.wfile.flush()
+                        prev_text = text
+                        n += 1
+                done = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                        "model": model, "choices": [{"index": 0, "delta": {},
+                                                     "finish_reason": "stop"}]}
+                self.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                log("WARN", "client disconnected mid-stream")
+            log("INFO", "done", chunks=n, secs=round(time.time() - t0, 2))
+            return
+
+        # non-streaming
+        try:
+            while True:
+                item = out_q.get()
+                if item is BatchScheduler.DONE:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                produced.append(item)
+        except Exception as e:   # noqa: BLE001
+            return self._json(500, {"error": str(e)})
+        text = _coord.tok.decode(produced)
+        message = {"role": "assistant", "content": text}
+        finish = "stop"
+        if tools:
+            content, tool_calls = _parse_tool_calls(text)
+            message = {"role": "assistant", "content": content}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+                finish = "tool_calls"
+        self._json(200, {
+            "id": cid, "object": "chat.completion", "created": created, "model": model,
+            "choices": [{"index": 0, "finish_reason": finish, "message": message}],
+            "usage": {"completion_tokens": len(produced)},
+        })
+        log("INFO", "done", tokens=len(produced), secs=round(time.time() - t0, 2))
+
     def do_POST(self):
         if self.path != "/v1/chat/completions":
             return self._json(404, {"error": "not found"})
@@ -188,6 +262,9 @@ class Handler(BaseHTTPRequestHandler):
         model = _coord.model_id
         t0 = time.time()
         log("INFO", "request", stream=stream, max_tokens=max_tokens, msgs=len(messages), tools=bool(tools))
+
+        if _sched is not None:   # batch mode (CIRCUIT_BATCH=1) — route through the scheduler
+            return self._serve_batched(prompt, max_tokens, stream, tools, cid, created, model, t0)
 
         if stream:
             # un-chunked SSE has no length/chunk end-signal, so close the socket
@@ -246,10 +323,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global _coord
+    global _coord, _sched
     log("INFO", "loading engine", model=os.environ.get("CIRCUIT_MODEL"))
     mesh = _build_mesh()                       # None unless CIRCUIT_MESH=1
     _coord = _build_coordinator(registry=mesh[0] if mesh else None)
+
+    if os.environ.get("CIRCUIT_BATCH") == "1":   # intra-step batching (Win B)
+        mb = int(os.environ.get("CIRCUIT_MAX_BATCH", "8"))
+        _sched = BatchScheduler(_coord, max_batch=mb)
+        log("INFO", "batch scheduler on — requests are batched", max_batch=mb)
 
     if mesh:
         from engine.control_server import make_server
