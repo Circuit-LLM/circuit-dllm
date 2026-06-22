@@ -203,9 +203,15 @@ never a silent change to the running engine.
 1. **Win A — overlap.** Per-request connection isolation (contextvar + `_ConnPool`),
    gated `CIRCUIT_MAX_CONCURRENCY` (default 1). **DONE — live on both pods at 4, correct,
    1.40×.**
-2. **Win B — intra-step batching.** Phases B1–B5 (§3.5). B1 (`BatchKV` + batched forward,
-   in-process, token-identical) is the correctness foundation and the right first step;
-   B5 (paged) is deferred behind padded batching. Gated `CIRCUIT_BATCH` / `CIRCUIT_MAX_BATCH`.
+2. **Win B — intra-step batching. B1–B3 BUILT + token-identical on CPU (2026-06-22),
+   gated `CIRCUIT_BATCH` / `CIRCUIT_MAX_BATCH`, NOT yet deployed.** B1 batched forward
+   (2D padding mask + per-row positions, no custom kernel), B2 batched wire
+   (BATCH_ACTIVATION), B3a `generate_batch` primitive (live shape: co-located +
+   remote), B3 scheduler (`engine/scheduler.py`, queue → batched decode → per-request
+   stream) + API (`_serve_batched`). Static batching; B4 (dynamic admit/evict, chunked
+   prefill) and B5 (paged) remain. Throughput is a GPU measurement at deploy — do it
+   when concurrent load justifies it (the swarm is on OpenRouter today, so there's no
+   load yet; the build is banked + ready).
 
 **Invariant throughout:** default config = today's behaviour; output always token-identical
 to sequential greedy; the live engine changes only on a deliberate, measured deploy. Same
