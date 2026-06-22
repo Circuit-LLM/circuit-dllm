@@ -326,14 +326,12 @@ def main():
     global _coord, _sched
     log("INFO", "loading engine", model=os.environ.get("CIRCUIT_MODEL"))
     mesh = _build_mesh()                       # None unless CIRCUIT_MESH=1
-    _coord = _build_coordinator(registry=mesh[0] if mesh else None)
-
-    if os.environ.get("CIRCUIT_BATCH") == "1":   # intra-step batching (Win B)
-        mb = int(os.environ.get("CIRCUIT_MAX_BATCH", "8"))
-        _sched = BatchScheduler(_coord, max_batch=mb)
-        log("INFO", "batch scheduler on — requests are batched", max_batch=mb)
-
     if mesh:
+        # Bring the control channel up BEFORE loading this coordinator's (slow) local
+        # model, so a joining node registers and loads its layers IN PARALLEL with our
+        # load instead of waiting for it — halves mesh cold-start downtime. Registration
+        # only touches the registry/topology (no model needed); the HTTP serving path
+        # below still waits for the model via _build_coordinator.
         from engine.control_server import make_server
         reg, chost, cport, reap, verify_sig = mesh
         csrv = make_server(reg, host=chost, port=cport, reap_interval=reap,
@@ -342,6 +340,13 @@ def main():
         log("INFO", "mesh control channel up — nodes may join", port=cport,
             stages=len(reg.topo.slots), replication=reg.topo.replication,
             allowlisted=(reg.allowlist is not None))
+
+    _coord = _build_coordinator(registry=mesh[0] if mesh else None)
+
+    if os.environ.get("CIRCUIT_BATCH") == "1":   # intra-step batching (Win B)
+        mb = int(os.environ.get("CIRCUIT_MAX_BATCH", "8"))
+        _sched = BatchScheduler(_coord, max_batch=mb)
+        log("INFO", "batch scheduler on — requests are batched", max_batch=mb)
 
     port = int(os.environ.get("CIRCUIT_API_PORT", "18931"))
     host = os.environ.get("CIRCUIT_API_HOST", "0.0.0.0")
