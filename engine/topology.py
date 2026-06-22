@@ -95,6 +95,12 @@ class Topology:
         has the capacity to hold. Raises on model mismatch / insufficient capacity."""
         if node.model_fp != self.model_fp:
             raise ValueError(f"model mismatch: node {node.model_fp!r} != mesh {self.model_fp!r}")
+        # A node re-registering (e.g. its worker restarted — same persisted node_id) must
+        # not double-count: drop any prior holding so it isn't listed twice. Removing it
+        # before _pick_slot also lets it land back on its old (now-emptier) slot.
+        for s in self.slots:
+            if node.node_id in s.holders:
+                s.holders.remove(node.node_id)
         slot = self._pick_slot(node)
         if slot is None:
             raise ValueError("no slot this node can hold (capacity_layers too small)")
