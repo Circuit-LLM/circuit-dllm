@@ -96,7 +96,37 @@ def unpack_activation(payload: bytes) -> Tuple[int, int, int, torch.Tensor]:
     return session_id, position, flags, hidden
 
 
+def pack_batch_activation(batch_id: int, position: int, hidden: torch.Tensor,
+                          position_ids: torch.Tensor, attention_mask: torch.Tensor,
+                          flags: int = FLAG_NONE) -> bytes:
+    """Payload for a batched activation (Win B): the [B,T,D] hidden plus the per-row
+    position_ids [B,T] and the 2D padding mask [B,kv_len] the stage needs to attend
+    each row to its own ragged KV. Length-delimited so the three tensors unpack cleanly."""
+    parts = [pack_tensor(hidden),
+             pack_tensor(position_ids.to(torch.int32)),
+             pack_tensor(attention_mask.to(torch.uint8))]
+    body = b"".join(struct.pack(">I", len(p)) + p for p in parts)
+    return struct.pack(">IIB", batch_id & 0xFFFFFFFF, position & 0xFFFFFFFF, flags) + body
+
+
+def unpack_batch_activation(payload: bytes):
+    """Inverse -> (batch_id, position, flags, hidden, position_ids, attention_mask)."""
+    if len(payload) < 9:
+        raise TensorError("batch activation payload too short")
+    batch_id, position, flags = struct.unpack(">IIB", payload[:9])
+    off = 9
+    tensors = []
+    for _ in range(3):
+        (n,) = struct.unpack(">I", payload[off:off + 4])
+        off += 4
+        tensors.append(unpack_tensor(payload[off:off + n]))
+        off += n
+    hidden, position_ids, attention_mask = tensors
+    return batch_id, position, flags, hidden, position_ids, attention_mask
+
+
 __all__ = [
     "FLAG_NONE", "FLAG_LAST_STAGE", "TensorError",
     "pack_tensor", "unpack_tensor", "pack_activation", "unpack_activation",
+    "pack_batch_activation", "unpack_batch_activation",
 ]

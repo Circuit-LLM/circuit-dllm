@@ -24,7 +24,7 @@ import threading
 import torch
 
 from engine import wire
-from engine.tensors import pack_activation, unpack_activation
+from engine.tensors import pack_activation, unpack_activation, unpack_batch_activation
 from engine.stage import stage_for_range
 from engine.kv import StageKV
 from engine.model import load_model
@@ -134,6 +134,22 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock):
             with compute_lock:                      # one model fwd at a time across peers
                 out = stage.forward(hidden, position_ids, past_key_values=cache, use_cache=True)
             wire.write_frame(conn, key, wire.RESULT, pack_activation(session, pos, out.cpu()))
+
+        elif mt == wire.BATCH_ACTIVATION:
+            # Win B: a batched hidden [B,T,D] with its own per-row position_ids and 2D
+            # padding mask — the coordinator computed them, the stage just applies them.
+            batch_id, pos, _flags, hidden, position_ids, attn = unpack_batch_activation(payload)
+            hidden = hidden.to(device)
+            position_ids = position_ids.to(device).long()
+            attn = attn.to(device)
+            cache = sessions.get(batch_id)
+            if cache is None or pos == 0:           # pos==0 begins a fresh batch
+                cache = StageKV(config)
+                sessions[batch_id] = cache
+            with compute_lock:
+                out = stage.forward(hidden, position_ids, past_key_values=cache,
+                                    use_cache=True, attention_mask=attn)
+            wire.write_frame(conn, key, wire.RESULT, pack_activation(batch_id, pos, out.cpu()))
 
         elif mt == wire.KV_CTRL:
             session, op, arg = struct.unpack(">IBI", payload[:9])

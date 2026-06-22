@@ -59,10 +59,12 @@ PING = 6
 PONG = 7
 ERROR = 8
 BYE = 9
+BATCH_ACTIVATION = 10  # batched hidden states (Win B): [B,T,D] + per-row pos + 2D mask
 
 _NAMES = {
     HELLO: "HELLO", WELCOME: "WELCOME", ACTIVATION: "ACTIVATION", RESULT: "RESULT",
     KV_CTRL: "KV_CTRL", PING: "PING", PONG: "PONG", ERROR: "ERROR", BYE: "BYE",
+    BATCH_ACTIVATION: "BATCH_ACTIVATION",
 }
 
 
