@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextvars
 import itertools
+import os
 import socket
 import struct
 import threading
@@ -39,6 +40,12 @@ from engine.log import make_logger
 # wait via _ensure_connected.)
 _DYNAMIC_CONNECT_TIMEOUT = 8.0
 
+# Explicit per-read timeout on stage sockets so a HUNG node (alive, accepts, never
+# replies) can't block a request forever — the read raises, and the dynamic path fails
+# over (the static path drops + reconnects). Generous enough not to false-positive on a
+# slow node's forward; tune up for slow remote GPUs via CIRCUIT_STAGE_READ_TIMEOUT.
+_STAGE_READ_TIMEOUT = float(os.environ.get("CIRCUIT_STAGE_READ_TIMEOUT", "30"))
+
 
 def _connect(addr: Tuple[str, int], key: bytes, timeout: float = 180.0):
     """Connect to a stage worker, retrying until it's up (it loads a model first)."""
@@ -49,6 +56,7 @@ def _connect(addr: Tuple[str, int], key: bytes, timeout: float = 180.0):
         try:
             s = socket.create_connection((host, port), timeout=10)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.settimeout(_STAGE_READ_TIMEOUT)   # explicit read timeout (hung-node guard)
             return s
         except OSError as e:
             last = e
