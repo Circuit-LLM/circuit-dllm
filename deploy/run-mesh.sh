@@ -27,6 +27,16 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
 
 : "${CIRCUIT_CONTROL_URL:?CIRCUIT_CONTROL_URL (http://coord-host:18932) must be set}"
 
+# Self-discover the PUBLIC address the coordinator dials to reach this node. On RunPod the
+# container is handed RUNPOD_PUBLIC_IP + RUNPOD_TCP_PORT_<internal> (the proxy mapping for
+# our :19210), so a node needs NO hand-wiring — it figures out its own reachable address.
+# An explicit CIRCUIT_ADVERTISE_* still wins (e.g. a home/bare-metal box with its own
+# public IP/port). So on RunPod an operator sets only CIRCUIT_CONTROL_URL (+ key); the
+# advertise address is automatic.
+ADV_HOST="${CIRCUIT_ADVERTISE_HOST:-${RUNPOD_PUBLIC_IP:-}}"
+ADV_PORT="${CIRCUIT_ADVERTISE_PORT:-${RUNPOD_TCP_PORT_19210:-0}}"
+echo "[run-mesh] advertising ${ADV_HOST:-<bind>}:${ADV_PORT:-<bind>} -> coordinator $CIRCUIT_CONTROL_URL"
+
 # node id derives from the ed25519 key (--node-key if given, else persisted/generated at
 # --node-key-file) and signs /register, so the coordinator can enforce CIRCUIT_MESH_VERIFY_SIG.
 exec python3 -u -m engine.stage_worker \
@@ -36,6 +46,6 @@ exec python3 -u -m engine.stage_worker \
   --node-key-file "${CIRCUIT_NODE_KEY_FILE:-/workspace/node_key.hex}" \
   --capacity-layers "${CIRCUIT_CAPACITY_LAYERS:-64}" \
   --model-fp      "${CIRCUIT_MODEL_FP:-qwen2.5-32b-awq}" \
-  --advertise-host "${CIRCUIT_ADVERTISE_HOST:-}" \
-  --advertise-port "${CIRCUIT_ADVERTISE_PORT:-0}" \
+  --advertise-host "$ADV_HOST" \
+  --advertise-port "$ADV_PORT" \
   --payout-wallet "${CIRCUIT_PAYOUT_WALLET:-}"
