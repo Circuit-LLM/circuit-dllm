@@ -8,6 +8,13 @@
 > (Node client) are two disconnected programs. We keep them as two *processes* but
 > ship them as one *product*, with the node-client as the front door and the Python
 > engine as the compute backend it supervises.
+>
+> **Authority vs. supervision (don't confuse them):** the **coordinator is the
+> network authority** — it admits nodes, assigns layer slots, orchestrates the
+> pipeline, and runs attribution. The **node-client is only the *local* supervisor**
+> on an operator's machine: it launches and babysits its own Python worker, holds the
+> wallet enrollment, and reports telemetry. It *obeys* the coordinator. "Front door"
+> = what the user installs/sees; not a network authority.
 
 ---
 
@@ -29,8 +36,8 @@
         ┌───────┴────────┐               ┌───────┴────────────────┐
         │  NODE (GPU)    │               │  NODE (GPU)  …add N     │
         │  ┌───────────┐ │               │  one container:         │
-        │  │node-client│ │  supervises   │   node-client (boss)    │
-        │  │  (boss)   │─┼──launches──►  │   + engine.stage_worker │
+        │  │node-client│ │  supervises   │   node-client (agent)   │
+        │  │  (agent)  │─┼──launches──►  │   + engine.stage_worker │
         │  └───────────┘ │               │   own volume: own model │
         │  engine worker │               │   own node-key (hot)    │
         │  layers X:Y    │               │   payout → your wallet  │
