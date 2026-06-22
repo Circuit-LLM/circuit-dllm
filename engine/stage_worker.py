@@ -33,6 +33,7 @@ from engine.log import make_logger
 # KV_CTRL payload: [session u32][op u8][arg u32]
 KVOP_RESET = 1
 KVOP_TRUNCATE = 2
+KVOP_FREE = 3       # drop the session/batch entry entirely (free its KV; Win B batches)
 
 
 def _position_ids(seq_len: int, start_pos: int, device):
@@ -153,12 +154,15 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock):
 
         elif mt == wire.KV_CTRL:
             session, op, arg = struct.unpack(">IBI", payload[:9])
-            cache = sessions.get(session)
-            if cache is not None:
-                if op == KVOP_RESET:
-                    cache.reset()
-                elif op == KVOP_TRUNCATE:
-                    cache.truncate_to(arg)
+            if op == KVOP_FREE:
+                sessions.pop(session, None)         # drop the entry; frees its KV
+            else:
+                cache = sessions.get(session)
+                if cache is not None:
+                    if op == KVOP_RESET:
+                        cache.reset()
+                    elif op == KVOP_TRUNCATE:
+                        cache.truncate_to(arg)
 
         elif mt == wire.PING:
             wire.write_frame(conn, key, wire.PONG, payload)

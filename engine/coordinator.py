@@ -23,11 +23,11 @@ from typing import List, Tuple
 import torch
 
 from engine import wire
-from engine.tensors import pack_activation, unpack_activation
+from engine.tensors import pack_activation, unpack_activation, pack_batch_activation
 from engine.model import load_model, load_tokenizer, prune_to_layers
 from engine.stage import stage_for_range
 from engine.kv import StageKV
-from engine.stage_worker import KVOP_RESET, KVOP_TRUNCATE
+from engine.stage_worker import KVOP_RESET, KVOP_TRUNCATE, KVOP_FREE
 from engine.specdecode import speculative_greedy, speculative_greedy_stream, GreedyDraft
 from engine.log import make_logger
 
@@ -170,6 +170,11 @@ class Coordinator:
         self._pool = _ConnPool(self._max_conc)
         self._session_ids = itertools.count(1)    # atomic id source (no lock needed)
         self._spec_lock = threading.Lock()        # guards the _spec counters/window
+        # Win B: intra-step batching. Batch ids live in a HIGH id space (>=2^31) so
+        # they never collide with session ids in a worker's shared cache dict; the
+        # local co-located stage keeps a per-batch KV alongside the per-session one.
+        self._batch_ids = itertools.count(1 << 31)
+        self._local_batch_caches: dict = {}
         # Optional dynamic mesh: when a registry is attached, route via its live
         # Topology + per-node keys instead of the static stage list. The static
         # path below is left exactly as-is (backward-compatible, zero risk).
@@ -381,6 +386,95 @@ class Coordinator:
         for s in (conn.socks or []):
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_TRUNCATE, length))
+
+    # ── Win B: intra-step batching (the static batch primitive the scheduler drives) ──
+    def _batch_inputs(self, prompts: List[str]):
+        """Tokenize + LEFT-pad prompts into [B,P] ids + [B,P] padding mask (1=real)."""
+        self.tok.padding_side = "left"
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+        enc = self.tok(prompts, return_tensors="pt", padding=True)
+        return enc.input_ids.to(self.device), enc.attention_mask.to(self.device)
+
+    def _run_local_batch(self, batch_id, pos, hidden, position_ids, attn):
+        cache = self._local_batch_caches.get(batch_id)
+        if cache is None or pos == 0:                  # pos==0 begins a fresh batch
+            cache = StageKV(self.config)
+            self._local_batch_caches[batch_id] = cache
+        return self.local_stage.forward(hidden, position_ids, past_key_values=cache,
+                                        use_cache=True, attention_mask=attn)
+
+    def _relay_batch(self, batch_id, pos, hidden, position_ids, attn):
+        """Batched analogue of _relay: the co-located stage (if any) then each remote
+        stage, carrying per-row position_ids + the 2D mask. Static-stage path (the live
+        config); the scheduler runs single-threaded over the default connection."""
+        if self.local_stage is not None:
+            hidden = self._run_local_batch(batch_id, pos, hidden, position_ids, attn)
+        for s in self._ensure_connected():
+            wire.write_frame(s, self.key, wire.BATCH_ACTIVATION,
+                             pack_batch_activation(batch_id, pos, hidden.detach().cpu(),
+                                                   position_ids, attn))
+            mt, payload = wire.read_frame_keyed(s, self.key)
+            if mt != wire.RESULT:
+                raise wire.WireError(f"expected RESULT, got {wire.msg_name(mt)}")
+            _, _, _, hidden = unpack_activation(payload)
+            hidden = hidden.to(self.device)
+        return hidden
+
+    def _reset_batch(self, batch_id):
+        """Free a finished batch's KV — the local cache and each remote stage's entry."""
+        self._local_batch_caches.pop(batch_id, None)
+        for s in (self._active_conn().socks or []):
+            try:
+                wire.write_frame(s, self.key, wire.KV_CTRL,
+                                 struct.pack(">IBI", batch_id & 0xFFFFFFFF, KVOP_FREE, 0))
+            except OSError:
+                pass
+
+    @torch.no_grad()
+    def generate_batch(self, prompts: List[str], n_new: int = 64,
+                       stop_on_eos: bool = True) -> List[List[int]]:
+        """Decode a fixed batch of prompts together — one batched forward per step —
+        and return each prompt's generated token ids. Token-identical to running each
+        prompt through generate() alone. A sequence that hits EOS stops contributing to
+        the output but rides along until the batch drains (static batching; the
+        scheduler adds dynamic admit/evict)."""
+        bid = next(self._batch_ids)
+        try:
+            ids, attn = self._batch_inputs(prompts)
+            B = ids.shape[0]
+            pos = (attn.long().cumsum(-1) - 1).clamp(min=0)
+            hidden = self._relay_batch(bid, 0, self.embed(ids), pos, attn)
+            nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)   # [B,1]
+            lengths = attn.long().sum(-1)
+            outs: List[List[int]] = [[] for _ in range(B)]
+            done = [False] * B
+
+            def record(tok_col):
+                for b in range(B):
+                    if done[b]:
+                        continue
+                    t = int(tok_col[b])
+                    if stop_on_eos and t in self._eos_ids:
+                        done[b] = True
+                    else:
+                        outs[b].append(t)
+
+            record(nxt)
+            cur_attn = attn
+            for step in range(n_new - 1):
+                if all(done):
+                    break
+                ones = torch.ones(B, 1, dtype=attn.dtype, device=self.device)
+                cur_attn = torch.cat([cur_attn, ones], dim=1)     # decode token is real
+                hidden = self._relay_batch(bid, step + 1, self.embed(nxt),
+                                           lengths.unsqueeze(1), cur_attn)
+                nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
+                lengths = lengths + 1
+                record(nxt)
+            return outs
+        finally:
+            self._reset_batch(bid)
 
     @torch.no_grad()
     def generate(self, prompt: str, n_new: int = 20) -> Tuple[str, List[int]]:
