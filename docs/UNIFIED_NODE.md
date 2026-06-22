@@ -102,17 +102,14 @@ volume, cluster key via env. Two independent pods proved it (own disk, own model
 serving). **Remaining cleanup:** cut production over to the independent pair + retire
 old shared-volume pods (paused, optional now).
 
-### Phase 1 — Node-client becomes the supervisor *(one entry point)* — **L/M**
-- Repoint `lib/llm-worker.js` to launch `engine.stage_worker` (not the retired WS coordinator).
-- Node-client detects GPU vs CPU → picks role.
-- Fold node-client into the image → **one container, one process the user runs.**
-- Still **static** join (no mesh yet) — derisk supervision first.
-- *Engine untouched.* **Deliverable:** run one container → it boots the worker → serves.
+### Phase 1 — Node-client becomes the supervisor *(one entry point)* — **DONE (L4-proven)**
+- ✅ `lib/llm-worker.js` now launches `engine.stage_worker` (via `deploy/run-stage1.sh`), not the retired WS coordinator. GPU/CPU detect (`hasGpu()`); passes the cluster key explicitly. Crash-restart lifecycle kept.
+- Proven on an L4: node-client launched the worker, it self-provisioned + loaded + listened on 19210, and the supervisor revived it after a SIGKILL. Committed (`circuit-node-client` 2cc84a0).
+- Remaining (cosmetic): fold the node-client into the image as the entrypoint (packaging) — the supervision itself is proven.
 
-### Phase 2 — Turn the mesh on *(dynamic join)* — **M (validation)**
-- Enable `CIRCUIT_MESH` on the coordinator; enforce `make_ed25519_verifier`.
-- Node registers with capacity → coordinator assigns the layer slice.
-- *Engine: flip a flag + enforce existing verifier — additive.* **Deliverable:** a new node joins by registering; "add a GPU" needs no hand-wiring.
+### Phase 2 — Turn the mesh on *(dynamic join)* — **JOIN PROVEN (3-client test passed)**
+- ✅ `CIRCUIT_MESH=1` + `run-coordinator-mesh.sh` (control plane on :18932, 3 slots) and `run-mesh.sh` (client join, advertises its public proxy addr). 2026-06-22 test: **coordinator + 3 clients on RunPod — each client registered, was assigned a distinct ~21-layer slot dynamically (`[0,21] [21,42] [42,64]`), loaded, and served; `coverage_ok=true`; inference through the dynamically-assembled 4-way pipeline returned coherent output.** "Add a GPU, it gets a slice" works.
+- **Remaining hardening: enforce `CIRCUIT_MESH_VERIFY_SIG=1`** — the client (`run_control_client`) does not yet *sign* its `/register` (no `ts`/`sig`), so sig-verify is OFF (private-net). Adding client-side signing closes this; until then, run permissioned.
 
 ### Phase 3 — Stake-gated admission + wallet binding — **L/M**
 - Coordinator calls `verifyStake(payout_wallet)` (reuse `stakepoint.js`) at `/register`; admit iff ≥ min.
