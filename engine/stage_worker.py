@@ -191,10 +191,14 @@ def run_control_client(a):
     clog = make_logger("node")
     base = a.control_url.rstrip("/")
     advertise = a.advertise_host or ("127.0.0.1" if a.host in ("0.0.0.0", "") else a.host)
+    # the endpoint the COORDINATOR dials may differ from the local bind (NAT / a
+    # RunPod TCP proxy maps an external port -> the internal --port). Advertise the
+    # externally-reachable port when given, else the bind port.
+    advertise_port = a.advertise_port or a.port
 
     code, resp = _control_post(base + "/register", {
         "node_id": a.node_id,
-        "endpoint": [advertise, a.port],
+        "endpoint": [advertise, advertise_port],
         "capacity_layers": a.capacity_layers,
         "model_fp": a.model_fp,
         "reachability": "public",
@@ -263,6 +267,9 @@ def main():
     ap.add_argument("--model-fp", default="", help="fingerprint of the model this node loads")
     ap.add_argument("--advertise-host", default="",
                     help="host the coordinator dials to reach this node (defaults to --host)")
+    ap.add_argument("--advertise-port", type=int, default=0,
+                    help="port the coordinator dials (for a NAT/proxy that maps an "
+                         "external port to --port; defaults to --port)")
     ap.add_argument("--payout-wallet", default="", help="where CIRC earnings settle")
     ap.add_argument("--hb-interval", type=float, default=10.0)
     a = ap.parse_args()
