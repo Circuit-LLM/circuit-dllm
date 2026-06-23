@@ -75,6 +75,12 @@ For the A/B: bring the coordinator up with `CIRCUIT_CHAIN=0` → bench → resta
 Record single-stream tok/s, round time, aggregate@concurrency, and `/health` acceptance —
 against the **1.5 tok/s cross-DC baseline** and proximity on/off.
 
+**Chain-mode caveat (from code review):** chain mode leaks non-head KV (no `CHAIN_KV_CTRL`
+yet). The bench is **safe** (~a dozen short gens ≈ tens of MB), but do **not** leave chain mode
+serving real traffic until the v1.5 KV-free fix. Also **inject a failover** once: kill the
+middle node of a 3-node chain, confirm `/topology` shows the *middle* node SUSPECT (not the
+head) and the request recovers — exercises `_suspect_by_endpoint` + re-prefill on the live mesh.
+
 ## 5. EAGLE on GPU (the remaining model-specific work)
 
 **Head availability (confirm first):** AngelSlim publishes EAGLE-3 for **Qwen3** + Qwen2.5-VL;
