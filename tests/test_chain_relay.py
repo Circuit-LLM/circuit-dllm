@@ -59,16 +59,19 @@ def _reference(model, tok, n_new):
 
 
 def main():
-    key = os.urandom(wire.KEY_LEN)
-    keyhex = key.hex()
+    # DISTINCT per-node keys — exercises the multi-key route encoding (each node carries its
+    # SUCCESSOR's key in the chain, and talks to the coordinator/predecessor with its own).
+    # A single shared key would hide a key-indexing bug in chain_head_and_route/encode_route.
+    keys = [os.urandom(wire.KEY_LEN) for _ in range(3)]
+    coord_key = os.urandom(wire.KEY_LEN)         # coordinator's own; unused (every node carries a key)
     ports = [free_port(), free_port(), free_port()]
     layer_ranges = ["0:8", "8:16", "16:24"]      # 24-layer 0.5B → head / middle / tail
 
     procs = []
-    for port, layers in zip(ports, layer_ranges):
+    for port, layers, k in zip(ports, layer_ranges, keys):
         procs.append(subprocess.Popen(
             [sys.executable, "-m", "engine.stage_worker", "--port", str(port),
-             "--layers", layers, "--model", MODEL, "--key", keyhex, "--device", "cpu"],
+             "--layers", layers, "--model", MODEL, "--key", k.hex(), "--device", "cpu"],
             cwd=REPO))
     print(f"launched 3 stage workers on {ports}")
 
@@ -77,22 +80,23 @@ def main():
         topo = Topology(num_layers=24, coordinator_end=0, num_stages=3,
                         model_fp="m", replication=1, dead_after_s=1e18)
         reg = Registry(topo=topo, master_secret=b"x", coordinator_endpoint=("c", 0))
-        # Register the 3 workers as READY holders, one per slot. CRUCIAL for the chain:
-        # set each node's wire_key = the cluster key, since all workers framed with --key.
-        # chain_head_and_route encodes each downstream node's key into the route so the
-        # PREVIOUS node can encrypt the forward to it.
-        for nid, port, slot_idx in [("s0", ports[0], 0), ("s1", ports[1], 1), ("s2", ports[2], 2)]:
+        # Register the 3 workers as READY holders, one per slot, each with its OWN wire_key
+        # (matching the --key its worker framed with). chain_head_and_route encodes each
+        # downstream node's key into the route so the PREVIOUS node can encrypt the forward to
+        # it — distinct keys mean a wrong-key bug would corrupt decryption and fail this test.
+        for (nid, port, slot_idx), k in zip(
+                [("s0", ports[0], 0), ("s1", ports[1], 1), ("s2", ports[2], 2)], keys):
             node = Node(node_id=nid, endpoint=("127.0.0.1", port), capacity_layers=8,
                         model_fp="m", state=READY)
             node.slot = slot_idx
-            node.wire_key = key
+            node.wire_key = k
             topo.nodes[nid] = node
             topo.slots[slot_idx].holders.append(nid)
             topo.heartbeat(nid, 1.0)
         assert topo.coverage_ok(), "mesh not fully covered"
         assert [(s.start, s.end) for s, _ in topo.route()] == [(0, 8), (8, 16), (16, 24)]
 
-        coord = Coordinator(MODEL, [], key, registry=reg)      # DYNAMIC mode, star by default
+        coord = Coordinator(MODEL, [], coord_key, registry=reg)   # DYNAMIC mode, star by default
         ref = _reference(coord._model, coord.tok, N_NEW)
 
         coord._chain = False

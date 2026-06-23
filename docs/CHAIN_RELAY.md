@@ -134,6 +134,11 @@ path → it accumulates across sessions on the (pooled, long-lived) forward conn
 
 - **Not a correctness bug** and **not a live risk** (chain mode is gated off by default); a
   single generation is exact, and teardown frees everything.
+- **Scale of the leak (quantified):** per non-head node it grows by one session's KV ≈
+  `tokens × layers_on_that_node × n_kv_heads × head_dim × 2(k,v) × 2 B`. For the 72B (GQA:
+  8 KV heads, head_dim 128, ~21 layers/node) that's ~7 MB per 80-token session per node. So
+  the **validation bench is safe** (~a dozen short gens → ~tens of MB), but **long-running
+  production** (thousands of sessions / long contexts) accumulates without bound → fix first.
 - **Fix (v1.5, tracked):** **chain the `KV_CTRL`** — a `CHAIN_KV_CTRL` frame that propagates
   the reset/free along the same route the activation took, so it lands on each node's
   forward `_serve_conn`. (Alternatives: global session table keyed by session id across

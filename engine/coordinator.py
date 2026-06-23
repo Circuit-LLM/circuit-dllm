@@ -369,15 +369,18 @@ class Coordinator:
         raise wire.WireError(f"chain expected RESULT/ERROR, got {wire.msg_name(mt)}")
 
     def _suspect_by_endpoint(self, endpoint: str, route, head) -> None:
-        """Mark the route node whose `host:port` matches the failed hop SUSPECT (so the
-        next route_snapshot routes around it); fall back to the head if none matches."""
-        target = head
+        """Mark the route node whose `host:port` matches the failed hop SUSPECT (so the next
+        route_snapshot routes around it). If NONE matches, suspect nothing — poisoning the
+        healthy head (or any wrong node) on an unparseable endpoint is worse than waiting for
+        the heartbeat reaper to mark the truly-dead node within dead_after_s; the caller still
+        drops the session pin, so the retry re-pins on a fresh snapshot regardless."""
         for node in route:
             h, p = node.endpoint[0], int(node.endpoint[1])
             if f"{h}:{p}" == endpoint:
-                target = node
-                break
-        self.registry.mark_suspect(target.node_id)
+                self.registry.mark_suspect(node.node_id)
+                return
+        self.log("WARN", "chain hop-failure endpoint not in route — not suspecting any node",
+                 endpoint=endpoint)
 
     def _reprefill(self, session: int, token_ids):
         """Rebuild a session's KV after a mid-session holder death: reset every stage's

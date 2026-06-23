@@ -68,6 +68,10 @@ def speculative_greedy(target, draft, prompt_ids: torch.Tensor, n_new: int,
 
     local = {"rounds": 0, "accepted": 0, "proposed": 0}
     while len(out) < n_new:
+        # EAGLE hook: when draft.needs_hidden, the EAGLE GPU integration passes
+        # target_hidden=target.last_hidden() here (the seed-position indexing is finalized
+        # against the real head — docs/EAGLE.md). GreedyDraft.needs_hidden is False, so this
+        # call is unchanged; the same hook applies in speculative_greedy_stream below.
         drafts = draft.propose(head, K, pos, perturb=draft_perturb)
         batch = torch.tensor([[head] + drafts], device=device)
         tlogits = target.forward_tokens(batch, pos)      # [1, K+1, V]
@@ -171,6 +175,10 @@ class SplitTarget:
 
 class GreedyDraft:
     """Draft = a full model run greedily with its own KV (+ optional perturb)."""
+
+    needs_hidden = False        # a standalone model — never reads the target's hidden. An
+                                # EagleDraft sets this True; the loop then feeds it
+                                # target.last_hidden() at the EAGLE hook below (docs/EAGLE.md).
 
     def __init__(self, model, device: str = "cpu"):
         self.model = model

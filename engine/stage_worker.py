@@ -197,6 +197,10 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_c
             session, pos, _flags, hidden = unpack_activation(rest)
             hidden = hidden.to(device)
             cache = sessions.get(session)
+            # pos==0 resets this session's KV — and this IS the chain failover recovery: on a
+            # mid-chain hop failure the coordinator re-prefills the session at pos==0 on a
+            # fresh route, which lands here and clears any half-advanced KV. (In chain mode a
+            # KV_CTRL reset reaches only the head; non-head nodes rely on this pos==0 reset.)
             if cache is None or pos == 0:
                 cache = StageKV(config)
                 sessions[session] = cache
