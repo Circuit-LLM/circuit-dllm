@@ -145,8 +145,14 @@ CIRCUIT_CONTROL_URL=http://<coord>:18932 CIRCUIT_AWQ_SHARDS=Circuit-LLM/qwen2.5-
 and (via `CIRCUIT_AWQ_SHARDS`) resolves its slice download→local-slice. Repeat step 3 to **replicate**
 pipelines for aggregate scale.
 
-**Validation pending (next GPU/HF session):** run the 3 steps above for real — publish a (small-model)
-shard repo, bring up a catalog-aligned coordinator + a contributor node that pulls its slice and
-serves end-to-end; confirm the assigned range hits the download path. **Scaling = REPLICATION**
+**Dynamic chain VALIDATED end-to-end (2026-06-23, Qwen2.5-7B-AWQ, one L4, `scripts/validate-awq-dynamic.sh`):**
+publish (sliced `coord-0-14` + `sub-14-28`) → catalog coordinator (`[mesh] catalog: coordinator_end=14,
+slot sizes=[14] aligned to published artifacts`) → contributor node `joined mesh layers=14:28` →
+`resolve_submodel` local-slice → `submodel-loaded (AWQ/Marlin)` → `ready` → `coverage_ok: true` →
+coherent inference, `tracebacks: coord=0 node=0`. So the catalog coordinator, dynamic register/assign,
+resolve_submodel (local-slice path), and serve all work end-to-end. **Only the HF upload/download leg
+is still unvalidated** (no HF write token this session — a thin huggingface_hub wrapper; the resolve
+decision logic + local-slice + serve are proven). **Remaining for 72B:** publish to a real HF repo +
+confirm the download path; **Scaling = REPLICATION**
 (multiple pipelines) — each L40+L4-class pipeline caps ~16 tok/s aggregate, so capacity grows by
 adding pipelines, not by tuning one (measured 2026-06-23).
