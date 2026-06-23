@@ -88,18 +88,26 @@ throughput (speculation always does). Coordinator-side draft compute grows with 
 
 ## Front 3 — Cheaper / hidden hops
 
-### 3.1 Replica hedging — race the replicas  ⭐ (cheap, immediate)
-**What:** send each hop's activation to **2+ holders of that slot simultaneously**, use the
-first response, cancel the rest.
-**Why distributed:** we already replicate slots for *failover* — reuse that redundancy for
-**speed**. Every hop silently routes around the slowest/most-distant replica; kills tail
-latency from one bad node on the path.
-**How:** in `coordinator._relay_dynamic`, for a slot with ≥2 routable holders, fan out the
-`ACTIVATION` frame to the top-2 (by latency matrix), take the first `RESULT`, drop the
-other conn. Falls back to single-send when only one holder.
-**Tradeoff:** **costs throughput** — duplicate compute on the loser. A latency↔throughput
-knob (hedge under low load, single-send under high load). Decentralized + low-complexity.
-**Depends on:** replication active; latency matrix (P1) to pick the 2 best (works blind too).
+### 3.1 Replica hedging — race the replicas  (DOWNGRADED — KV affinity kills the naive version)
+**What (original idea):** send each hop's activation to 2+ holders of that slot, use the
+first response, cancel the rest — route around the slowest replica every hop.
+**Why it does NOT work per-token here (the finding):** this is an **autoregressive KV
+pipeline** — each holder caches the session's KV for *its* layers, and token N's forward
+needs the KV from tokens 0…N-1 *on that same node*. So a slot's holder is **pinned for the
+session** (`coordinator._session_routes`, "affinity → warm KV"). You can't send token N to
+replica A and token N+1 to replica B: B never saw 0…N, so its KV is empty → wrong output or
+a full re-prefill. Per-token hedging therefore requires **mirroring every token to both
+replicas** (keep both KVs warm) = ~2× compute *always*, not just under contention.
+**What survives:** **race-to-pin** — race the *first* token across the top-2 replicas and
+pin the winner for the session. But that doubles the *prefill* (the loser's prefill is
+wasted), and **proximity routing (P1, already done) already picks the fastest replica at
+pin time from the RTT prober with ZERO per-request cost.** So race-to-pin adds cost for a
+marginal gain over what we already have.
+**Conclusion:** proximity routing subsumes the practical benefit; true per-token hedging is
+high-cost / low-ROI for a KV pipeline. **Not building it.** (Failover across replicas — the
+*reliability* use of replication — stays as-is.)
+**Lesson:** KV affinity is the constraint that makes distributed *decode* fundamentally
+different from stateless request hedging. It shapes the whole roadmap (see Early-exit, Chain).
 
 ### 3.2 Async speculative pipelining
 **What:** the draft runs *ahead* continuously so verification of chunk N overlaps drafting
@@ -163,7 +171,7 @@ They attack different fronts, so they **stack multiplicatively** — but it is N
 | Early-exit (1.1) | fewer hops | ⬆⬆ avg | ⬆ (less compute) | ⬇ risk (tune τ) | exit heads + calibration |
 | Fewest-fattest (1.2) | fewer hops | ⬆⬆ | ⬆ | – | needs beefier nodes |
 | Spec trees (2.1) | more/hop | ⬆⬆ | ⬇ at high batch | – (exact) | draft compute |
-| Replica hedging (3.1) | cheaper hop | ⬆⬆ tail | **⬇ (dup compute)** | – | extra compute |
+| Proximity routing (P1 ✓) | cheaper hop | ⬆ | – | – | ~free (RTT prober) |
 | Prefix KV cache (4.1) | no hop | ⬆⬆ TTFT | ⬆ | – | node memory |
 
 Interactions: **early-exit × spec-trees** is the one non-trivial combo (branches that exit
@@ -181,13 +189,18 @@ gate to productizing the mesh at all — so the cheap wins double as the "is the
 experiment. Build **incrementally and measured**, not all-five-blind: the cheap, low-risk
 three first, measure on a `tc netem` testbed, *then* commit to the heavy two.
 
-- **P0 (prereq):** topology-aware foundation — latency matrix + region metadata
-  (`TOPOLOGY_AWARE_ROUTING` P1). Everything latency-adaptive needs it.
-- **Wave 1 — cheap, low-risk, big lift (do together):**
-  - **Replica hedging (3.1)** — tail latency, ~free, decentralized.
-  - **Fewest-fattest stages (1.2)** — structural hop reduction, lives in the topology planner.
-  - **Prefix KV cache (4.1)** — TTFT, high value for real chat, independent.
-  - Measure each on netem (injected RTT/jitter) + the existing unit-test harness.
+- **P1 (DONE ✓) — latency-aware foundation + proximity routing:** `Node.region` +
+  coordinator region + RTT map (measured > region-estimate > default), active TCP-connect
+  RTT prober, holder ordering by RTT (`CIRCUIT_ROUTE_LATENCY`, default off = byte-identical).
+  Unit-tested (`test_topology_latency`, `test_rtt_probe`). This already **picks the fastest
+  replica per slot at pin time** — i.e. subsumes the practical benefit of replica hedging
+  (which KV affinity rules out, see §3.1).
+- **Wave 1 — cheap, low-risk, big lift (do together, GPU/mesh):**
+  - **Prefix KV cache (4.1)** — TTFT, high value for real chat, independent. Highest-ROI next.
+  - **Fewest-fattest stages (1.2)** — structural hop reduction; entangled with dynamic
+    re-slicing, so it lands with that work.
+  - Validate proximity routing's real lift on netem (injected RTT/jitter) — does ordering by
+    measured RTT beat round-robin when replicas span regions?
 - **Wave 2 — single-stream depth:**
   - **Latency-scaled spec trees (2.1)** — builds on the spec-forest groundwork + the matrix.
   - Async speculative pipelining (3.2) if Wave 1 shows the draft is on the critical path.
