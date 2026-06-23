@@ -19,11 +19,13 @@ MODEL_HOME="${MODEL_HOME:-/workspace/hf-cache}"
 SRC="$MODEL_HOME/hub"
 mkdir -p "$SRC" "$DEST/hub"
 
-# repo_id -> on-disk cache dir name
-declare -A REPOS=(
-  ["models--Qwen--Qwen2.5-32B-Instruct-AWQ"]="Qwen/Qwen2.5-32B-Instruct-AWQ"
-)
-[ -n "${CIRCUIT_DRAFT:-}" ] && REPOS["models--Qwen--Qwen2.5-0.5B-Instruct"]="Qwen/Qwen2.5-0.5B-Instruct"
+# repo_id -> on-disk cache dir name. Derived from CIRCUIT_MODEL so this script serves
+# any model (32B AWQ for prod, 72B fp16 for the bnb mesh) — defaults to the 32B AWQ so
+# the static prod path (which exports CIRCUIT_MODEL before calling) is unchanged.
+MODEL_REPO="${CIRCUIT_MODEL:-Qwen/Qwen2.5-32B-Instruct-AWQ}"
+declare -A REPOS=( ["models--${MODEL_REPO//\//--}"]="$MODEL_REPO" )
+# the 0.5B predictive-drafting draft is only needed by the coordinator (CIRCUIT_DRAFT set)
+[ -n "${CIRCUIT_DRAFT:-}" ] && REPOS["models--${CIRCUIT_DRAFT//\//--}"]="$CIRCUIT_DRAFT"
 
 # 1) Ensure each model is on this node's own volume (download from HF if absent).
 for m in "${!REPOS[@]}"; do
