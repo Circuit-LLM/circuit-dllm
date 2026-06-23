@@ -60,11 +60,14 @@ PONG = 7
 ERROR = 8
 BYE = 9
 BATCH_ACTIVATION = 10  # batched hidden states (Win B): [B,T,D] + per-row pos + 2D mask
+CHAIN_ACTIVATION = 11  # chain relay: encode_route(downstream) ++ pack_activation(...) —
+                       # the node forwards node->next instead of returning to the coordinator
+                       # (engine/chain.py, docs/CHAIN_RELAY.md). Gated by CIRCUIT_CHAIN.
 
 _NAMES = {
     HELLO: "HELLO", WELCOME: "WELCOME", ACTIVATION: "ACTIVATION", RESULT: "RESULT",
     KV_CTRL: "KV_CTRL", PING: "PING", PONG: "PONG", ERROR: "ERROR", BYE: "BYE",
-    BATCH_ACTIVATION: "BATCH_ACTIVATION",
+    BATCH_ACTIVATION: "BATCH_ACTIVATION", CHAIN_ACTIVATION: "CHAIN_ACTIVATION",
 }
 
 
