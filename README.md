@@ -10,6 +10,8 @@
 [![x402](https://img.shields.io/badge/x402-CIRC%20payments-gold)](https://x402.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
+> **Beta software.** circuit-dllm is under active development. Expect breaking changes between releases, incomplete features, and rough edges. A model split across networked GPUs is only as available as its slowest shard, so validate outputs against the reference model and load-test the full mesh before serving paid traffic.
+
 [Website](https://circuitllm.xyz) · [Chat the DLLM](https://circuitllm.xyz/dllm) · [Inference API](https://inference.circuitllm.xyz) · [Telegram](https://t.me/circuitllm) · [X / Twitter](https://x.com/CircuitLLM)
 
 </div>
