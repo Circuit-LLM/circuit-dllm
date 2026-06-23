@@ -18,8 +18,12 @@ export CIRCUIT_KEY="${CIRCUIT_KEY:-$(openssl rand -hex 32)}"
 export CIRCUIT_DEVICE=cuda
 export CIRCUIT_API_PORT="${CIRCUIT_API_PORT:-18931}"
 export CIRCUIT_MAX_CONCURRENCY="${CIRCUIT_MAX_CONCURRENCY:-4}"
-export CIRCUIT_QUANT=bnb
-export CIRCUIT_SHARD=1
+# Quant: bnb 4-bit shard-load by default; override for AWQ (no sharding needed on one GPU →
+# the Marlin kernel is faster than bnb dequant). For AWQ: CIRCUIT_MODEL=...-AWQ CIRCUIT_QUANT=""
+# CIRCUIT_SHARD=0 (dense load_model handles AWQ; the shard path is bnb-only). `${VAR-default}`
+# keeps an explicitly-empty value.
+export CIRCUIT_QUANT="${CIRCUIT_QUANT-bnb}"
+export CIRCUIT_SHARD="${CIRCUIT_SHARD-1}"
 export CIRCUIT_LOCAL_LAYERS="${CIRCUIT_LOCAL_LAYERS:-0:80}"   # Qwen2.5-72B = 80 layers, all local
 # deliberately NO CIRCUIT_MESH / CIRCUIT_STAGES → single-process, whole model, zero hops
 
