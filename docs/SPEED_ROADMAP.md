@@ -78,11 +78,49 @@ from the latency matrix.
 throughput (speculation always does). Coordinator-side draft compute grows with tree size.
 **Depends on:** latency matrix (P1) to size the tree; batched-wire path (exists).
 
-### 2.2 Lookahead / Jacobi decoding
+### 2.2 EAGLE-3 drafting  ⭐⭐ (highest-ROI single lever — more accepted tokens per round-trip)
+**What:** replace the vanilla 0.5B draft with an **EAGLE-3 head** — a 1-layer draft (~1-3B)
+that autoregresses at the *feature/hidden-state* level, fusing activations from every target
+layer through a learned gate and reusing the target's own LM head. State-of-the-art draft
+acceptance.
+**Why distributed (this is the whole game):** in a high-latency mesh the network round-trip
+is the fixed cost, so **acceptance per round-trip is everything**, and the draft runs on the
+coordinator → **zero added hops**. Our live mesh measured **acceptance 0.389 / 2.56 tokens
+per round** with the untrained 0.5B; EAGLE-3 reports **0.80-0.88** acceptance on the Qwen
+family → roughly **2× the tokens per round-trip → ~half the round-trips per token.** That is
+a near-direct ~2× on single-stream latency, stacking on top of chain relay and trees.
+**How:** drop an EAGLE-3 head onto the coordinator (it already holds embed/lm_head + early
+layers); feed it the target's fused features; it proposes the tree that §2.1 verifies in one
+sweep. `specdecode.GreedyDraft` → `EagleDraft` behind `CIRCUIT_DRAFT_KIND=eagle`.
+**Availability (researched 2026-06):** pre-trained EAGLE-3 heads exist for **Qwen2.5-72B**
+(e.g. AngelSlim / the EAGLE repo) → mostly download+integrate; training a custom head is
+~2-4h on 4×H100 with the target's activations as supervision. Tokenizer-shared with the 72B.
+**Tradeoff:** the head is model-specific (one per target/rev); ~1-3 GB extra on the
+coordinator; integration must match the target's hidden-state interface. Pure win otherwise.
+**Depends on:** the speculative path (exists); pairs with §2.1 trees (EAGLE-3 is tree-native).
+
+### 2.3 Speculation swarm  🧪 (the per-node-0.5B idea, done right — uses idle decode compute)
+**What:** decode is **memory-bandwidth-bound**, so each node's compute units sit ~idle during
+the big model's forward. Put that free capacity to work: each node runs a tiny local draft
+that proposes a *diverse* candidate continuation; the coordinator **harvests these during the
+verification sweep that's already in flight** (a side-channel on connections already open — NO
+extra round-trip) and assembles a wider tree. More diverse branches → more accepted tokens per
+expensive round-trip, at ~zero marginal cost.
+**Why distributed:** turns the contributed GPUs from "just pipeline stages" into a speculation
+engine, monetizing compute that's otherwise wasted on a memory-bound decode.
+**Why it's 🧪 not ⭐:** the win hinges on harvesting drafts *without adding a hop* — the timing
+(draft round N+1 during verify round N) and the diversity-vs-redundancy of independent drafts
+are the open questions. EAGLE-3 (§2.2) captures most of the "more tokens/round" benefit with a
+single strong coordinator-local draft and no coordination risk — so **EAGLE first, swarm as the
+research bet on top.** A swarm of *EAGLE* heads (one per node) is the ambitious endgame.
+**Depends on:** §2.1 trees + §2.2 EAGLE as the per-node drafter; async-pipelined harvest (§3.2).
+
+### 2.4 Lookahead / Jacobi decoding
 **What:** draft-free parallel token generation (n-gram guesses refined by Jacobi iteration).
 **Why distributed:** more compute per round-trip, fewer rounds; no separate draft model.
 **How:** a parallel-decode loop at the coordinator; verify n-grams through the pipeline.
-**Tradeoff:** less mature than tree-spec for chat; interacts with KV layout. A "maybe."
+**Tradeoff:** less mature than tree-spec for chat; interacts with KV layout. Superseded by
+EAGLE-3 for our case — keep as a fallback if an EAGLE head proves hard to obtain/train.
 
 ---
 
@@ -168,11 +206,19 @@ They attack different fronts, so they **stack multiplicatively** — but it is N
 
 | Technique | Front | Single-stream latency | Aggregate throughput | Quality | Cost |
 |---|---|---|---|---|---|
+| **Chain relay (P3)** | fewer/cheaper hops | ⬆⬆ structural | ⬆ | – (exact) | wire + failover rework |
+| **EAGLE-3 draft (2.2)** | more/hop | ⬆⬆ (~2× tokens/round) | ⬇ at high batch | – (exact) | model-specific head, ~1-3 GB |
 | Early-exit (1.1) | fewer hops | ⬆⬆ avg | ⬆ (less compute) | ⬇ risk (tune τ) | exit heads + calibration |
 | Fewest-fattest (1.2) | fewer hops | ⬆⬆ | ⬆ | – | needs beefier nodes |
 | Spec trees (2.1) | more/hop | ⬆⬆ | ⬇ at high batch | – (exact) | draft compute |
 | Proximity routing (P1 ✓) | cheaper hop | ⬆ | – | – | ~free (RTT prober) |
 | Prefix KV cache (4.1) | no hop | ⬆⬆ TTFT | ⬆ | – | node memory |
+| Speculation swarm (2.3) | more/hop | ⬆ (research) | – (idle compute) | – (exact) | harvest-timing risk |
+
+Spec trees (2.1), EAGLE-3 (2.2) and speculation swarm (2.3) all live on the same axis
+(tokens-per-round) and **compose**: EAGLE is the strong per-draft model, trees verify many of
+its branches per sweep, the swarm widens the tree with idle per-node compute. Build them in
+that order.
 
 Interactions: **early-exit × spec-trees** is the one non-trivial combo (branches that exit
 at different depths need care in the tree verifier). The rest are orthogonal. Net: all five
@@ -195,19 +241,24 @@ three first, measure on a `tc netem` testbed, *then* commit to the heavy two.
   Unit-tested (`test_topology_latency`, `test_rtt_probe`). This already **picks the fastest
   replica per slot at pin time** — i.e. subsumes the practical benefit of replica hedging
   (which KV affinity rules out, see §3.1).
-- **Wave 1 — cheap, low-risk, big lift (do together, GPU/mesh):**
-  - **Prefix KV cache (4.1)** — TTFT, high value for real chat, independent. Highest-ROI next.
-  - **Fewest-fattest stages (1.2)** — structural hop reduction; entangled with dynamic
-    re-slicing, so it lands with that work.
-  - Validate proximity routing's real lift on netem (injected RTT/jitter) — does ordering by
-    measured RTT beat round-robin when replicas span regions?
-- **Wave 2 — single-stream depth:**
-  - **Latency-scaled spec trees (2.1)** — builds on the spec-forest groundwork + the matrix.
-  - Async speculative pipelining (3.2) if Wave 1 shows the draft is on the critical path.
-- **Wave 3 — the heavy hitter, deliberate:**
-  - **Early-exit / adaptive depth (1.1)** — biggest avg-case win, biggest lift, quality-
-    sensitive. Start as a parallel research/calibration track; productionize behind a
-    quality gate.
+- **Wave A — the two biggest levers, built together, measured on ONE 72B mesh bring-up
+  (current focus):**
+  - **Chain relay (P3 / docs/CHAIN_RELAY.md)** — the structural fix: stages forward node→node,
+    coordinator only at entry/exit. Turns N coordinator round-trips into one forward sweep.
+    Pure-logic core (route→chain, next-hop, wire frames) unit-tested on the VPS; the
+    stage/coordinator GPU integration validated on the mesh.
+  - **EAGLE-3 draft (2.2)** — ~2× tokens/round (0.389 → ~0.85 acceptance), zero added hops.
+    Mostly download+integrate (pretrained Qwen2.5-72B head). `CIRCUIT_DRAFT_KIND=eagle`.
+  - Amortize the spin-up: bring the 72B mesh up *once*, measure P1 proximity + chain + EAGLE
+    together against the 1.5 tok/s cross-DC baseline.
+- **Wave B — stack more tokens-per-round + kill prefill:**
+  - **Latency-scaled spec trees (2.1)** — EAGLE-3 is tree-native; size the tree by RTT.
+  - **Prefix KV cache (4.1)** — TTFT; deletes the prompt's network traversal for shared prefixes.
+  - Async speculative pipelining (3.2) if EAGLE drafting sits on the critical path.
+- **Wave C — the heavy / research bets:**
+  - **Early-exit / adaptive depth (1.1)** — biggest avg-case win; quality-sensitive, behind a gate.
+  - **Speculation swarm (2.3)** — per-node idle-compute drafts harvested in-flight; research bet.
+  - **Fewest-fattest stages (1.2)** — lands with dynamic re-slicing.
 - **Emergent (no build):** regional replication (1.3) appears with node density.
 
 ## Testing
