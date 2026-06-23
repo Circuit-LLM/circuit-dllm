@@ -81,6 +81,12 @@ class Registry:
         with self._lock:
             self.topo.mark_suspect(node_id)
 
+    def set_rtt(self, node_id: str, ms: float) -> None:
+        """Record a measured coordinator→node RTT (ms). The active RTT prober calls
+        this; proximity routing (topo.route_by_latency) then prefers closer holders."""
+        with self._lock:
+            self.topo.set_rtt(node_id, ms)
+
     def snapshot(self) -> dict:
         """JSON-able view of the live mesh for ops / dashboards / the /topology route."""
         with self._lock:
@@ -90,7 +96,9 @@ class Registry:
                 "coverage_ok": self.topo.coverage_ok(),
                 "slots": [
                     {"slot": s.index, "layers": [s.start, s.end],
-                     "holders": [{"node_id": h, "state": self.topo.nodes[h].state}
+                     "holders": [{"node_id": h, "state": self.topo.nodes[h].state,
+                                  "region": self.topo.nodes[h].region,
+                                  "rtt_ms": round(self.topo.rtt(h), 1)}
                                  for h in s.holders if h in self.topo.nodes]}
                     for s in self.topo.slots
                 ],

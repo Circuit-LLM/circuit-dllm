@@ -244,6 +244,7 @@ def run_control_client(a):
         "capacity_layers": a.capacity_layers,
         "model_fp": a.model_fp,
         "reachability": "public",
+        "region": a.region or "",          # coarse geo label for proximity routing (signed)
         "payout_wallet": a.payout_wallet or "",
         "ts": int(_time.time()),
     }
@@ -346,6 +347,8 @@ def main():
     ap.add_argument("--node-id", help="this node's id (ed25519 pubkey hex); derived from the key if a key is resolved")
     ap.add_argument("--node-key", help="ed25519 private key hex; node-id derives from it (signs /register)")
     ap.add_argument("--node-key-file", help="persist/load the node key here (default /workspace/node_key.hex) for a stable identity across restarts")
+    ap.add_argument("--region", default="",
+                    help="coarse geo label (e.g. na-east) for proximity routing; signed in /register")
     ap.add_argument("--capacity-layers", type=int, default=999,
                     help="max contiguous layers this node can hold")
     ap.add_argument("--model-fp", default="", help="fingerprint of the model this node loads")

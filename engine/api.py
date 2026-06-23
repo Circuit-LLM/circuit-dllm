@@ -87,7 +87,11 @@ def _build_mesh():
 
     topo = Topology(num_layers=layers, coordinator_end=coordinator_end,
                     num_stages=n_stages, model_fp=fp, replication=repl,
-                    dead_after_s=dead_after)
+                    dead_after_s=dead_after,
+                    # topology-aware routing: coordinator's region (for region-distance
+                    # estimates) + prefer-closest-holder routing. Default off → unchanged.
+                    coordinator_region=os.environ.get("CIRCUIT_REGION") or None,
+                    route_by_latency=os.environ.get("CIRCUIT_ROUTE_LATENCY") == "1")
     reg = Registry(topo=topo, master_secret=secret, coordinator_endpoint=coord_ep,
                    allowlist=allowlist)
     verify_sig = None

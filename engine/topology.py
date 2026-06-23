@@ -34,6 +34,26 @@ DRAINING = "draining"  # leaving cleanly: finishes in-flight, takes no new sessi
 
 _ROUTABLE = (READY,)   # only READY nodes receive sessions / count toward coverage
 
+# ── latency estimation (topology-aware routing foundation) ────────────────────
+# Neutral RTT (ms) used when neither a measured probe nor a region label is known —
+# so an unlabeled node neither wins nor loses proximity routing by default.
+_DEFAULT_RTT_MS = 80.0
+
+
+def _region_rtt_estimate(a: Optional[str], b: Optional[str]) -> float:
+    """Coarse RTT (ms) between two region labels like 'na-east' / 'eu-west': exact
+    match ≈ local, shared continent (the prefix before '-') ≈ regional, otherwise ≈
+    intercontinental. A *bootstrap* heuristic for proximity routing before any probe
+    lands — a measured RTT (`Topology.set_rtt`) always supersedes it. Numbers are
+    deliberately coarse/tunable; only their ordering matters for routing."""
+    if not a or not b:
+        return _DEFAULT_RTT_MS
+    if a == b:
+        return 5.0
+    if a.split("-", 1)[0] == b.split("-", 1)[0]:
+        return 40.0
+    return 150.0
+
 
 @dataclass
 class Node:
@@ -42,6 +62,8 @@ class Node:
     capacity_layers: int         # how many contiguous layers it can hold (VRAM-derived)
     model_fp: str                # fingerprint of the model the node loaded
     reachability: str = "public" # public | relay
+    region: Optional[str] = None # coarse geo label (e.g. "na-east") — a routing HINT,
+                                 # superseded by measured RTT; see Topology.rtt()
     payout_wallet: str = ""       # where CIRC earnings settle
     slot: Optional[int] = None    # assigned slot index
     state: str = JOINING
@@ -59,7 +81,9 @@ class Slot:
 
 class Topology:
     def __init__(self, num_layers: int, coordinator_end: int, num_stages: int,
-                 model_fp: str, replication: int = 2, dead_after_s: float = 30.0):
+                 model_fp: str, replication: int = 2, dead_after_s: float = 30.0,
+                 coordinator_region: Optional[str] = None,
+                 route_by_latency: bool = False):
         if num_stages < 1:
             raise ValueError("num_stages must be >= 1")
         if not (0 <= coordinator_end < num_layers):
@@ -69,6 +93,12 @@ class Topology:
         self.model_fp = model_fp
         self.replication = replication
         self.dead_after_s = dead_after_s
+        # topology-aware routing: the coordinator's own region (for region-distance
+        # estimates) and whether to order holders by RTT instead of heartbeat freshness.
+        # Default off → holder ordering is byte-identical to the pre-latency behavior.
+        self.coordinator_region = coordinator_region
+        self.route_by_latency = route_by_latency
+        self._rtt: Dict[str, float] = {}     # node_id -> measured RTT(ms) from coordinator
         self.nodes: Dict[str, Node] = {}
         # fixed contiguous slots over [coordinator_end, num_layers)
         per = (num_layers - coordinator_end) // num_stages
@@ -169,17 +199,38 @@ class Topology:
 
     def remove(self, node_id: str) -> None:
         n = self.nodes.pop(node_id, None)
+        self._rtt.pop(node_id, None)
         if n and n.slot is not None and node_id in self.slots[n.slot].holders:
             self.slots[n.slot].holders.remove(node_id)
 
+    # ── latency (topology-aware routing foundation) ───────────────────────────
+    def set_rtt(self, node_id: str, ms: float) -> None:
+        """Record a MEASURED round-trip (ms) from the coordinator to a node (an active
+        prober calls this). A measured value supersedes the region estimate in rtt()."""
+        self._rtt[node_id] = float(ms)
+
+    def rtt(self, node_id: str) -> float:
+        """Estimated RTT (ms) coordinator→node: a measured probe if we have one, else a
+        region-distance estimate, else a neutral default. This is the cost a hop to this
+        node pays in the star (every hop is coordinator↔holder), so routing minimizes it."""
+        if node_id in self._rtt:
+            return self._rtt[node_id]
+        n = self.nodes.get(node_id)
+        return _region_rtt_estimate(self.coordinator_region, n.region if n else None)
+
     # ── routing ──────────────────────────────────────────────────────────────
     def holders(self, slot_index: int) -> List[Node]:
-        """Routable holders for a slot, primary first (freshest heartbeat). The
-        first is the primary; the rest are failover fallbacks for this session."""
+        """Routable holders for a slot, primary first. Default order is freshest
+        heartbeat (liveness). With route_by_latency, the LOWEST-RTT holder is primary —
+        i.e. the slot is served by its closest replica to the coordinator (cheapest hop
+        in the star), heartbeat freshness breaking ties. The rest are failover fallbacks."""
         slot = self.slots[slot_index]
         live = [self.nodes[h] for h in slot.holders
                 if h in self.nodes and self.nodes[h].state in _ROUTABLE]
-        live.sort(key=lambda n: -n.last_hb)
+        if self.route_by_latency:
+            live.sort(key=lambda n: (self.rtt(n.node_id), -n.last_hb))
+        else:
+            live.sort(key=lambda n: -n.last_hb)
         return live
 
     def route(self) -> List[Tuple[Slot, List[Node]]]:

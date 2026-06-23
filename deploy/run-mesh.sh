@@ -44,6 +44,7 @@ exec python3 -u -m engine.stage_worker \
   --control-url   "$CIRCUIT_CONTROL_URL" \
   --node-key      "${CIRCUIT_NODE_KEY:-}" \
   --node-key-file "${CIRCUIT_NODE_KEY_FILE:-/workspace/node_key.hex}" \
+  --region        "${CIRCUIT_REGION:-}" \
   --capacity-layers "${CIRCUIT_CAPACITY_LAYERS:-64}" \
   --model-fp      "${CIRCUIT_MODEL_FP:-qwen2.5-32b-awq}" \
   --advertise-host "$ADV_HOST" \

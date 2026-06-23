@@ -88,6 +88,7 @@ def _handler(registry, now_fn, verify_sig):
                         capacity_layers=int(body["capacity_layers"]),
                         model_fp=str(body.get("model_fp", "")),
                         reachability=str(body.get("reachability", "public")),
+                        region=(str(body["region"]) if body.get("region") else None),
                         payout_wallet=str(body.get("payout_wallet", "")),
                     )
                     resp = registry.register(node, now_fn())
