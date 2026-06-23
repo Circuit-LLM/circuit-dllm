@@ -14,6 +14,9 @@ BASE="${1:?usage: bench-mesh.sh http://host:port [model]}"
 MODEL="${2:-Qwen/Qwen2.5-72B-Instruct}"
 MAXTOK="${MAXTOK:-80}"
 CONC="${CONC:-1 4 8}"            # concurrency levels to sweep
+# SPEC_K (optional): sweep the speculative K per request (no coordinator restart needed) —
+# e.g. `for k in 4 8 12 16; do SPEC_K=$k bench-mesh.sh URL; done`
+_SK=""; [ -n "${SPEC_K:-}" ] && _SK=",\"spec_k\":${SPEC_K}"
 
 PROMPTS=(
   "Explain in 4 sentences why the sky is blue."
@@ -29,7 +32,7 @@ PROMPTS=(
 stream_tokens() {  # $1 = prompt -> prints number of streamed chunks (tokens)
   curl -s --max-time 240 -N -X POST "$BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d "{\"model\":\"$MODEL\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"$1\"}],\"max_tokens\":$MAXTOK,\"temperature\":0}" \
+    -d "{\"model\":\"$MODEL\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"$1\"}],\"max_tokens\":$MAXTOK,\"temperature\":0${_SK}}" \
     2>/dev/null | grep -c "chat.completion.chunk"
 }
 

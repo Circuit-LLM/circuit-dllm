@@ -65,15 +65,34 @@ ssh <node> "
 Reminder: in an SSH shell `RUNPOD_PUBLIC_IP`/`RUNPOD_TCP_PORT_19210` are EMPTY — pass
 `CIRCUIT_ADVERTISE_HOST/PORT` explicitly. Wait for `/health` `coverage_ok:true` (3 stages).
 
-## 4. Measure — star vs chain (same hardware, the honest A/B)
+## 4. Measure — PACKED config sweep (one bring-up, many configs)
+
+The expensive part is the bring-up, so amortize it. Two harness enablers make this cheap:
+- **Node re-register on coordinator restart** (heartbeat reports `registered`; a node re-registers
+  for its already-loaded slot via `prefer_range`). So changing a *coordinator* config is just
+  **restart the coordinator** — the 3 nodes re-join themselves, no node restarts. Kill the old
+  coordinator by PID and verify the ports are free first (lingering proc = "Address already in
+  use"); relaunch with `setsid bash ... >log 2>&1 </dev/null &`.
+- **Per-request `spec_k`** (`SPEC_K=8 scripts/bench-mesh.sh ...`) → sweep K with **no restart**.
+
+The matrix to run from a single mesh (each coordinator-env change = one coordinator restart →
+auto re-join → bench):
+
+| Config | env (coordinator) | what it tests |
+|---|---|---|
+| draft size | `CIRCUIT_DRAFT=Qwen/Qwen2.5-0.5B/1.5B/3B-Instruct` | acceptance (the cheap EAGLE-lite win) |
+| chain on/off | `CIRCUIT_CHAIN=0/1` | topology lever (A/B) |
+| K sweep | per-request `SPEC_K=4/8/12/16` (no restart) | tokens/round vs round cost |
+| continuous batching | `CIRCUIT_BATCH=1` (+`CIRCUIT_MAX_BATCH`) | throughput under load |
+| concurrency | `CIRCUIT_MAX_CONCURRENCY=4/8/16` | aggregate scaling |
 
 ```
-scripts/bench-mesh.sh http://<coord_public_ip>:<coord_18931_mapped>
+scripts/bench-mesh.sh http://<coord_ip>:<coord_18931_mapped>            # base
+SPEC_K=8 scripts/bench-mesh.sh http://<coord_ip>:<coord_18931_mapped>   # K sweep, no restart
+CONC="1 8 16" scripts/bench-mesh.sh http://<coord_ip>:<coord_18931_mapped>
 ```
-For the A/B: bring the coordinator up with `CIRCUIT_CHAIN=0` → bench → restart coordinator with
-`CIRCUIT_CHAIN=1` → bench (a coordinator restart re-pins; nodes re-register via the retry).
-Record single-stream tok/s, round time, aggregate@concurrency, and `/health` acceptance —
-against the **1.5 tok/s cross-DC baseline** and proximity on/off.
+Record single-stream tok/s, round time, aggregate@concurrency, and `/health` acceptance per
+config — against the **1.5 tok/s scattered baseline** (and the measured star 1.77 / chain 1.69).
 
 **Chain-mode caveat (from code review):** chain mode leaks non-head KV (no `CHAIN_KV_CTRL`
 yet). The bench is **safe** (~a dozen short gens ≈ tens of MB), but do **not** leave chain mode
