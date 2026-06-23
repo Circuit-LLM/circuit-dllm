@@ -247,15 +247,44 @@ def run_control_client(a):
         "payout_wallet": a.payout_wallet or "",
         "ts": int(_time.time()),
     }
-    # Sign the canonical body (minus sig) so the coordinator's ed25519 verifier can
-    # prove we hold the private key behind node_id. Unsigned only if no key resolved
-    # (legacy/private-net with CIRCUIT_MESH_VERIFY_SIG off).
-    if getattr(a, "_signing_key", None) is not None:
-        msg = _json.dumps(reg, sort_keys=True, separators=(",", ":")).encode()
-        reg["sig"] = a._signing_key.sign(msg).hex()
-    code, resp = _control_post(base + "/register", reg)
-    if code != 200:
-        raise SystemExit(f"register rejected ({code}): {resp}")
+    import urllib.error as _ue
+
+    def _sign_register():
+        # Sign the canonical body (minus sig) so the coordinator's ed25519 verifier can
+        # prove we hold the private key behind node_id. Refresh ts + re-sign on each
+        # attempt so a long retry window can't drift outside the replay tolerance.
+        reg["ts"] = int(_time.time())
+        reg.pop("sig", None)
+        if getattr(a, "_signing_key", None) is not None:
+            msg = _json.dumps(reg, sort_keys=True, separators=(",", ":")).encode()
+            reg["sig"] = a._signing_key.sign(msg).hex()
+
+    # Register, retrying while the coordinator is still coming up — its control plane
+    # may not be listening yet when this node finishes its own (slow) model download,
+    # and a node should be able to JOIN a mesh whose coordinator starts later. A
+    # connection error / 5xx is transient (keep trying); a 4xx is a real rejection
+    # (bad signature, model_fp mismatch, no capacity) — fail fast, no point retrying.
+    deadline = _time.time() + float(getattr(a, "register_timeout", 2400))
+    attempt = 0
+    while True:
+        attempt += 1
+        _sign_register()
+        try:
+            code, resp = _control_post(base + "/register", reg)
+            break
+        except _ue.HTTPError as e:
+            if 400 <= e.code < 500:
+                body = ""
+                try: body = e.read().decode()[:200]
+                except Exception: pass
+                raise SystemExit(f"register rejected ({e.code}): {body}")
+            last = f"http {e.code}"          # 5xx — transient
+        except Exception as e:
+            last = str(e)                    # connection refused etc — coordinator not up yet
+        if _time.time() >= deadline:
+            raise SystemExit(f"register failed after {attempt} attempts ({int(_time.time()-(deadline-2400))}s): {last}")
+        clog("INFO", "coordinator not ready, retrying register", attempt=attempt, last=last)
+        _time.sleep(10)
     start, end = resp["assignment"]["start"], resp["assignment"]["end"]
     key = wire.normalize_key(bytes.fromhex(resp["session_key"]))
     clog("INFO", "joined mesh", node=a.node_id[:12], layers=f"{start}:{end}",
