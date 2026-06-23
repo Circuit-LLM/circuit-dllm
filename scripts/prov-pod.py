@@ -39,8 +39,11 @@ def gql(q, v=None):
 pubkey = rest("GET", "pods/0e78t6cfl72z9y").get("env", {}).get("PUBLIC_KEY", "")
 assert pubkey, "no PUBLIC_KEY"
 
+# Only DECLARE + use $dc when a datacenter is pinned — GraphQL rejects a declared-but-unused
+# variable (400 "Variable $dc is never used").
+_dcdecl = ",$dc:String" if DC else ""
 _dcline = "dataCenterId:$dc," if DC else ""
-MUT = ('''mutation($img:String!,$auth:String!,$pk:String!,$name:String!,$role:String!,$ports:String!,$cloud:CloudTypeEnum!,$gpu:String!,$disk:Int!,$dc:String){
+MUT = ('''mutation($img:String!,$auth:String!,$pk:String!,$name:String!,$role:String!,$ports:String!,$cloud:CloudTypeEnum!,$gpu:String!,$disk:Int!''' + _dcdecl + '''){
   podFindAndDeployOnDemand(input:{
     cloudType:$cloud, gpuTypeId:$gpu, gpuCount:1, name:$name, ''' + _dcline + '''
     imageName:$img, containerRegistryAuthId:$auth, containerDiskInGb:$disk,
@@ -51,8 +54,11 @@ MUT = ('''mutation($img:String!,$auth:String!,$pk:String!,$name:String!,$role:St
 def create():
     # try each GPU type until one has supply on this cloud
     for gpu in GPUS:
-        r = gql(MUT, {"img":IMAGE,"auth":AUTHID,"pk":pubkey,"name":NAME,"role":ROLE,
-                      "ports":PORTS,"cloud":CLOUD,"gpu":gpu,"disk":DISK,"dc":DC})
+        v = {"img":IMAGE,"auth":AUTHID,"pk":pubkey,"name":NAME,"role":ROLE,
+             "ports":PORTS,"cloud":CLOUD,"gpu":gpu,"disk":DISK}
+        if DC:
+            v["dc"] = DC
+        r = gql(MUT, v)
         try:
             return r["data"]["podFindAndDeployOnDemand"]["id"]
         except Exception:
