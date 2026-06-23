@@ -55,19 +55,27 @@ def load_model_shard_bnb(model_id: str, start: int, end: int, keep_head: bool = 
     and requires each to be on cuda (un-owned on meta/cpu -> "Expected a cuda device").
     bitsandbytes has no such constraint. Proven bitwise-correct on a GPU (the sharded
     stage output matches the full model). Requires `bitsandbytes` installed.
+
+    IMPORTANT: shard-loading only works from a *fp16* checkpoint (quantize-at-load — the
+    un-owned layers are never materialized). A *pre-quantized* bnb 4-bit checkpoint can
+    NOT be sharded: bnb deserializes every stored 4-bit tensor, including un-owned ones
+    bound to meta -> "Bnb4bitDeserialize ... uint8 on meta". So point this at the fp16
+    repo (e.g. Qwen/Qwen2.5-72B-Instruct), not a *-bnb-4bit one.
     """
     from transformers import BitsAndBytesConfig
     config = AutoConfig.from_pretrained(model_id)
     dm = _shard_device_map(config, start, end, keep_head=keep_head, gpu=device, other="meta")
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, quantization_config=bnb, device_map=dm, torch_dtype=torch.float16,
-    )
+    kwargs = dict(device_map=dm, torch_dtype=torch.float16)
+    # If the checkpoint is ALREADY 4-bit (a pre-quantized bnb repo), its config carries the
+    # quantization_config — the uint8 weights load as-is. Passing our own bnb config would
+    # try to RE-quantize them ("expected a floating-point dtype, but got uint8"). So only
+    # attach a bnb config to quantize a *fp16* checkpoint at load time.
+    if not getattr(config, "quantization_config", None):
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True,
+        )
+    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     return model.eval()
 
 
