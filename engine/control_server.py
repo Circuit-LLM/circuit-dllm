@@ -124,7 +124,8 @@ def _handler(registry, now_fn, verify_sig):
 
 
 def make_server(registry, host="0.0.0.0", port=18932, reap_interval=10.0,
-                now_fn=time.time, verify_sig=None) -> ThreadingHTTPServer:
+                now_fn=time.time, verify_sig=None,
+                rtt_probe_interval: float = 30.0) -> ThreadingHTTPServer:
     """Build the control server + start its background reaper. The caller runs
     srv.serve_forever() (typically in a daemon thread alongside the inference API)."""
     def reaper():
@@ -144,6 +145,13 @@ def make_server(registry, host="0.0.0.0", port=18932, reap_interval=10.0,
                 log("WARN", "reaper error", error=str(e))
 
     threading.Thread(target=reaper, daemon=True).start()
+
+    # Topology-aware routing: when proximity routing is on, run the active RTT prober so
+    # holder ordering uses measured coordinator→node latency (not just region estimates).
+    if getattr(getattr(registry, "topo", None), "route_by_latency", False):
+        from engine.rtt_probe import start_rtt_prober
+        start_rtt_prober(registry, interval=rtt_probe_interval)
+
     srv = ThreadingHTTPServer((host, port), _handler(registry, now_fn, verify_sig))
     log("INFO", "control channel listening", port=port)
     return srv

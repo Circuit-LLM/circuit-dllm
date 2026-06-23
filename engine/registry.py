@@ -121,6 +121,14 @@ class Registry:
             }
 
     # ── routing (read) ────────────────────────────────────────────────────────
+    def node_endpoints(self) -> List[Tuple[str, Tuple]]:
+        """[(node_id, endpoint), …] for public nodes — the RTT prober snapshots this
+        under the lock, then probes UNLOCKED (slow network I/O must not block the
+        control plane) and records via set_rtt()."""
+        with self._lock:
+            return [(nid, n.endpoint) for nid, n in self.topo.nodes.items()
+                    if n.reachability == "public"]
+
     def route_snapshot(self) -> List[Node]:
         """Thread-safe snapshot of the pipeline: the PRIMARY healthy holder for each
         slot, in order. The coordinator pins this for a session's lifetime (session
