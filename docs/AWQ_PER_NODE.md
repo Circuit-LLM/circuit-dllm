@@ -115,8 +115,16 @@ artifact (#1) → slice locally from a staged full checkpoint** — then serves 
 by `CIRCUIT_AWQ_SHARDS=<repo>` (or `=local` to always slice). Unset → the original bnb/shard path.
 This is what makes a contributor's node run AWQ (2.1× bnb) instead of bnb in the live mesh.
 
-**Validation pending (next GPU/HF session):** publish a real shard repo + a dynamic node that pulls
-its slice and serves; confirm the assigned range aligns with a published slot (catalog-aligned slot
-boundaries) or falls back to local slicing cleanly. **Scaling = REPLICATION** (multiple pipelines)
-— each L40+L4-class pipeline caps ~16 tok/s aggregate, so capacity grows by adding pipelines, not
-by tuning one (measured 2026-06-23).
+**Catalog alignment (BUILT):** `CIRCUIT_MESH_CATALOG` (a layout string `0:59,59:80`, a manifest.json
+path, or a repo manifest) makes the coordinator build its Topology from the SAME slot boundaries the
+artifacts were sliced at (`shard_fetch.catalog_layout` → `topology_from_catalog` → `Topology(slot_sizes=)`).
+So every slot the coordinator assigns matches a published artifact dir (`sub-<s>-<e>`), and a joining
+node's `resolve_submodel` hits the **download** path, not the 40GB local-slice fallback. The layout,
+manifest, publisher, and coordinator all share one definition in `engine/shard_fetch.py` so ranges
+can't drift. Unit-tested (`test_shard_fetch`: catalog→Topology → coordinator slots == published dirs).
+
+**Validation pending (next GPU/HF session):** publish a real shard repo (`publish-awq-shards.py
+--upload`) + bring up a catalog-aligned coordinator + a dynamic node (`CIRCUIT_AWQ_SHARDS=<repo>`)
+that pulls its slice and serves end-to-end. **Scaling = REPLICATION** (multiple pipelines) — each
+L40+L4-class pipeline caps ~16 tok/s aggregate, so capacity grows by adding pipelines, not by tuning
+one (measured 2026-06-23).

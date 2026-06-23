@@ -18,9 +18,77 @@ proven slicer CLI and huggingface_hub.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+
+
+# ── pipeline layout / catalog (shared by the publisher AND the coordinator) ───
+# A "layout" is the canonical contiguous slot partition of a model: the FIRST slice is the
+# coordinator's keep-head slice (embed+norm+lm_head + layers [0,c)), the rest are pure stage
+# slices. The publisher (publish-awq-shards.py) slices artifacts for these exact ranges, and the
+# coordinator builds its Topology from the SAME layout (topology_from_catalog) — so every slot the
+# coordinator assigns matches a published artifact and a joining node DOWNLOADS its slice instead
+# of slicing the full 40GB locally. One definition, used both places → ranges can't drift.
+
+def parse_layout(spec: str):
+    """'0:59,59:80' -> [(0,59,True),(59,80,False)]: contiguous ranges, the FIRST flagged keep_head
+    (the coordinator slice). Validates contiguity + non-empty/ascending ranges. Pure."""
+    parts = [p for p in spec.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty layout")
+    ranges, prev_end = [], None
+    for i, p in enumerate(parts):
+        s_str, e_str = p.split(":")
+        s, e = int(s_str), int(e_str)
+        if e <= s:
+            raise ValueError(f"range {p}: end must be > start")
+        if prev_end is not None and s != prev_end:
+            raise ValueError(f"non-contiguous layout at {p}: expected start {prev_end}")
+        ranges.append((s, e, i == 0))
+        prev_end = e
+    return ranges
+
+
+def build_manifest(model_id: str, ranges) -> dict:
+    """Manifest a node reads to find its slot's artifact. Pure."""
+    return {
+        "model": model_id,
+        "format": "awq-per-node-v1",
+        "num_layers": ranges[-1][1],
+        "slots": [
+            {"start": s, "end": e, "keep_head": kh, "dir": slot_dirname(s, e, kh)}
+            for (s, e, kh) in ranges
+        ],
+    }
+
+
+def catalog_layout(spec) -> list:
+    """Normalize a catalog into [(start,end,keep_head)]: accepts a layout STRING ('0:59,59:80'),
+    a manifest DICT, or a path to a manifest.json. The coordinator and the node both resolve their
+    layout through this so they agree on slot boundaries."""
+    if isinstance(spec, dict):
+        return [(s["start"], s["end"], s["keep_head"]) for s in spec["slots"]]
+    if isinstance(spec, str) and (spec.endswith(".json") or os.path.isfile(spec)):
+        with open(spec) as f:
+            return [(s["start"], s["end"], s["keep_head"]) for s in json.load(f)["slots"]]
+    return parse_layout(spec)
+
+
+def topology_from_catalog(num_layers: int, ranges):
+    """Map a layout to the coordinator's Topology args: the first slice is the coordinator's
+    co-located keep-head range [0,coordinator_end); the rest are the mesh stage slots. Returns
+    (coordinator_end, num_stages, slot_sizes). Validates the stages tile [coordinator_end,num_layers)."""
+    if not ranges or not ranges[0][2]:
+        raise ValueError("catalog's first slot must be the coordinator keep-head slice")
+    coordinator_end = ranges[0][1]
+    stages = ranges[1:]
+    if not stages:
+        raise ValueError("catalog has no stage slots (coordinator-only not a mesh)")
+    if stages[0][0] != coordinator_end or stages[-1][1] != num_layers:
+        raise ValueError(f"stage slots must tile [{coordinator_end},{num_layers}), got {stages}")
+    return coordinator_end, len(stages), [e - s for (s, e, _kh) in stages]
 
 
 def slot_dirname(start: int, end: int, keep_head: bool = False) -> str:

@@ -79,20 +79,34 @@ def _build_mesh():
     coordinator_end = int(ll.split(":")[1]) if ll else 0
     layers = int(os.environ["CIRCUIT_MESH_LAYERS"])
     n_stages = int(os.environ.get("CIRCUIT_MESH_STAGES", "1"))
-    # Fewest-fattest stages (SPEED_ROADMAP §1.2): if the operator declares the fleet's
-    # per-node capacity (layers a node can hold, VRAM-derived), pick the FEWEST stages those
-    # nodes can staff — fewer stages = fewer inter-node hops = a shorter per-token round, the
-    # dominant cost on a distributed mesh. Overrides the static CIRCUIT_MESH_STAGES. Unset →
-    # the static stage count (default path unchanged). Capacity-only (node-count/replication
-    # is handled by rebalance as nodes join), so pass plenty of homogeneous slots.
-    node_cap = os.environ.get("CIRCUIT_MESH_NODE_CAP")
-    if node_cap:
-        from engine.topology import plan_stages
-        budget = layers - coordinator_end
-        n_stages = plan_stages(budget, [int(node_cap)] * budget, replication=1)
-        print(f"[mesh] fewest-fattest: {budget} layers / {node_cap}-cap nodes "
-              f"-> {n_stages} stage(s) (~{-(-budget // n_stages)} layers each), "
-              f"overriding CIRCUIT_MESH_STAGES", flush=True)
+    slot_sizes = None
+    # Catalog alignment (docs/AWQ_PER_NODE.md): if the operator points at the published shard
+    # layout (CIRCUIT_MESH_CATALOG = a layout string '0:59,59:80', a manifest.json path, or a
+    # repo's manifest), the coordinator builds its Topology from the SAME slot boundaries the
+    # artifacts were sliced at — so every assigned slot matches a published artifact and a joining
+    # node DOWNLOADS its slice instead of slicing the full checkpoint. Sets coordinator_end +
+    # stage slot sizes exactly; overrides the env/fewest-fattest sizing below.
+    catalog = os.environ.get("CIRCUIT_MESH_CATALOG")
+    if catalog:
+        from engine.shard_fetch import catalog_layout, topology_from_catalog
+        coordinator_end, n_stages, slot_sizes = topology_from_catalog(layers, catalog_layout(catalog))
+        print(f"[mesh] catalog: coordinator_end={coordinator_end}, {n_stages} stage slot(s) "
+              f"sizes={slot_sizes} (aligned to published artifacts)", flush=True)
+    else:
+        # Fewest-fattest stages (SPEED_ROADMAP §1.2): if the operator declares the fleet's
+        # per-node capacity (layers a node can hold, VRAM-derived), pick the FEWEST stages those
+        # nodes can staff — fewer stages = fewer inter-node hops = a shorter per-token round, the
+        # dominant cost on a distributed mesh. Overrides the static CIRCUIT_MESH_STAGES. Unset →
+        # the static stage count (default path unchanged). Capacity-only (node-count/replication
+        # is handled by rebalance as nodes join), so pass plenty of homogeneous slots.
+        node_cap = os.environ.get("CIRCUIT_MESH_NODE_CAP")
+        if node_cap:
+            from engine.topology import plan_stages
+            budget = layers - coordinator_end
+            n_stages = plan_stages(budget, [int(node_cap)] * budget, replication=1)
+            print(f"[mesh] fewest-fattest: {budget} layers / {node_cap}-cap nodes "
+                  f"-> {n_stages} stage(s) (~{-(-budget // n_stages)} layers each), "
+                  f"overriding CIRCUIT_MESH_STAGES", flush=True)
     fp = os.environ.get("CIRCUIT_MESH_FP", "")
     repl = int(os.environ.get("CIRCUIT_MESH_REPLICATION", "1"))
     dead_after = float(os.environ.get("CIRCUIT_MESH_DEAD_AFTER", "30"))
@@ -108,6 +122,7 @@ def _build_mesh():
     topo = Topology(num_layers=layers, coordinator_end=coordinator_end,
                     num_stages=n_stages, model_fp=fp, replication=repl,
                     dead_after_s=dead_after,
+                    slot_sizes=slot_sizes,   # set by CIRCUIT_MESH_CATALOG; None → equal/fewest-fattest
                     # topology-aware routing: coordinator's region (for region-distance
                     # estimates) + prefer-closest-holder routing. Default off → unchanged.
                     coordinator_region=os.environ.get("CIRCUIT_REGION") or None,

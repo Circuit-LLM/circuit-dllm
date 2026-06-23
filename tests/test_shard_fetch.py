@@ -60,8 +60,42 @@ def main():
     for sl in m["slots"]:
         assert sl["dir"] == slot_dirname(sl["start"], sl["end"], sl["keep_head"])
 
+    # ── catalog → coordinator Topology alignment (the download-path guarantee) ─
+    from engine.shard_fetch import catalog_layout, topology_from_catalog
+    from engine.topology import Topology
+
+    # catalog from a layout string and from a manifest dict agree
+    lay = "0:59,59:80"
+    assert catalog_layout(lay) == [(0, 59, True), (59, 80, False)]
+    assert catalog_layout(m) == [(0, 59, True), (59, 80, False)], "manifest dict → same layout"
+
+    # layout → coordinator Topology args
+    assert topology_from_catalog(80, catalog_layout(lay)) == (59, 1, [21])
+    assert topology_from_catalog(80, catalog_layout("0:16,16:48,48:80")) == (16, 2, [32, 32])
+
+    # THE GUARANTEE: a Topology built from the catalog assigns exactly the published stage slots,
+    # so a node's assigned range maps to a published artifact dir (download, not local-slice).
+    ranges = catalog_layout("0:16,16:48,48:80")
+    ce, ns, sizes = topology_from_catalog(80, ranges)
+    topo = Topology(num_layers=80, coordinator_end=ce, num_stages=ns, model_fp="m", slot_sizes=sizes)
+    assigned = [(s.start, s.end) for s in topo.slots]
+    published_stage_dirs = [slot_dirname(s, e, False) for (s, e, kh) in ranges if not kh]
+    node_resolved_dirs = [slot_dirname(s.start, s.end, False) for s in topo.slots]
+    assert assigned == [(16, 48), (48, 80)], assigned
+    assert node_resolved_dirs == published_stage_dirs, "coordinator slots ↔ published artifact dirs"
+
+    # validation: first slot must be keep-head; stages must tile to num_layers
+    for bad in (lambda: topology_from_catalog(80, [(0, 59, False), (59, 80, False)]),  # no head
+                lambda: topology_from_catalog(80, [(0, 59, True)]),                    # no stages
+                lambda: topology_from_catalog(80, [(0, 40, True), (40, 70, False)])):  # gap to 80
+        try:
+            bad(); raise AssertionError("should reject bad catalog")
+        except ValueError:
+            pass
+
     print("SHARD-FETCH TESTS PASSED — slot naming (coord vs stage), resolve_submodel cache path, "
-          "parse_layout contiguity, build_manifest ↔ node slot-name agreement")
+          "parse_layout contiguity, build_manifest ↔ node slot-name agreement, catalog→Topology "
+          "alignment (coordinator slots == published artifact dirs)")
 
 
 if __name__ == "__main__":

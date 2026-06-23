@@ -26,41 +26,9 @@ import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
-from engine.shard_fetch import slot_dirname  # noqa: E402
-
-
-def parse_layout(spec: str):
-    """'0:59,59:80' -> [(0,59,True),(59,80,False)]: contiguous ranges, the FIRST flagged keep_head
-    (the coordinator slice). Validates contiguity (each range starts where the previous ended) and
-    that ranges are non-empty/ascending. Pure."""
-    ranges = []
-    parts = [p for p in spec.split(",") if p.strip()]
-    if not parts:
-        raise ValueError("empty layout")
-    prev_end = None
-    for i, p in enumerate(parts):
-        s_str, e_str = p.split(":")
-        s, e = int(s_str), int(e_str)
-        if e <= s:
-            raise ValueError(f"range {p}: end must be > start")
-        if prev_end is not None and s != prev_end:
-            raise ValueError(f"non-contiguous layout at {p}: expected start {prev_end}")
-        ranges.append((s, e, i == 0))   # first slice keeps the head
-        prev_end = e
-    return ranges
-
-
-def build_manifest(model_id: str, ranges) -> dict:
-    """Manifest a node reads to find its slot's artifact. Pure."""
-    return {
-        "model": model_id,
-        "format": "awq-per-node-v1",
-        "num_layers": ranges[-1][1],
-        "slots": [
-            {"start": s, "end": e, "keep_head": kh, "dir": slot_dirname(s, e, kh)}
-            for (s, e, kh) in ranges
-        ],
-    }
+# layout/manifest live in engine.shard_fetch so the publisher and the coordinator share ONE
+# definition of the slot boundaries (catalog alignment — see topology_from_catalog).
+from engine.shard_fetch import slot_dirname, parse_layout, build_manifest  # noqa: E402
 
 
 def main(argv):
