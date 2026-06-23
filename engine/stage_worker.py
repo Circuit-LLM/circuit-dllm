@@ -26,7 +26,7 @@ import torch
 
 from engine import wire, chain
 from engine.tensors import pack_activation, unpack_activation, unpack_batch_activation
-from engine.stage import stage_for_range
+from engine.stage import Stage, stage_for_range
 from engine.kv import StageKV
 from engine.model import load_model
 from engine.log import make_logger
@@ -99,10 +99,30 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
           device: str = "cpu", host: str = "0.0.0.0",
           prune: bool = False, keep_head: bool = False,
           shard: bool = False, other_device: str = "cpu", quant: str = "",
-          on_listening=None):
+          submodel: str = "", on_listening=None):
     log = make_logger(f"stage[{start}:{end}]")
-    log("INFO", "loading model", model=model_id, device=device, shard=shard, quant=quant or "fp16")
-    if shard:
+    log("INFO", "loading model", model=model_id, device=device, shard=shard,
+        quant=quant or "fp16", submodel=submodel or "-")
+    stage = None
+    if submodel:
+        # AWQ-per-node (docs/AWQ_PER_NODE.md): load a PRE-SLICED complete n-layer AWQ sub-model
+        # (every layer on cuda → Marlin OK; sidesteps AWQ-can't-shard). Its layers are global
+        # [start,end) renumbered to local 0..n-1. The Stage runs them on incoming hidden states,
+        # so embed/lm_head (dropped by the slicer; random-init at load) are freed. RoPE/masks
+        # depend on position + attention-config, not layer index → LOCAL indices are correct.
+        import torch
+        model = load_model(submodel, device=device)
+        n = model.config.num_hidden_layers
+        if n != end - start:
+            log("WARN", "submodel layer count != slot width", n=n, slot=f"{start}:{end}")
+        model.model.embed_tokens = torch.nn.Identity()
+        if getattr(model, "lm_head", None) is not None:
+            model.lm_head = torch.nn.Identity()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        stage = Stage(list(model.model.layers), list(range(n)), model.model.rotary_emb, model.config)
+        log("INFO", "submodel-loaded owned layers (AWQ/Marlin)", local_layers=n, slot=f"{start}:{end}")
+    elif shard:
         # load ONLY this stage's layers into VRAM (models too big to load whole)
         gpu = "cuda:0" if device == "cuda" else device
         if quant == "bnb":
@@ -121,7 +141,8 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
             from engine.model import prune_to_layers
             prune_to_layers(model, start, end, keep_head=keep_head)
             log("INFO", "pruned to owned layers", keep_head=keep_head)
-    stage = stage_for_range(model, start, end)
+    if stage is None:                       # non-submodel paths build the stage over global [start,end)
+        stage = stage_for_range(model, start, end)
     config = model.config
     compute_lock = threading.Lock()   # serialize model use across peer threads
 
@@ -407,6 +428,7 @@ def run_control_client(a):
     try:
         serve(a.port, start, end, a.model, key, device=a.device, host=a.host,
               prune=a.prune, shard=a.shard, other_device=a.other_device, quant=a.quant,
+              submodel=(a.submodel or os.environ.get("CIRCUIT_STAGE_SUBMODEL", "")),
               on_listening=_on_listening)
     finally:
         stop.set()
@@ -434,6 +456,10 @@ def main():
     ap.add_argument("--keep-head", action="store_true",
                     help="keep embed/norm/lm_head (for the coordinator-colocated stage)")
     # ── static mode: a fixed layer range + the shared cluster key ──
+    ap.add_argument("--submodel", default="",
+                    help="AWQ-per-node: dir of a PRE-SLICED complete n-layer AWQ sub-model for "
+                         "this slot (docs/AWQ_PER_NODE.md). Loads it whole (Marlin OK) instead of "
+                         "sharding; overrides --shard/--quant. Env: CIRCUIT_STAGE_SUBMODEL.")
     ap.add_argument("--layers", help="START:END for static mode (e.g. 0:12)")
     ap.add_argument("--key", help="64-char hex cluster key for static mode")
     # ── control-client mode: join a coordinator's mesh; receive layers + a per-node key ──
@@ -469,7 +495,7 @@ def main():
     start, end = (int(x) for x in a.layers.split(":"))
     serve(a.port, start, end, a.model, wire.normalize_key(a.key), a.device, a.host,
           prune=a.prune, keep_head=a.keep_head, shard=a.shard, other_device=a.other_device,
-          quant=a.quant)
+          quant=a.quant, submodel=(a.submodel or os.environ.get("CIRCUIT_STAGE_SUBMODEL", "")))
 
 
 if __name__ == "__main__":

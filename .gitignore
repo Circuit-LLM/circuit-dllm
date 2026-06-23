@@ -22,3 +22,6 @@ data/
 .env
 .env.*
 !.env.example
+
+# local cluster wire key (secret — never commit)
+.circuit_72b_key

@@ -56,11 +56,11 @@ bench() {  # $1 = concurrency
   done
   wait
   end=$(date +%s.%N)
-  secs=$(echo "$end - $start" | bc)
+  secs=$(awk "BEGIN{printf \"%.3f\", $end - $start}")   # awk, not bc (bc absent on some pods)
   for i in $(seq 0 $((N - 1))); do tot=$((tot + $(cat "$tmp/$i"))); done
   rm -rf "$tmp"
   printf "concurrency=%-2s  tokens=%-4s  wall=%6.1fs  AGGREGATE=%s tok/s\n" \
-    "$N" "$tot" "$secs" "$(echo "scale=2; $tot / $secs" | bc)"
+    "$N" "$tot" "$secs" "$(awk "BEGIN{printf \"%.2f\", $tot / $secs}")"
 }
 
 echo "== mesh benchmark: $BASE  (model=$MODEL, max_tokens=$MAXTOK) =="

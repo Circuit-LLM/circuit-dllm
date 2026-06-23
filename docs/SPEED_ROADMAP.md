@@ -1,9 +1,42 @@
 # Speed Roadmap — making decentralized inference fast
 
-**Status:** design / proposal
+**Status:** ACTIVE — mesh is the committed product direction (operator decision 2026-06-23:
+"mesh-only, stay decentralized"; a single fat-GPU solo box was explicitly rejected even though
+it benchmarked fast). So this roadmap's trigger has fired: single-stream latency on the mesh is
+now the thing to fix.
 **Companion to:** `docs/TOPOLOGY_AWARE_ROUTING.md` (the routing foundation these build on).
 **Constraint:** every technique here must preserve decentralization — no co-location, no
 assuming nodes are nearby. They make *genuinely distributed* nodes fast.
+
+### Measured reality (2026-06-23 — read before planning)
+- **Solo ceiling (1 fat GPU, 0 hops):** 72B-**AWQ** on one A100-80GB = **16.67 tok/s** single-
+  stream (beats the live 32B's 13-14). Same card on **bnb** = 7.93 → **AWQ/Marlin is 2.1× bnb.**
+  This is the speed-of-light for the model on one card; the mesh's job is to approach it while
+  staying distributed. Concurrency on ONE card *hurts* (global lock serializes: AWQ conc4=12.76
+  < 16.67) — a single card is one fast stream, not a throughput box. The mesh's overlap across
+  GPUs is what scales concurrency.
+- **Modest scattered 4-GPU mesh:** 2.77 tok/s single (1.5B draft), ~7.3 aggregate@4. The
+  per-token round (~1.2-1.3s) is **compute + hop-overhead bound, NOT network bound** (proven:
+  single-host mesh gave the same ~2 tok/s). So the levers are (a) fewer/fatter hops and (b)
+  faster per-node compute — NOT network tricks (chain relay ≈ star on a scattered mesh; it only
+  wins with clustered nodes we don't have → §3.x, LATER).
+- **Acceptance is already good:** the free **1.5B draft** measured **0.577 accept / 3.31 tokens
+  per round** on the 72B. That is already at the TOP of EAGLE-3's published accept-length range
+  (1.8-3.5) → **EAGLE is now a marginal lever, not the ~2× the old §2.2 claimed** (see §2.2,
+  corrected). The mesh's real bottleneck is hops × per-hop compute, which acceptance doesn't touch.
+
+### The reframed mesh-only critical path (supersedes the old Wave A)
+1. **Fewest-fattest stages (§1.2)** — 2 fat nodes (1 hop) beats 4 thin nodes (3 hops). Hop count
+   is the dominant cost; halving stages ≈ halving the round. Structural, cheap. **Do first.**
+2. **AWQ per node (the 2.1× compute win)** — each node runs the Marlin kernel on its slice
+   instead of bnb. BLOCKER: AWQ can't shard today (gptqmodel Marlin wants all layers on cuda;
+   dense skeleton won't bind AWQ qweight/scales). Finishing the quant-aware shard loader is the
+   single biggest per-node compute lever. GPU-validation-gated, uncertain — the key build.
+3. **Concurrency/overlap (§3.3, BUILT)** — the decentralized net's real metric; ~3-4× aggregate
+   already proven. Deploy + measure under real load.
+4. **EAGLE (§2.2) — OPTIONAL, deferred.** Marginal over the 1.5B draft (above), and our target
+   (Qwen2.5-72B text) has NO published head → a SpecForge training run. Not worth it unless a
+   higher single-stream bar is set after 1-3.
 
 ---
 
@@ -78,26 +111,34 @@ from the latency matrix.
 throughput (speculation always does). Coordinator-side draft compute grows with tree size.
 **Depends on:** latency matrix (P1) to size the tree; batched-wire path (exists).
 
-### 2.2 EAGLE-3 drafting  ⭐⭐ (highest-ROI single lever — more accepted tokens per round-trip)
-**What:** replace the vanilla 0.5B draft with an **EAGLE-3 head** — a 1-layer draft (~1-3B)
-that autoregresses at the *feature/hidden-state* level, fusing activations from every target
-layer through a learned gate and reusing the target's own LM head. State-of-the-art draft
-acceptance.
-**Why distributed (this is the whole game):** in a high-latency mesh the network round-trip
-is the fixed cost, so **acceptance per round-trip is everything**, and the draft runs on the
-coordinator → **zero added hops**. Our live mesh measured **acceptance 0.389 / 2.56 tokens
-per round** with the untrained 0.5B; EAGLE-3 reports **0.80-0.88** acceptance on the Qwen
-family → roughly **2× the tokens per round-trip → ~half the round-trips per token.** That is
-a near-direct ~2× on single-stream latency, stacking on top of chain relay and trees.
-**How:** drop an EAGLE-3 head onto the coordinator (it already holds embed/lm_head + early
-layers); feed it the target's fused features; it proposes the tree that §2.1 verifies in one
-sweep. `specdecode.GreedyDraft` → `EagleDraft` behind `CIRCUIT_DRAFT_KIND=eagle`.
-**Availability (researched 2026-06):** pre-trained EAGLE-3 heads exist for **Qwen2.5-72B**
-(e.g. AngelSlim / the EAGLE repo) → mostly download+integrate; training a custom head is
-~2-4h on 4×H100 with the target's activations as supervision. Tokenizer-shared with the 72B.
-**Tradeoff:** the head is model-specific (one per target/rev); ~1-3 GB extra on the
-coordinator; integration must match the target's hidden-state interface. Pure win otherwise.
-**Depends on:** the speculative path (exists); pairs with §2.1 trees (EAGLE-3 is tree-native).
+### 2.2 EAGLE-3 drafting  ⚠️ (DOWNGRADED from ⭐⭐ — marginal over the 1.5B draft we already run)
+**What:** replace the vanilla draft with an **EAGLE-3 head** — a 1-layer draft (~1-3B) that
+autoregresses at the *feature/hidden-state* level, fusing activations from every target layer
+through a learned gate and reusing the target's own LM head. State-of-the-art draft acceptance.
+**Why it was the headline lever:** in a high-latency mesh the round-trip is the fixed cost, so
+acceptance per round-trip matters, and the draft runs on the coordinator → zero added hops.
+**Why it's DOWNGRADED (verified 2026-06-23 — the old numbers here were wrong):**
+- **The benefit is now marginal.** We measured the free **1.5B draft at 0.577 accept / 3.31
+  tokens-per-round** on the live 72B. AngelSlim's EAGLE-3 reports accept-**length 1.8-3.5**
+  (1.4-1.9× speedup) for the Qwen3 family. Our 3.31 is already at the top of that band → EAGLE
+  buys little headline tokens/round over the draft we already run for free. (The old "0.389 →
+  0.85, ~2×" claim used the weak 0.5B draft as the baseline and an optimistic EAGLE number; the
+  1.5B draft already closed most of that gap at zero cost — see SPEED_ROADMAP measured reality.)
+- **No head exists for our target.** Verified against the SafeAILab/EAGLE repo + HF: there is
+  **NO EAGLE/EAGLE-3 head for Qwen2.5-72B-Instruct (text)**. Only `Qwen2.5-VL-72B` (vision,
+  trained on ALLaVA-4V — features won't transfer to text) and an old EAGLE-**v1** head for
+  *Qwen2* (not 2.5) 72B. AngelSlim's ready EAGLE-3 heads cover **Qwen3** 1.7B/4B/8B/14B/32B dense
+  + 30B-A3B MoE only — and **Qwen3 has no dense 72B** (dense tops at 32B; bigger is MoE). So
+  EAGLE on our exact target = a **SpecForge training run** (~2-4h on 4×H100, one-time), not a
+  download. Not worth that for a marginal gain.
+**When it WOULD matter again:** (a) if a model swap is on the table — pivoting to **Qwen3-32B**
+(fits one card, free head) or a **Qwen3 MoE** (235B-A22B genuinely needs a mesh, but no published
+head → still a training run); (b) if after fewest-fattest + AWQ-per-node the single-stream bar is
+still short and the cheap draft's acceptance is the remaining gap. Until then: **keep the 1.5B
+draft, skip EAGLE.**
+**How (if revived):** `specdecode.GreedyDraft` → `EagleDraft` behind `CIRCUIT_DRAFT_KIND=eagle`
+(scaffolding FINAL in `engine/eagle.py`; the head-forward + `load_eagle_head` are the GPU steps).
+**Depends on:** a trained/available head for the served model.
 
 ### 2.3 Speculation swarm  🧪 (the per-node-0.5B idea, done right — uses idle decode compute)
 **What:** decode is **memory-bandwidth-bound**, so each node's compute units sit ~idle during
@@ -241,16 +282,21 @@ three first, measure on a `tc netem` testbed, *then* commit to the heavy two.
   Unit-tested (`test_topology_latency`, `test_rtt_probe`). This already **picks the fastest
   replica per slot at pin time** — i.e. subsumes the practical benefit of replica hedging
   (which KV affinity rules out, see §3.1).
-- **Wave A — the two biggest levers, built together, measured on ONE 72B mesh bring-up
-  (current focus):**
-  - **Chain relay (P3 / docs/CHAIN_RELAY.md)** — the structural fix: stages forward node→node,
-    coordinator only at entry/exit. Turns N coordinator round-trips into one forward sweep.
-    Pure-logic core (route→chain, next-hop, wire frames) unit-tested on the VPS; the
-    stage/coordinator GPU integration validated on the mesh.
-  - **EAGLE-3 draft (2.2)** — ~2× tokens/round (0.389 → ~0.85 acceptance), zero added hops.
-    Mostly download+integrate (pretrained Qwen2.5-72B head). `CIRCUIT_DRAFT_KIND=eagle`.
-  - Amortize the spin-up: bring the 72B mesh up *once*, measure P1 proximity + chain + EAGLE
-    together against the 1.5 tok/s cross-DC baseline.
+- **Wave A — REFRAMED for mesh-only (2026-06-23): fewer/fatter hops + faster per-node compute,
+  NOT acceptance.** The measured round is compute/hop-bound, acceptance is already good (3.31
+  tok/round on the free 1.5B draft), and chain relay ≈ star on scattered nodes → the old "chain +
+  EAGLE" Wave A is wrong for our actual bottleneck. Build, on ONE 72B mesh bring-up:
+  - **Fewest-fattest stages (§1.2)** — fewest stages that cover the model from joined nodes'
+    `capacity_layers` (2 fat nodes / 1 hop ≫ 4 thin / 3 hops). Halving hops ≈ halving the round.
+    The cheapest, most structural win; lands in `topology.py` slot construction. **First.**
+  - **AWQ per node (the 2.1× Marlin compute win)** — finish the quant-aware shard loader so each
+    node loads ONLY its layers as AWQ and runs Marlin instead of bnb. The known blocker
+    (gptqmodel wants all layers on cuda; dense skeleton won't bind AWQ buffers) is the crux —
+    GPU-validation-gated. This is the single biggest per-node compute lever; **the key build.**
+  - **Concurrency/overlap (§3.3)** — already built (Win A live ~3-4×, Win B gated); deploy +
+    measure aggregate under load. The decentralized net's real metric.
+  - Defer **chain relay** (§3.x, only helps with clustered placement — gated on contributor
+    density) and **EAGLE** (§2.2, marginal + needs a training run) until 1-3 are measured.
 - **Wave B — stack more tokens-per-round + kill prefill:**
   - **Latency-scaled spec trees (2.1)** — EAGLE-3 is tree-native; size the tree by RTT.
   - **Prefix KV cache (4.1)** — TTFT; deletes the prompt's network traversal for shared prefixes.

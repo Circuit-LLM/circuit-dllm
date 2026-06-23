@@ -55,6 +55,49 @@ def _region_rtt_estimate(a: Optional[str], b: Optional[str]) -> float:
     return 150.0
 
 
+def plan_stages(layer_budget: int, capacities, replication: int = 1) -> int:
+    """Choose the FEWEST contiguous stages that the given node capacities can staff —
+    the "fewest-fattest" lever (SPEED_ROADMAP §1.2). Each stage boundary is an inter-node
+    network hop, and the measured per-token round on a distributed mesh is dominated by
+    hop count (the round is compute/hop-overhead-bound, not network-bandwidth-bound), so
+    2 fat nodes (1 hop) beats 4 thin nodes (3 hops). Fewer stages ≈ proportionally fewer
+    hops ≈ a shorter round.
+
+    `layer_budget` = layers NOT held by the coordinator = `num_layers - coordinator_end`
+    (the part split across nodes). `capacities` = each candidate node's `capacity_layers`
+    (VRAM-derived max contiguous layers it can hold). `replication` = holders required per
+    slot (so k stages need k·replication assignable nodes).
+
+    Returns the smallest stage count k (≥1) such that the balanced-split layout the Topology
+    constructor produces — `rem = budget % k` slots of `ceil(budget/k)` and the rest of
+    `budget//k` — can be covered: matching the largest slots to the largest-capacity nodes,
+    every slot gets `replication` distinct nodes with capacity ≥ that slot's size. As k grows
+    the slots shrink, so more nodes qualify; we return the first feasible k. Raises ValueError
+    if no k works (the fattest nodes can't even hold the model split as thin as it goes, or
+    too few nodes for the requested replication).
+
+    NOTE: assumes capacity-aware slot assignment OR a homogeneous fleet (identical GPUs —
+    the common RunPod bring-up). `_pick_slot` currently fills least-committed-first (not
+    fat-node→fat-slot), so a heterogeneous fleet can still mis-assign; see _pick_slot TODO."""
+    if layer_budget < 1:
+        raise ValueError("layer_budget must be >= 1")
+    if replication < 1:
+        raise ValueError("replication must be >= 1")
+    caps = sorted((int(c) for c in capacities), reverse=True)
+    for k in range(1, layer_budget + 1):
+        per, rem = divmod(layer_budget, k)   # per==0 once k > layer_budget
+        if per == 0:
+            break                            # can't make k non-empty contiguous slots
+        sizes = [per + 1] * rem + [per] * (k - rem)          # balanced (matches constructor)
+        demands = sorted(sizes * replication, reverse=True)  # k·replication demands
+        # feasible iff sorted demands fit under sorted capacities (largest-to-largest)
+        if len(demands) <= len(caps) and all(d <= c for d, c in zip(demands, caps)):
+            return k
+    raise ValueError(
+        f"cannot cover {layer_budget} layers with capacities {caps} at replication "
+        f"{replication}: fattest node holds {caps[0] if caps else 0}, need more/bigger nodes")
+
+
 @dataclass
 class Node:
     node_id: str                 # ed25519 pubkey (operator identity)
@@ -100,14 +143,32 @@ class Topology:
         self.route_by_latency = route_by_latency
         self._rtt: Dict[str, float] = {}     # node_id -> measured RTT(ms) from coordinator
         self.nodes: Dict[str, Node] = {}
-        # fixed contiguous slots over [coordinator_end, num_layers)
-        per = (num_layers - coordinator_end) // num_stages
+        # fixed contiguous slots over [coordinator_end, num_layers). The remainder is spread
+        # one-layer-each across the FIRST `rem` slots (balanced split) rather than dumped on
+        # the last slot — so the max slot size is ceil(budget/num_stages), not per+rem. That
+        # evens VRAM load across nodes AND lets the fewest-fattest planner (plan_stages) staff
+        # a given stage count with smaller nodes (a fat trailing slot would otherwise force
+        # more stages). Exact-divide layouts are unchanged.
+        budget = num_layers - coordinator_end
+        per, rem = divmod(budget, num_stages)
         self.slots: List[Slot] = []
         s = coordinator_end
         for i in range(num_stages):
-            e = num_layers if i == num_stages - 1 else s + per
+            e = s + per + (1 if i < rem else 0)
             self.slots.append(Slot(i, s, e))
             s = e
+
+    @classmethod
+    def for_fleet(cls, num_layers: int, coordinator_end: int, model_fp: str,
+                  capacities, replication: int = 2, **kw) -> "Topology":
+        """Build a Topology with the FEWEST stages the fleet's `capacities` can staff
+        (plan_stages — the fewest-fattest lever, SPEED_ROADMAP §1.2), instead of a static
+        num_stages. The control plane calls this once it knows the joined nodes' capacities
+        so a 24GB-class fleet runs as 2 fat stages (1 hop), not 4 thin ones (3 hops).
+        `replication` is forwarded to BOTH plan_stages (enough nodes to staff k·rep slots)
+        and the Topology (per-slot holder target)."""
+        k = plan_stages(num_layers - coordinator_end, capacities, replication)
+        return cls(num_layers, coordinator_end, k, model_fp, replication=replication, **kw)
 
     def _slot_size(self, slot: Slot) -> int:
         return slot.end - slot.start

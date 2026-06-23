@@ -49,6 +49,9 @@ def _build_coordinator(registry=None) -> Coordinator:
         shard=os.environ.get("CIRCUIT_SHARD") == "1",
         other_device=os.environ.get("CIRCUIT_OTHER_DEVICE", "cpu"),
         quant=os.environ.get("CIRCUIT_QUANT", ""),
+        # AWQ-per-node: a PRE-SLICED keep-head sub-model dir (embed+norm+lm_head+layers[0,k))
+        # the coordinator loads whole (Marlin OK) instead of bnb-sharding. docs/AWQ_PER_NODE.md.
+        submodel=os.environ.get("CIRCUIT_COORD_SUBMODEL", ""),
         registry=registry,
         # CIRCUIT_MAX_CONCURRENCY > 1 enables pipeline overlap (each request gets its
         # own stage sockets); 1 (default) = single-stream, byte-identical to before.
@@ -76,6 +79,20 @@ def _build_mesh():
     coordinator_end = int(ll.split(":")[1]) if ll else 0
     layers = int(os.environ["CIRCUIT_MESH_LAYERS"])
     n_stages = int(os.environ.get("CIRCUIT_MESH_STAGES", "1"))
+    # Fewest-fattest stages (SPEED_ROADMAP §1.2): if the operator declares the fleet's
+    # per-node capacity (layers a node can hold, VRAM-derived), pick the FEWEST stages those
+    # nodes can staff — fewer stages = fewer inter-node hops = a shorter per-token round, the
+    # dominant cost on a distributed mesh. Overrides the static CIRCUIT_MESH_STAGES. Unset →
+    # the static stage count (default path unchanged). Capacity-only (node-count/replication
+    # is handled by rebalance as nodes join), so pass plenty of homogeneous slots.
+    node_cap = os.environ.get("CIRCUIT_MESH_NODE_CAP")
+    if node_cap:
+        from engine.topology import plan_stages
+        budget = layers - coordinator_end
+        n_stages = plan_stages(budget, [int(node_cap)] * budget, replication=1)
+        print(f"[mesh] fewest-fattest: {budget} layers / {node_cap}-cap nodes "
+              f"-> {n_stages} stage(s) (~{-(-budget // n_stages)} layers each), "
+              f"overriding CIRCUIT_MESH_STAGES", flush=True)
     fp = os.environ.get("CIRCUIT_MESH_FP", "")
     repl = int(os.environ.get("CIRCUIT_MESH_REPLICATION", "1"))
     dead_after = float(os.environ.get("CIRCUIT_MESH_DEAD_AFTER", "30"))

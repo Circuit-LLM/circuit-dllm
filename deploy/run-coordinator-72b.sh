@@ -37,7 +37,12 @@ export CIRCUIT_LOCAL_LAYERS="${CIRCUIT_LOCAL_LAYERS:-0:16}"   # coordinator hold
 # ── mesh control plane ───────────────────────────────────────────────────────
 export CIRCUIT_MESH=1
 export CIRCUIT_MESH_LAYERS="${CIRCUIT_MESH_LAYERS:-80}"       # Qwen2.5-72B = 80 layers
-export CIRCUIT_MESH_STAGES="${CIRCUIT_MESH_STAGES:-3}"        # 3 nodes split [16,80) -> ~21 layers each
+export CIRCUIT_MESH_STAGES="${CIRCUIT_MESH_STAGES:-3}"        # fallback static count if no NODE_CAP
+# Fewest-fattest (SPEED_ROADMAP §1.2): set NODE_CAP = layers one node can hold (VRAM-derived)
+# and the coordinator picks the FEWEST stages those nodes can staff (fewer hops = faster). A
+# 24GB card holds ~40 4-bit-72B layers -> NODE_CAP=32 makes [16,80) run as 2 fat stages (1 hop)
+# instead of 3-4 thin ones. Unset -> the static CIRCUIT_MESH_STAGES above. Match node VRAM.
+export CIRCUIT_MESH_NODE_CAP="${CIRCUIT_MESH_NODE_CAP:-32}"
 export CIRCUIT_MESH_FP="${CIRCUIT_MESH_FP:-qwen2.5-72b-bnb}"  # must match nodes' --model-fp
 export CIRCUIT_MESH_REPLICATION="${CIRCUIT_MESH_REPLICATION:-1}"
 export CIRCUIT_CONTROL_HOST=0.0.0.0

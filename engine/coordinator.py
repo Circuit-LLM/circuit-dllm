@@ -120,6 +120,7 @@ class Coordinator:
                  local_layers: Optional[Tuple[int, int]] = None,
                  draft_model_id: Optional[str] = None,
                  shard: bool = False, other_device: str = "cpu", quant: str = "",
+                 submodel: str = "",
                  registry=None, max_concurrency: int = 1, chain_relay: bool = False):
         """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
         so a big model loads once on this pod (layers + head) instead of a
@@ -141,7 +142,17 @@ class Coordinator:
                  local_layers=local_layers, shard=shard)
         self.local_stage = None
         self._local_caches = {}
-        if local_layers is not None and shard:
+        if submodel:
+            # AWQ-per-node (docs/AWQ_PER_NODE.md): the coordinator loads a PRE-SLICED keep-head
+            # sub-model = embed + norm + lm_head + layers [0,k) as a complete AWQ model (Marlin
+            # OK). local_layers=(0,k); the sub-model's layers 0..k-1 ARE global [0,k) (coordinator
+            # always holds the first layers, start=0), so stage_for_range maps directly.
+            model = load_model(submodel, device=device)
+            if local_layers is not None:
+                s, e = local_layers
+                self.local_stage = stage_for_range(model, s, e)
+                self.log("INFO", "co-located stage (AWQ submodel)", layers=f"{s}:{e}")
+        elif local_layers is not None and shard:
             # too big to load whole: load only embed/head + this pod's layers
             s, e = local_layers
             gpu = "cuda:0" if device == "cuda" else device
