@@ -123,8 +123,30 @@ node's `resolve_submodel` hits the **download** path, not the 40GB local-slice f
 manifest, publisher, and coordinator all share one definition in `engine/shard_fetch.py` so ranges
 can't drift. Unit-tested (`test_shard_fetch`: catalog→Topology → coordinator slots == published dirs).
 
-**Validation pending (next GPU/HF session):** publish a real shard repo (`publish-awq-shards.py
---upload`) + bring up a catalog-aligned coordinator + a dynamic node (`CIRCUIT_AWQ_SHARDS=<repo>`)
-that pulls its slice and serves end-to-end. **Scaling = REPLICATION** (multiple pipelines) — each
-L40+L4-class pipeline caps ~16 tok/s aggregate, so capacity grows by adding pipelines, not by tuning
-one (measured 2026-06-23).
+### End-to-end deploy (3 steps — also the validation-session script)
+```
+# 0. pick the layout for the target fleet (bandwidth-proportional)
+python3 -m engine.topology layout 80 "NVIDIA L40" "NVIDIA L4"      # -> 0:59,59:80
+
+# 1. publish the per-stage artifacts once (any box with HF write + the full AWQ)
+python3 scripts/publish-awq-shards.py Qwen/Qwen2.5-72B-Instruct-AWQ /root/shards \
+    --layout 0:59,59:80 --repo Circuit-LLM/qwen2.5-72b-awq-shards --upload
+
+# 2. coordinator: build the Topology from the SAME layout so assigned slots == published slots
+CIRCUIT_MESH=1 CIRCUIT_MESH_LAYERS=80 CIRCUIT_MESH_FP=qwen2.5-72b-awq \
+CIRCUIT_MESH_CATALOG=0:59,59:80 CIRCUIT_COORD_SUBMODEL=<coord keep-head slice> ... \
+    bash deploy/run-coordinator-72b-awq.sh        # coordinator_end+slot sizes come from the catalog
+
+# 3. each contributor: join + pull ONLY their assigned ~16GB slice + serve (Marlin)
+CIRCUIT_CONTROL_URL=http://<coord>:18932 CIRCUIT_AWQ_SHARDS=Circuit-LLM/qwen2.5-72b-awq-shards \
+    bash deploy/run-contributor-node.sh
+```
+`run-contributor-node.sh` auto-derives capacity from VRAM, self-advertises its RunPod proxy addr,
+and (via `CIRCUIT_AWQ_SHARDS`) resolves its slice download→local-slice. Repeat step 3 to **replicate**
+pipelines for aggregate scale.
+
+**Validation pending (next GPU/HF session):** run the 3 steps above for real — publish a (small-model)
+shard repo, bring up a catalog-aligned coordinator + a contributor node that pulls its slice and
+serves end-to-end; confirm the assigned range hits the download path. **Scaling = REPLICATION**
+(multiple pipelines) — each L40+L4-class pipeline caps ~16 tok/s aggregate, so capacity grows by
+adding pipelines, not by tuning one (measured 2026-06-23).
