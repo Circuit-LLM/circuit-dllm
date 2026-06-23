@@ -28,9 +28,16 @@ declare -A REPOS=( ["models--${MODEL_REPO//\//--}"]="$MODEL_REPO" )
 [ -n "${CIRCUIT_DRAFT:-}" ] && REPOS["models--${CIRCUIT_DRAFT//\//--}"]="$CIRCUIT_DRAFT"
 
 # 1) Ensure each model is on this node's own volume (download from HF if absent).
+# "Present" must mean the WEIGHTS are actually linked in the snapshot — not just that the
+# snapshot dir is non-empty. A partial/interrupted download can leave only config.json +
+# model.safetensors.index.json (and even blobs without snapshot symlinks), which passes a
+# naive non-empty check but then fails the load with "no model.safetensors". Re-running
+# snapshot_download is idempotent: it resumes from existing blobs and (re)creates the
+# missing symlinks (instant when blobs are present). So gate on a real weights file.
 for m in "${!REPOS[@]}"; do
-  if [ -d "$SRC/$m" ] && [ -n "$(ls -A "$SRC/$m/snapshots" 2>/dev/null)" ]; then
-    echo "[stage-model] $m present on node volume"
+  _snap=$(ls -d "$SRC/$m/snapshots/"*/ 2>/dev/null | head -1)
+  if [ -n "$_snap" ] && ls "$_snap"*.safetensors "$_snap"*.bin >/dev/null 2>&1; then
+    echo "[stage-model] $m present on node volume (weights linked)"
   else
     repo="${REPOS[$m]}"
     echo "[stage-model] $m absent — downloading $repo from HF to $MODEL_HOME (one-time self-provision)"
