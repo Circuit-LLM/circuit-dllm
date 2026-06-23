@@ -164,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
                 n_stages = n_remote + (1 if _coord.local_stage is not None else 0)
                 health = {"status": "ok", "model": _coord.model_id, "mesh": False,
                           "stages": n_stages, "remote_stages": n_remote}
-            if _coord._draft_model is not None:       # speculative decode active → its health
+            if _coord.has_draft():                    # speculative decode active → its health
                 health["speculative"] = _coord.spec_stats()
             self._json(200, health)
         elif self.path == "/v1/models":
@@ -295,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
                     # when acceptance is low.
                     _spec_k = int(os.environ.get("CIRCUIT_SPEC_K", "4"))
                     gen = (_coord.generate_speculative_stream(prompt, max_tokens, K=_spec_k)
-                           if _coord._draft_model is not None
+                           if _coord.has_draft()
                            else _coord.generate_stream(prompt, max_tokens))
                     for piece in gen:
                         chunk = {"id": cid, "object": "chat.completion.chunk",

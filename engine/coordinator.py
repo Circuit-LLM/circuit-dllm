@@ -174,6 +174,12 @@ class Coordinator:
         eos = gc.eos_token_id if (gc and gc.eos_token_id is not None) else self.tok.eos_token_id
         self._eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
         self._draft_model = load_model(draft_model_id, device=device) if draft_model_id else None
+        # CIRCUIT_DRAFT_KIND selects the speculative draft: "model" (default) = the proven
+        # standalone GreedyDraft; "eagle" = an EAGLE head conditioned on the target's final
+        # hidden (docs/EAGLE.md) — far higher acceptance, zero extra hop. Output stays
+        # token-identical to greedy for any draft; the kind only changes speed.
+        self._draft_kind = os.environ.get("CIRCUIT_DRAFT_KIND", "model")
+        self._eagle_head = None      # lazily loaded + cached (weights shared across calls)
         self._stage_addrs = stage_addrs
         # Per-request connection isolation (pipeline overlap). The default _Conn is
         # used single-stream and for direct (un-scoped) calls; request_gate() lends a
@@ -604,6 +610,26 @@ class Coordinator:
         finally:
             self._reset_sessions(sid)
 
+    def has_draft(self) -> bool:
+        """True when a speculative draft is available — a separate model (CIRCUIT_DRAFT) or an
+        EAGLE head (CIRCUIT_DRAFT_KIND=eagle). The API uses this to choose the speculative path."""
+        return self._draft_model is not None or self._draft_kind == "eagle"
+
+    def _make_draft(self):
+        """Build the speculative draft per CIRCUIT_DRAFT_KIND. 'model' (default) → the proven
+        standalone GreedyDraft over the separate draft model (the co-located main model may be
+        pruned and can't draft itself). 'eagle' → an EAGLE head conditioned on the target's
+        final hidden (docs/EAGLE.md): far higher acceptance, zero extra hop. Output stays
+        token-identical to greedy for ANY draft — the kind only affects speed."""
+        if self._draft_kind == "eagle":
+            from engine.eagle import EagleDraft, load_eagle_head
+            if self._eagle_head is None:
+                self._eagle_head = load_eagle_head(
+                    os.environ["CIRCUIT_EAGLE_HEAD"], self._model, self.device)
+            return EagleDraft(self._eagle_head, self._model.model.embed_tokens,
+                              self._model.lm_head, device=self.device)
+        return GreedyDraft(self._draft_model or self._model, device=self.device)
+
     @torch.no_grad()
     def generate_speculative(self, prompt: str, n_new: int = 24, K: int = 4,
                              draft=None) -> Tuple[str, List[int]]:
@@ -615,9 +641,7 @@ class Coordinator:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             target = SocketTarget(self, sid)
             if draft is None:
-                # use the separate draft model if loaded (the main model may be
-                # pruned for co-located stage 0 and can't draft itself)
-                draft = GreedyDraft(self._draft_model or self._model, device=self.device)
+                draft = self._make_draft()
             out = speculative_greedy(target, draft, ids, n_new, K=K, device=self.device,
                                      stats=local)
             return self.tok.decode(out), out
@@ -630,16 +654,16 @@ class Coordinator:
         """Streaming speculative decode (yields decoded text incrementally, like
         generate_stream, but verifies K draft tokens per pipeline round-trip).
         Output is token-identical to greedy; the draft only affects speed.
-        Requires a separate draft model (the co-located main model is pruned and
-        cannot draft itself)."""
-        if self._draft_model is None:
+        Requires a draft (the co-located main model is pruned and cannot draft itself):
+        a separate model (CIRCUIT_DRAFT) or an EAGLE head (CIRCUIT_DRAFT_KIND=eagle)."""
+        if self._draft_kind == "model" and self._draft_model is None:
             raise RuntimeError("generate_speculative_stream requires a draft model (set CIRCUIT_DRAFT)")
         sid = next(self._session_ids)
         local = {"rounds": 0, "accepted": 0, "proposed": 0, "window": []}
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             target = SocketTarget(self, sid)
-            draft = GreedyDraft(self._draft_model, device=self.device)
+            draft = self._make_draft()
             produced: List[int] = []
             prev_text = ""
             for tid in speculative_greedy_stream(target, draft, ids, n_new,
