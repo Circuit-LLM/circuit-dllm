@@ -150,9 +150,17 @@ publish (sliced `coord-0-14` + `sub-14-28`) → catalog coordinator (`[mesh] cat
 slot sizes=[14] aligned to published artifacts`) → contributor node `joined mesh layers=14:28` →
 `resolve_submodel` local-slice → `submodel-loaded (AWQ/Marlin)` → `ready` → `coverage_ok: true` →
 coherent inference, `tracebacks: coord=0 node=0`. So the catalog coordinator, dynamic register/assign,
-resolve_submodel (local-slice path), and serve all work end-to-end. **Only the HF upload/download leg
-is still unvalidated** (no HF write token this session — a thin huggingface_hub wrapper; the resolve
-decision logic + local-slice + serve are proven). **Remaining for 72B:** publish to a real HF repo +
-confirm the download path; **Scaling = REPLICATION**
-(multiple pipelines) — each L40+L4-class pipeline caps ~16 tok/s aggregate, so capacity grows by
-adding pipelines, not by tuning one (measured 2026-06-23).
+resolve_submodel (local-slice path), and serve all work end-to-end.
+
+**Download leg ALSO VALIDATED (2026-06-23, `scripts/validate-awq-download.sh`):** published
+`coord-0-14`+`sub-14-28`+manifest (revision + per-slot sha256) to a PRIVATE repo
+`circuitllmdev/qwen25-7b-awq-shards-val` with the `HUGGING_FACE_TOKEN` write token; a node then
+`joined mesh 14:28` → **`slice integrity verified`** (sha256 vs manifest) → **`downloaded published
+slice`** (NOT local-slice) → `submodel-loaded (AWQ/Marlin)` → `ready` → coherent inference, 0
+tracebacks. So the FULL chain is proven: publish(slice+hash+upload) → catalog coordinator → node
+downloads only its slice → verifies integrity → serves. (HF host = user **`circuitllmdev`**, write
+token Infisical `HUGGING_FACE_TOKEN`; test repo deleted after.)
+
+**Remaining: REPLICATION** (multiple pipelines) — each L40+L4-class pipeline caps ~16 tok/s
+aggregate, so capacity grows by adding pipelines, not by tuning one (measured 2026-06-23) — and the
+go-live decision (persistent endpoint and/or open contributor enrollment).
