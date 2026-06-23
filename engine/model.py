@@ -43,6 +43,34 @@ def _shard_device_map(config, start: int, end: int, keep_head: bool,
     return dm
 
 
+def load_model_shard_bnb(model_id: str, start: int, end: int, keep_head: bool = False,
+                         device: str = "cuda:0"):
+    """Selective shard load for a 4-bit (bitsandbytes NF4) model: a device_map places
+    ONLY the owned layers (+ embed/norm/lm_head if keep_head) on the GPU and every other
+    layer on `meta` — so un-owned layers are never materialized and only this stage's
+    ~share of the 4-bit weights lands in VRAM.
+
+    This is what lets a model too big for one card (e.g. a 70B) be split across GPUs.
+    AWQ/GPTQ can't shard this way: their Marlin kernel's post_init runs on every layer
+    and requires each to be on cuda (un-owned on meta/cpu -> "Expected a cuda device").
+    bitsandbytes has no such constraint. Proven bitwise-correct on a GPU (the sharded
+    stage output matches the full model). Requires `bitsandbytes` installed.
+    """
+    from transformers import BitsAndBytesConfig
+    config = AutoConfig.from_pretrained(model_id)
+    dm = _shard_device_map(config, start, end, keep_head=keep_head, gpu=device, other="meta")
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, quantization_config=bnb, device_map=dm, torch_dtype=torch.float16,
+    )
+    return model.eval()
+
+
 def load_model_shard(model_id: str, start: int, end: int, keep_head: bool = False,
                      device: str = "cuda:0", other_device: str = "cpu"):
     """Selective shard load: build the FULL model skeleton on `meta` (no weights),

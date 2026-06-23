@@ -48,6 +48,7 @@ def _build_coordinator(registry=None) -> Coordinator:
         draft_model_id=os.environ.get("CIRCUIT_DRAFT") or None,
         shard=os.environ.get("CIRCUIT_SHARD") == "1",
         other_device=os.environ.get("CIRCUIT_OTHER_DEVICE", "cpu"),
+        quant=os.environ.get("CIRCUIT_QUANT", ""),
         registry=registry,
         # CIRCUIT_MAX_CONCURRENCY > 1 enables pipeline overlap (each request gets its
         # own stage sockets); 1 (default) = single-stream, byte-identical to before.

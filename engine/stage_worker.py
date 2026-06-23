@@ -72,16 +72,23 @@ def _serve_conn(conn, addr, key, stage, config, device, compute_lock, log):
 def serve(port: int, start: int, end: int, model_id: str, key: bytes,
           device: str = "cpu", host: str = "0.0.0.0",
           prune: bool = False, keep_head: bool = False,
-          shard: bool = False, other_device: str = "cpu", on_listening=None):
+          shard: bool = False, other_device: str = "cpu", quant: str = "",
+          on_listening=None):
     log = make_logger(f"stage[{start}:{end}]")
-    log("INFO", "loading model", model=model_id, device=device, shard=shard)
+    log("INFO", "loading model", model=model_id, device=device, shard=shard, quant=quant or "fp16")
     if shard:
         # load ONLY this stage's layers into VRAM (models too big to load whole)
-        from engine.model import load_model_shard
         gpu = "cuda:0" if device == "cuda" else device
-        model = load_model_shard(model_id, start, end, keep_head=keep_head,
-                                 device=gpu, other_device=other_device)
-        log("INFO", "shard-loaded owned layers", keep_head=keep_head, other=other_device)
+        if quant == "bnb":
+            # 4-bit bitsandbytes: the only quant format that shard-loads (AWQ can't)
+            from engine.model import load_model_shard_bnb
+            model = load_model_shard_bnb(model_id, start, end, keep_head=keep_head, device=gpu)
+            log("INFO", "bnb-shard-loaded owned layers (4bit)", keep_head=keep_head)
+        else:
+            from engine.model import load_model_shard
+            model = load_model_shard(model_id, start, end, keep_head=keep_head,
+                                     device=gpu, other_device=other_device)
+            log("INFO", "shard-loaded owned layers", keep_head=keep_head, other=other_device)
     else:
         model = load_model(model_id, device=device)
         if prune:
@@ -275,7 +282,7 @@ def run_control_client(a):
 
     try:
         serve(a.port, start, end, a.model, key, device=a.device, host=a.host,
-              prune=a.prune, shard=a.shard, other_device=a.other_device,
+              prune=a.prune, shard=a.shard, other_device=a.other_device, quant=a.quant,
               on_listening=_on_listening)
     finally:
         stop.set()
@@ -297,6 +304,9 @@ def main():
                     help="load ONLY owned layers into VRAM (for models too big for one card)")
     ap.add_argument("--other-device", default="cpu",
                     help="where non-owned modules go under --shard (cpu or meta)")
+    ap.add_argument("--quant", default="",
+                    help="quant format for --shard: 'bnb' (4-bit bitsandbytes, the only "
+                         "format that shard-loads) or '' (fp16). AWQ can't shard.")
     ap.add_argument("--keep-head", action="store_true",
                     help="keep embed/norm/lm_head (for the coordinator-colocated stage)")
     # ── static mode: a fixed layer range + the shared cluster key ──
@@ -332,7 +342,8 @@ def main():
         ap.error("--layers and --key are required in static mode (or use --control-url)")
     start, end = (int(x) for x in a.layers.split(":"))
     serve(a.port, start, end, a.model, wire.normalize_key(a.key), a.device, a.host,
-          prune=a.prune, keep_head=a.keep_head, shard=a.shard, other_device=a.other_device)
+          prune=a.prune, keep_head=a.keep_head, shard=a.shard, other_device=a.other_device,
+          quant=a.quant)
 
 
 if __name__ == "__main__":

@@ -119,8 +119,8 @@ class Coordinator:
                  key: bytes, device: str = "cpu",
                  local_layers: Optional[Tuple[int, int]] = None,
                  draft_model_id: Optional[str] = None,
-                 shard: bool = False, other_device: str = "cpu", registry=None,
-                 max_concurrency: int = 1):
+                 shard: bool = False, other_device: str = "cpu", quant: str = "",
+                 registry=None, max_concurrency: int = 1):
         """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
         so a big model loads once on this pod (layers + head) instead of a
         coordinator and a stage worker each loading the whole model. The model
@@ -143,13 +143,18 @@ class Coordinator:
         self._local_caches = {}
         if local_layers is not None and shard:
             # too big to load whole: load only embed/head + this pod's layers
-            from engine.model import load_model_shard
             s, e = local_layers
             gpu = "cuda:0" if device == "cuda" else device
-            model = load_model_shard(model_id, s, e, keep_head=True,
-                                     device=gpu, other_device=other_device)
+            if quant == "bnb":
+                from engine.model import load_model_shard_bnb
+                model = load_model_shard_bnb(model_id, s, e, keep_head=True, device=gpu)
+                self.log("INFO", "co-located stage (bnb 4bit sharded)", layers=f"{s}:{e}")
+            else:
+                from engine.model import load_model_shard
+                model = load_model_shard(model_id, s, e, keep_head=True,
+                                         device=gpu, other_device=other_device)
+                self.log("INFO", "co-located stage (sharded)", layers=f"{s}:{e}")
             self.local_stage = stage_for_range(model, s, e)
-            self.log("INFO", "co-located stage (sharded)", layers=f"{s}:{e}")
         else:
             model = load_model(model_id, device=device)
             if local_layers is not None:
