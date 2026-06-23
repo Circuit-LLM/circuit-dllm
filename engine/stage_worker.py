@@ -389,6 +389,21 @@ def run_control_client(a):
     start, end, key = _do_register(timeout=float(getattr(a, "register_timeout", 2400)))
     clog("INFO", "joined mesh", node=a.node_id[:12], layers=f"{start}:{end}")
 
+    # AWQ-per-node in the DYNAMIC mesh (docs/AWQ_PER_NODE.md): the coordinator just told us our
+    # range, so now obtain a complete n-layer AWQ sub-model for exactly [start,end) and serve it
+    # with Marlin (instead of bnb shard). CIRCUIT_AWQ_SHARDS = a published artifact repo to pull
+    # our ~16GB slice from, or "local" to slice it out of the staged full checkpoint. An explicit
+    # --submodel / CIRCUIT_STAGE_SUBMODEL (static) still wins. Unset → the original bnb/shard path.
+    submodel = a.submodel or os.environ.get("CIRCUIT_STAGE_SUBMODEL", "")
+    awq_shards = getattr(a, "awq_shards", "") or os.environ.get("CIRCUIT_AWQ_SHARDS", "")
+    if not submodel and awq_shards:
+        from engine.shard_fetch import resolve_submodel
+        repo = None if awq_shards == "local" else awq_shards
+        submodel = resolve_submodel(a.model, start, end,
+                                    work_dir=os.environ.get("CIRCUIT_WORK_DIR", "/root"),
+                                    keep_head=False, repo=repo, log=clog)
+        clog("INFO", "resolved AWQ slice", dir=submodel)
+
     stop = threading.Event()
 
     def _heartbeat():
@@ -428,8 +443,7 @@ def run_control_client(a):
     try:
         serve(a.port, start, end, a.model, key, device=a.device, host=a.host,
               prune=a.prune, shard=a.shard, other_device=a.other_device, quant=a.quant,
-              submodel=(a.submodel or os.environ.get("CIRCUIT_STAGE_SUBMODEL", "")),
-              on_listening=_on_listening)
+              submodel=submodel, on_listening=_on_listening)
     finally:
         stop.set()
         try:
@@ -460,6 +474,11 @@ def main():
                     help="AWQ-per-node: dir of a PRE-SLICED complete n-layer AWQ sub-model for "
                          "this slot (docs/AWQ_PER_NODE.md). Loads it whole (Marlin OK) instead of "
                          "sharding; overrides --shard/--quant. Env: CIRCUIT_STAGE_SUBMODEL.")
+    ap.add_argument("--awq-shards", default="", dest="awq_shards",
+                    help="DYNAMIC AWQ-per-node: after the coordinator assigns this node's range, "
+                         "obtain the AWQ sub-model for it from this published artifact repo "
+                         "(Circuit-LLM HF repo), or 'local' to slice it from the staged full "
+                         "checkpoint. Env: CIRCUIT_AWQ_SHARDS. Control-client mode only.")
     ap.add_argument("--layers", help="START:END for static mode (e.g. 0:12)")
     ap.add_argument("--key", help="64-char hex cluster key for static mode")
     # ── control-client mode: join a coordinator's mesh; receive layers + a per-node key ──

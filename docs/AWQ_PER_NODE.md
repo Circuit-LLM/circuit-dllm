@@ -96,3 +96,27 @@ layers on the incoming activation, mapping the global slot to local `0..n-1`. Ga
 A fat-node **bnb** mesh (fewest-fattest already done) stays decentralized and correct, just
 ~2.1× slower per node. Acceptable interim; AWQ-per-node is the upgrade, not a prerequisite for a
 working mesh.
+
+## Productization — the contributor on-ramp (BUILT, GPU/HF validation pending)
+Two pieces turn the validated static path into something a contributor can actually run in the
+**dynamic** mesh:
+
+**#1 Per-stage artifact distribution** (`scripts/publish-awq-shards.py`): a one-time job slices the
+full AWQ into the canonical pipeline layout — coordinator keep-head slice + per-stage slices — and
+publishes them to ONE private Circuit-LLM HF repo (one subfolder per slot) plus a `manifest.json`.
+So a node pulls only its **~16GB slice**, not the full 40GB. Get the bandwidth-proportional layout
+for a target fleet from `python3 -m engine.topology layout <N> <gpu0> <gpu1> …`, pass it as
+`--layout 0:59,59:80`. Pure `parse_layout`/`build_manifest` unit-tested (`test_shard_fetch`).
+
+**#2 Dynamic-mesh wiring** (`engine/shard_fetch.py` + `run_control_client`): a node joins via
+`--control-url`, the coordinator assigns it `[start,end)`, and `resolve_submodel(model, start, end,
+repo=…)` obtains the AWQ sub-model for *exactly that range* — **local cache → download the published
+artifact (#1) → slice locally from a staged full checkpoint** — then serves it with Marlin. Enabled
+by `CIRCUIT_AWQ_SHARDS=<repo>` (or `=local` to always slice). Unset → the original bnb/shard path.
+This is what makes a contributor's node run AWQ (2.1× bnb) instead of bnb in the live mesh.
+
+**Validation pending (next GPU/HF session):** publish a real shard repo + a dynamic node that pulls
+its slice and serves; confirm the assigned range aligns with a published slot (catalog-aligned slot
+boundaries) or falls back to local slicing cleanly. **Scaling = REPLICATION** (multiple pipelines)
+— each L40+L4-class pipeline caps ~16 tok/s aggregate, so capacity grows by adding pipelines, not
+by tuning one (measured 2026-06-23).
