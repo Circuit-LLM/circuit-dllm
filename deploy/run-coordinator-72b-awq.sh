@@ -6,6 +6,9 @@
 #
 # Env:
 #   CIRCUIT_COORD_LAYERS  coordinator's head slice, e.g. 0:16   (default 0:16)
+#     For a HETEROGENEOUS fleet, size slices ∝ GPU bandwidth so the slow card isn't the straggler:
+#       python3 -m engine.topology layout <num_layers> "<coord-gpu>" "<stage-gpu>" ...
+#     prints the CIRCUIT_COORD_LAYERS + per-stage CIRCUIT_LAYERS to use (SPEED_ROADMAP §1.2b).
 #   CIRCUIT_STAGES        comma list host:port of the stage nodes   (required)
 #   CIRCUIT_KEY           64-hex wire key, must match the nodes      (required)
 #   CIRCUIT_MODEL         AWQ repo (default Qwen/Qwen2.5-72B-Instruct-AWQ)

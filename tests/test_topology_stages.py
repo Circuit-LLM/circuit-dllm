@@ -97,8 +97,67 @@ def main():
     assert t2.slots[0].start == 16 and t2.slots[-1].end == 80, "slots cover the whole split"
     assert all((s.end - s.start) <= 20 for s in t2.slots), "all slots fit a 20-cap node"
 
+    # ══ bandwidth-proportional split (SPEED_ROADMAP §1.2 refinement) ══════════
+    from engine.topology import (plan_weighted_split, plan_pipeline_layout, gpu_bandwidth,
+                                  _DEFAULT_BW)
+
+    # gpu_bandwidth: known names, longest-match wins, unknown → default
+    assert gpu_bandwidth("NVIDIA L40S") == 864.0
+    assert gpu_bandwidth("NVIDIA L4") == 300.0, "L4 != L40S (substring care)"
+    assert gpu_bandwidth("NVIDIA A100 80GB PCIe") == 2039.0, "longest match a100 80 beats a100"
+    assert gpu_bandwidth("NVIDIA A100-SXM4-40GB") == 1555.0
+    assert gpu_bandwidth("Some Unknown GPU") == _DEFAULT_BW
+
+    # plan_weighted_split: equal weights → equal (≡ balanced split); sums exactly
+    assert plan_weighted_split(80, [1, 1]) == [40, 40]
+    assert sum(plan_weighted_split(64, [1, 1, 1])) == 64
+    assert plan_weighted_split(10, [1, 1, 1]) == [4, 3, 3], "largest-remainder, sums to 10"
+    # the measured L40S+L4 case: 80 layers, bw 864 vs 300 → ~59/21 (not 40/40)
+    assert plan_weighted_split(80, [864, 300]) == [59, 21], "fast card gets proportionally more"
+    # heavier disparity, and min_size keeps every stage non-empty
+    sp = plan_weighted_split(80, [3350, 300])     # H100 + L4
+    assert sum(sp) == 80 and min(sp) >= 1 and sp[0] > sp[1]
+    assert plan_weighted_split(4, [100, 1, 1, 1]) == [1, 1, 1, 1] or \
+           min(plan_weighted_split(4, [100, 1, 1, 1])) >= 1, "min_size honored"
+    for bad in (lambda: plan_weighted_split(1, [1, 1]),      # total < n*min
+                lambda: plan_weighted_split(10, [1, 0])):    # non-positive weight
+        try:
+            bad(); raise AssertionError("should raise")
+        except ValueError:
+            pass
+
+    # plan_pipeline_layout: contiguous ranges covering [0,num_layers), stage 0 = coordinator
+    lay = plan_pipeline_layout(80, [gpu_bandwidth("NVIDIA L40S"), gpu_bandwidth("NVIDIA L4")])
+    assert lay == [(0, 59), (59, 80)], f"L40S coord + L4 stage → {lay}"
+    assert lay[0][0] == 0 and lay[-1][1] == 80 and all(a < b for a, b in lay), "contiguous cover"
+
+    # Topology(slot_sizes=): proportional stage slots (e.g. coordinator holds 0:16 head, then a
+    # weighted split of the remaining 64 across an L40S + L4 stage → 48/16, not 32/32)
+    rem_split = plan_weighted_split(64, [864, 300])    # [48, 16]
+    assert rem_split == [48, 16], rem_split
+    tw = Topology(80, 16, 2, FP, slot_sizes=rem_split)
+    assert [(s.start, s.end) for s in tw.slots] == [(16, 64), (64, 80)], "proportional stage slots"
+    # validation: wrong count / sum / zero rejected
+    for bad in (lambda: Topology(80, 16, 2, FP, slot_sizes=[64]),       # wrong count
+                lambda: Topology(80, 16, 2, FP, slot_sizes=[40, 40]),   # sum != 64
+                lambda: Topology(80, 16, 2, FP, slot_sizes=[64, 0])):   # zero slot
+        try:
+            bad(); raise AssertionError("should reject bad slot_sizes")
+        except ValueError:
+            pass
+    # default (no slot_sizes) unchanged: equal balanced split
+    assert [(s.start, s.end) for s in Topology(80, 16, 2, FP).slots] == [(16, 48), (48, 80)]
+
+    # for_fleet with weights → proportional; equal weights ≡ equal split
+    tf = Topology.for_fleet(80, 16, FP, capacities=[40, 40, 40], replication=1, weights=[864, 300])
+    assert [(s.start, s.end) for s in tf.slots] == [(16, 64), (64, 80)], "for_fleet weighted"
+    tfe = Topology.for_fleet(80, 16, FP, capacities=[40, 40, 40], replication=1, weights=[1, 1])
+    assert [(s.start, s.end) for s in tfe.slots] == [(16, 48), (48, 80)], "equal weights = equal"
+
     print("TOPOLOGY STAGES TESTS PASSED — fewest-fattest planning (72B fat-node = 2 stages), "
-          "remainder/replication/infeasibility, heterogeneous fleets, for_fleet wiring")
+          "remainder/replication/infeasibility, heterogeneous fleets, for_fleet wiring, "
+          "bandwidth-proportional split (gpu_bandwidth, plan_weighted_split, pipeline_layout, "
+          "slot_sizes, weighted for_fleet)")
 
 
 if __name__ == "__main__":

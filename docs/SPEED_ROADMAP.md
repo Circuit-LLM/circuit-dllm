@@ -82,6 +82,24 @@ the fewest stages that cover the model, then assigns by proximity (`TOPOLOGY_AWA
 **Tradeoff:** raises the bar to contribute (favors beefier GPUs); fewer stages = less
 parallelism headroom for very long models. Pure win when capable nodes exist.
 **Depends on:** topology-aware assignment (P1/P2).
+**Status:** BUILT — `topology.plan_stages` + `Topology.for_fleet` + `CIRCUIT_MESH_NODE_CAP`.
+
+### 1.2b Bandwidth-proportional layer split  ⭐ (BUILT — refines 1.2; closes the straggler gap)
+**What:** fewest-fattest picks how MANY stages; this picks how BIG each one is. Decode is
+memory-bandwidth-bound, so a stage's per-token time ≈ `(its layers × bytes/layer) / its GPU
+bandwidth`. In a serial pipeline the **slowest stage sets the round**, so an EQUAL split makes a
+low-bandwidth card the straggler. Size each stage's slice **∝ its bandwidth** → all stages finish
+a token at ~the same time → shorter round, NO extra hop.
+**Measured motivation:** the 72B mesh (L40S 864 GB/s coord + L4 300 GB/s stage) ran an even
+split; the L4 held 32/80 layers and was ~50ms of the ~77ms round. Proportional → L40S 59 / L4 21
+(`python3 -m engine.topology layout 80 "NVIDIA L40S" "NVIDIA L4"`), equalizing stage times →
+projected ~13.7 → ~16 single-stream (toward the 16.67 solo).
+**How:** `topology.plan_weighted_split(total, weights)` (largest-remainder, min_size, sums exact)
++ `plan_pipeline_layout` + a `_GPU_BW` table / `gpu_bandwidth(name)`; `Topology(slot_sizes=…)` and
+`for_fleet(weights=…)` apply it; a `layout` CLI prints ready-to-paste deploy env. Equal weights /
+homogeneous fleet ≡ the balanced equal split (unchanged). Unit-tested (`test_topology_stages`).
+**Tradeoff:** needs a per-node bandwidth signal (GPU-type table today; could measure/​self-report).
+A fat trailing slot can exceed a small node's VRAM — pair with capacity checks.
 
 ### 1.3 Regional pipeline replication (emergent)
 **What:** when node density allows, a full pipeline replicates per region; users hit the

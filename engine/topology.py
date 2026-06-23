@@ -98,6 +98,88 @@ def plan_stages(layer_budget: int, capacities, replication: int = 1) -> int:
         f"{replication}: fattest node holds {caps[0] if caps else 0}, need more/bigger nodes")
 
 
+# ── bandwidth-proportional layer split (SPEED_ROADMAP §1.2 refinement) ────────
+# Decode is memory-bandwidth-bound: a stage's per-token time ≈ (its layers × bytes/layer) /
+# its GPU memory bandwidth. In a serial pipeline the SLOWEST stage sets the round, so an EQUAL
+# split makes a low-bandwidth card the straggler (measured: an L4 stage holding 32/80 layers was
+# ~50ms of a ~77ms round). Sizing each stage's slice ∝ its bandwidth equalizes stage times →
+# shorter round → faster single-stream, with NO extra hop. Fewest-fattest picks how MANY stages;
+# this picks how BIG each one is. Homogeneous fleets get equal sizes (no change).
+#
+# Best-effort GB/s by GPU type (HBM/GDDR memory bandwidth, the decode-relevant number). Only the
+# RATIOS matter for the split; absolute values are approximate/tunable. Unknown → _DEFAULT_BW.
+_DEFAULT_BW = 400.0
+_GPU_BW = {
+    "h100": 3350.0, "h200": 4800.0, "a100 80": 2039.0, "a100": 1555.0,
+    "l40s": 864.0, "l40": 864.0, "a40": 696.0, "rtx 6000 ada": 960.0,
+    "rtx a6000": 768.0, "a6000": 768.0, "rtx a5000": 768.0, "a5000": 768.0,
+    "rtx a4000": 448.0, "a4000": 448.0, "rtx 4090": 1008.0, "rtx 4080": 717.0,
+    "rtx 4000 ada": 360.0, "l4": 300.0, "v100": 900.0, "t4": 320.0,
+}
+
+
+def gpu_bandwidth(name: str) -> float:
+    """Best-effort memory bandwidth (GB/s) for a GPU name (e.g. 'NVIDIA L40S'). Substring match,
+    longest key first so 'a100 80gb' beats 'a100'. Unknown → _DEFAULT_BW. Used as a stage's
+    throughput weight when a node doesn't measure/report its own."""
+    n = (name or "").lower()
+    for key in sorted(_GPU_BW, key=len, reverse=True):
+        if key in n:
+            return _GPU_BW[key]
+    return _DEFAULT_BW
+
+
+def plan_weighted_split(total: int, weights, min_size: int = 1):
+    """Split `total` contiguous layers into len(weights) integer slices ∝ `weights` (each stage's
+    throughput / bandwidth), summing EXACTLY to total, each ≥ min_size. Largest-remainder rounding;
+    then enforce min_size by moving a layer from the largest slice to any below min. Pure.
+
+    Equal weights → equal split (≡ the balanced constructor). Heterogeneous weights → the faster
+    stage gets proportionally more layers so all stages finish a token at ~the same time."""
+    w = [float(x) for x in weights]
+    n = len(w)
+    if n < 1:
+        raise ValueError("need at least one weight")
+    if min(w) <= 0:
+        raise ValueError("weights must be > 0")
+    if total < n * min_size:
+        raise ValueError(f"total {total} < {n}×min_size {min_size}: can't give each stage min_size")
+    W = sum(w)
+    ideal = [total * x / W for x in w]
+    sizes = [int(f) for f in ideal]                       # floors
+    rem = total - sum(sizes)
+    order = sorted(range(n), key=lambda i: ideal[i] - sizes[i], reverse=True)
+    for i in range(rem):                                  # hand out the remainder by frac part
+        sizes[order[i]] += 1
+    # enforce min_size: steal from the largest slice until none is below min
+    guard = 0
+    while min(sizes) < min_size and guard < 10 * n:
+        guard += 1
+        lo = min(range(n), key=lambda i: sizes[i])
+        hi = max(range(n), key=lambda i: sizes[i])
+        if sizes[hi] - 1 < min_size:
+            break
+        sizes[lo] += 1
+        sizes[hi] -= 1
+    return sizes
+
+
+def plan_pipeline_layout(num_layers: int, weights, min_size: int = 1):
+    """Operator-facing planner: contiguous (start,end) layer ranges for a full pipeline whose
+    stage throughput weights are `weights` (stage 0 = the coordinator's co-located slice, then the
+    remote stages in order). Sizes ∝ weights (plan_weighted_split). Returns [(0,e0),(e0,e1),…,(…,num_layers)].
+
+    Use it to set the AWQ deploy ranges for a known heterogeneous fleet — e.g. an L40S coordinator
+    + an L4 stage over 80 layers → [(0,59),(59,80)] instead of an even (0,40),(40,80), so the L4
+    isn't the straggler. Pass GPU names through gpu_bandwidth() to get the weights."""
+    sizes = plan_weighted_split(num_layers, weights, min_size=min_size)
+    ranges, s = [], 0
+    for sz in sizes:
+        ranges.append((s, s + sz))
+        s += sz
+    return ranges
+
+
 @dataclass
 class Node:
     node_id: str                 # ed25519 pubkey (operator identity)
@@ -126,7 +208,8 @@ class Topology:
     def __init__(self, num_layers: int, coordinator_end: int, num_stages: int,
                  model_fp: str, replication: int = 2, dead_after_s: float = 30.0,
                  coordinator_region: Optional[str] = None,
-                 route_by_latency: bool = False):
+                 route_by_latency: bool = False,
+                 slot_sizes: Optional[List[int]] = None):
         if num_stages < 1:
             raise ValueError("num_stages must be >= 1")
         if not (0 <= coordinator_end < num_layers):
@@ -149,26 +232,46 @@ class Topology:
         # evens VRAM load across nodes AND lets the fewest-fattest planner (plan_stages) staff
         # a given stage count with smaller nodes (a fat trailing slot would otherwise force
         # more stages). Exact-divide layouts are unchanged.
+        # slot_sizes (optional): an explicit per-stage layer count for the stage portion, summing
+        # to `budget` — used for a BANDWIDTH-PROPORTIONAL split (plan_weighted_split) so a slow
+        # card isn't the straggler. None → the balanced equal split below (byte-identical default).
         budget = num_layers - coordinator_end
-        per, rem = divmod(budget, num_stages)
         self.slots: List[Slot] = []
         s = coordinator_end
-        for i in range(num_stages):
-            e = s + per + (1 if i < rem else 0)
-            self.slots.append(Slot(i, s, e))
-            s = e
+        if slot_sizes is not None:
+            if len(slot_sizes) != num_stages or sum(slot_sizes) != budget or min(slot_sizes) < 1:
+                raise ValueError(
+                    f"slot_sizes {slot_sizes} must have {num_stages} entries ≥1 summing to {budget}")
+            for i, sz in enumerate(slot_sizes):
+                self.slots.append(Slot(i, s, s + sz)); s += sz
+        else:
+            per, rem = divmod(budget, num_stages)
+            for i in range(num_stages):
+                e = s + per + (1 if i < rem else 0)
+                self.slots.append(Slot(i, s, e))
+                s = e
 
     @classmethod
     def for_fleet(cls, num_layers: int, coordinator_end: int, model_fp: str,
-                  capacities, replication: int = 2, **kw) -> "Topology":
+                  capacities, replication: int = 2, weights=None, **kw) -> "Topology":
         """Build a Topology with the FEWEST stages the fleet's `capacities` can staff
         (plan_stages — the fewest-fattest lever, SPEED_ROADMAP §1.2), instead of a static
         num_stages. The control plane calls this once it knows the joined nodes' capacities
         so a 24GB-class fleet runs as 2 fat stages (1 hop), not 4 thin ones (3 hops).
         `replication` is forwarded to BOTH plan_stages (enough nodes to staff k·rep slots)
-        and the Topology (per-slot holder target)."""
+        and the Topology (per-slot holder target).
+
+        `weights` (optional): per-stage throughput weights (one per stage, len == the chosen k)
+        → a BANDWIDTH-PROPORTIONAL slot split (plan_weighted_split) so a slow card isn't the
+        straggler. None → equal split. Equal weights ≡ equal split."""
         k = plan_stages(num_layers - coordinator_end, capacities, replication)
-        return cls(num_layers, coordinator_end, k, model_fp, replication=replication, **kw)
+        sizes = None
+        if weights is not None:
+            if len(weights) != k:
+                raise ValueError(f"weights needs {k} entries (one per chosen stage), got {len(weights)}")
+            sizes = plan_weighted_split(num_layers - coordinator_end, weights)
+        return cls(num_layers, coordinator_end, k, model_fp, replication=replication,
+                   slot_sizes=sizes, **kw)
 
     def _slot_size(self, slot: Slot) -> int:
         return slot.end - slot.start
@@ -336,3 +439,36 @@ class Topology:
         """Slots needing another holder, most-urgent first (uncovered before merely
         under-replicated). The control service assigns new joiners to these."""
         return sorted(self.under_replicated(), key=lambda s: len(self.holders(s.index)))
+
+
+def _cli_layout(argv):
+    """`python3 -m engine.topology layout <num_layers> <gpu0> <gpu1> ...` — print the
+    BANDWIDTH-PROPORTIONAL pipeline layout for a known heterogeneous fleet (stage 0 = the
+    coordinator). Each GPU name is mapped to a bandwidth weight (gpu_bandwidth) and the layers
+    are split ∝ those weights, then printed as ready-to-paste deploy env so the slow card isn't
+    the straggler. A numeric arg is taken as an explicit weight (GB/s) instead of a name."""
+    if len(argv) < 2:
+        print("usage: python3 -m engine.topology layout <num_layers> <gpu0> <gpu1> ...")
+        print('  e.g. python3 -m engine.topology layout 80 "NVIDIA L40S" "NVIDIA L4"')
+        return 2
+    num_layers = int(argv[0])
+    specs = argv[1:]
+    weights = [float(x) if x.replace(".", "", 1).isdigit() else gpu_bandwidth(x) for x in specs]
+    ranges = plan_pipeline_layout(num_layers, weights)
+    print(f"# bandwidth-proportional layout for {num_layers} layers across {len(specs)} stages")
+    for i, (g, w, (s, e)) in enumerate(zip(specs, weights, ranges)):
+        role = "coordinator" if i == 0 else f"stage {i}"
+        print(f"#  {role:<12} {g:<28} bw≈{w:>6.0f} GB/s  ->  layers [{s},{e})  ({e-s} layers)")
+    c0, c1 = ranges[0]
+    print(f"\n# coordinator:  CIRCUIT_COORD_LAYERS={c0}:{c1}")
+    for i, (s, e) in enumerate(ranges[1:], 1):
+        print(f"# stage {i}:      CIRCUIT_LAYERS={s}:{e}")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) >= 2 and sys.argv[1] == "layout":
+        sys.exit(_cli_layout(sys.argv[2:]))
+    print("commands: layout <num_layers> <gpu0> <gpu1> ...")
+    sys.exit(2)
