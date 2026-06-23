@@ -219,6 +219,23 @@ speculative decoding` seam is already noted in `api.py`.
 Win A live). Continuous batching (Win B, `CIRCUIT_BATCH`) is built + gated. Push both.
 **Tradeoff:** helps aggregate, not single-stream.
 
+### 3.4 Replication — parallel pipelines across slot replicas  (BUILT — the at-scale lever)
+**What:** the measured ceiling is ~16 tok/s per *single* pipeline (scheduler-independent), so
+aggregate scales by running pipelines IN PARALLEL, not by tuning one. When a slot has R healthy
+holders, spread concurrent sessions across them so R replicas of every slot form ~R parallel
+pipelines → ~R× aggregate. **This is how the network scales with contributors** (more GPUs = more
+replicas = more lanes), and the honest answer to "more GPUs add hops": route growth into *width*
+(replicas), not *depth* (hops).
+**How (BUILT):** `Registry.acquire_route(session)` picks, per slot, the LEAST-LOADED routable
+holder (tie-break = `holders()` RTT/freshness order, so a slot's closest replica wins on a tie),
+tracks per-holder active-session load, and pins the lane for the session's KV affinity;
+`release_route` frees it on end/reset/failover (coordinator `_reset_sessions`). Replication=1 ≡
+the old primary pick (`route_snapshot`), so it's a safe default. Unit-tested
+(`tests/test_replication.py`: disjoint parallel lanes, balanced load, replication=1 unchanged).
+**Needs:** `CIRCUIT_MAX_CONCURRENCY` ≥ the number of lanes (else the coordinator serializes them).
+**Next bottleneck:** the coordinator is shared (embed/lm_head/norm/draft/relay for all lanes) — for
+very high aggregate, replicate the coordinator/entry role too (multi-coordinator; future).
+
 ---
 
 ## Front 4 — No hop at all

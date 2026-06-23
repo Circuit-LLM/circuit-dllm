@@ -326,7 +326,9 @@ class Coordinator:
         re-prefills the session onto a replica and retries (mid-session failover)."""
         route = self._session_routes.get(session)
         if route is None or pos == 0:
-            route = self.registry.route_snapshot()   # locked; raises on a coverage gap
+            # acquire_route load-balances across each slot's replicas (replication → parallel
+            # pipelines); ==route_snapshot when replication=1. Pins for the session's KV affinity.
+            route = self.registry.acquire_route(session)   # locked; raises on a coverage gap
             self._session_routes[session] = route
         if self._chain:                              # forward node→node (1 round-trip)
             return self._relay_chain(session, pos, hidden, route)
@@ -433,6 +435,9 @@ class Coordinator:
         conn = self._active_conn()
         if self._dynamic:
             self._session_routes.pop(session, None)
+            if self.registry is not None:
+                self.registry.release_route(session)   # free this session's replica load
+
             for nid, sock in list(conn.conns.items()):
                 node = self.registry.topo.nodes.get(nid)
                 key = self._node_key(node) if node else self.key

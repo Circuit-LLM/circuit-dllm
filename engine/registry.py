@@ -46,6 +46,10 @@ class Registry:
     # one lock serializes control-plane mutations (control-server threads) against
     # the coordinator reading a route snapshot (inference thread).
     _lock: object = field(default_factory=threading.RLock, repr=False, compare=False)
+    # replication load-balancing: active-session count per holder + each session's chosen route,
+    # so concurrent sessions spread across a slot's replicas (R replicas → ~R parallel pipelines).
+    _load: Dict[str, int] = field(default_factory=dict, repr=False, compare=False)
+    _session_load: Dict[object, list] = field(default_factory=dict, repr=False, compare=False)
 
     # ── admission ─────────────────────────────────────────────────────────────
     def register(self, node: Node, now: float = 0.0, prefer_range=None) -> dict:
@@ -137,6 +141,49 @@ class Registry:
         affinity → warm KV). Raises if any slot is uncovered (the coverage invariant)."""
         with self._lock:
             return [holders[0] for _slot, holders in self.topo.route()]
+
+    # ── replication: load-balanced session routing ────────────────────────────
+    def acquire_route(self, session) -> List[Node]:
+        """Pick a route for a NEW session, balancing across each slot's replicas: per slot, the
+        LEAST-LOADED routable holder (tie-break = holders() order = RTT/freshness, so a slot's
+        closest replica wins when load is equal). Concurrent sessions therefore spread across the
+        replicas → R replicas of every slot yield ~R parallel pipelines, and aggregate throughput
+        scales with contributors instead of funnelling to one primary. Records the session's load
+        (release_route frees it). Re-acquiring for the same session (re-prefill/failover) releases
+        its prior route first. Raises on a coverage gap.
+
+        Replication=1 (one holder/slot) → identical to route_snapshot (min of one = that holder),
+        so this is a safe default; it only changes behavior once slots have replicas."""
+        with self._lock:
+            self._release_locked(session)
+            route = []
+            for _slot, holders in self.topo.route():        # raises on an uncovered slot
+                i = min(range(len(holders)),
+                        key=lambda j: (self._load.get(holders[j].node_id, 0), j))
+                route.append(holders[i])
+            for n in route:
+                self._load[n.node_id] = self._load.get(n.node_id, 0) + 1
+            self._session_load[session] = [n.node_id for n in route]
+            return route
+
+    def release_route(self, session) -> None:
+        """Free a session's load (call when its pin is dropped — end, reset, or failover).
+        Idempotent: a session we don't track is a no-op."""
+        with self._lock:
+            self._release_locked(session)
+
+    def _release_locked(self, session) -> None:
+        for nid in self._session_load.pop(session, []):
+            c = self._load.get(nid, 0) - 1
+            if c > 0:
+                self._load[nid] = c
+            else:
+                self._load.pop(nid, None)
+
+    def load_snapshot(self) -> Dict[str, int]:
+        """Active-session count per holder (observability / /health)."""
+        with self._lock:
+            return dict(self._load)
 
     # ── attribution + payout ──────────────────────────────────────────────────
     def record_work(self, route: List[Tuple[str, int, int]], paid_raw: int) -> None:
