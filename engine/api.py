@@ -53,6 +53,9 @@ def _build_coordinator(registry=None) -> Coordinator:
         # CIRCUIT_MAX_CONCURRENCY > 1 enables pipeline overlap (each request gets its
         # own stage sockets); 1 (default) = single-stream, byte-identical to before.
         max_concurrency=int(os.environ.get("CIRCUIT_MAX_CONCURRENCY", "1")),
+        # CIRCUIT_CHAIN=1 forwards activations node→node (chain relay) instead of the
+        # star; mesh-mode only, default off = the star path, byte-identical.
+        chain_relay=os.environ.get("CIRCUIT_CHAIN") == "1",
     )
 
 

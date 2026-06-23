@@ -122,12 +122,35 @@ mesh (vetted operators). For the open network, issue **per-session ephemeral for
 (coordinator generates a session chain key, hands each adjacent pair their shared leg key) so
 no node holds another's long-lived key. v2 security item; until then run chain mode permissioned.
 
+## v1 limitation — KV free in chain mode (known, gated off, fix tracked)
+
+The worker keeps its session KV in a **per-connection** `sessions` dict (each `_serve_conn`
+has its own). In the **star** that's fine: the coordinator holds one pooled connection per
+node, and the activations *and* the `KV_CTRL` reset/free both travel on it → same
+`_serve_conn`, KV freed correctly. In the **chain**, a downstream node's KV lives on the
+connection from its **predecessor**, but `_reset_sessions` only reaches the **head** (the
+only node in the coordinator's `conn.conns`). So non-head KV is **not** freed by the normal
+path → it accumulates across sessions on the (pooled, long-lived) forward connections.
+
+- **Not a correctness bug** and **not a live risk** (chain mode is gated off by default); a
+  single generation is exact, and teardown frees everything.
+- **Fix (v1.5, tracked):** **chain the `KV_CTRL`** — a `CHAIN_KV_CTRL` frame that propagates
+  the reset/free along the same route the activation took, so it lands on each node's
+  forward `_serve_conn`. (Alternatives: global session table keyed by session id across
+  connections, or TTL eviction on the worker. Chaining the control frame is cleanest — it
+  reuses this exact mechanism.) **Required before chain mode serves production traffic.**
+
 ## Build order
 
 1. **`engine/chain.py` + `tests/test_chain.py`** — route encode/decode + head/next logic
    (pure, GPU-free). ✅ done.
-2. `wire.CHAIN_ACTIVATION` constant + a pooled `conn_to(host,port)` on the stage worker.
-3. `stage_worker._handle` CHAIN_ACTIVATION branch (forward + nested return).
-4. `coordinator._relay_dynamic` chain mode behind `CIRCUIT_CHAIN=1` + `chain_head_and_route`.
-5. Validate on a 72B mesh (output identical to star; measure tok/s vs the 1.5 baseline).
-6. v2: direct return + per-session forwarding keys + NAT/relay chaining.
+2. `wire.CHAIN_ACTIVATION` constant + pooled `_fwd_conn` on the stage worker. ✅ done.
+3. `stage_worker._handle` CHAIN_ACTIVATION branch (compute → forward → bubble RESULT/ERROR). ✅ done.
+4. `coordinator._relay_chain` behind `CIRCUIT_CHAIN=1` + `chain_head_and_route` +
+   `_suspect_by_endpoint` failover; `api.py` wiring. ✅ done.
+5. **`tests/test_chain_relay.py`** — 3-stage star==reference==chain identical-output test
+   (needs torch + small model → run on a pod). ✅ written; runs at the mesh session.
+6. **Mesh session:** run `test_chain_relay` (small model, ~2 min) → confirm identical output,
+   then load the 72B and measure tok/s vs the 1.5 baseline.
+7. v1.5: chain the `KV_CTRL` (the KV-free fix above) before production traffic.
+8. v2: direct return + per-session forwarding keys + NAT/relay chaining.

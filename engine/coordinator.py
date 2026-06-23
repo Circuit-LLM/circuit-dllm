@@ -23,7 +23,7 @@ from typing import List, Tuple
 
 import torch
 
-from engine import wire
+from engine import wire, chain
 from engine.tensors import pack_activation, unpack_activation, pack_batch_activation
 from engine.model import load_model, load_tokenizer, prune_to_layers
 from engine.stage import stage_for_range
@@ -120,7 +120,7 @@ class Coordinator:
                  local_layers: Optional[Tuple[int, int]] = None,
                  draft_model_id: Optional[str] = None,
                  shard: bool = False, other_device: str = "cpu", quant: str = "",
-                 registry=None, max_concurrency: int = 1):
+                 registry=None, max_concurrency: int = 1, chain_relay: bool = False):
         """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
         so a big model loads once on this pod (layers + head) instead of a
         coordinator and a stage worker each loading the whole model. The model
@@ -193,6 +193,10 @@ class Coordinator:
         # path below is left exactly as-is (backward-compatible, zero risk).
         self.registry = registry
         self._dynamic = registry is not None
+        # Chain relay (CIRCUIT_CHAIN): forward the activation node→node instead of
+        # returning it to the coordinator between every stage (the star). Only meaningful
+        # in dynamic/mesh mode (it needs the route's node endpoints + per-node keys).
+        self._chain = bool(chain_relay) and self._dynamic
         self._session_routes: dict = {}   # session -> pinned [node per slot] (affinity)
 
     def _active_conn(self) -> _Conn:
@@ -307,7 +311,9 @@ class Coordinator:
         if route is None or pos == 0:
             route = self.registry.route_snapshot()   # locked; raises on a coverage gap
             self._session_routes[session] = route
-        for node in route:
+        if self._chain:                              # forward node→node (1 round-trip)
+            return self._relay_chain(session, pos, hidden, route)
+        for node in route:                           # star: a round-trip per stage
             key = self._node_key(node)
             try:
                 sock = self._conn_for(node)
@@ -324,6 +330,48 @@ class Coordinator:
                 self._session_routes.pop(session, None)
                 raise
         return hidden
+
+    def _relay_chain(self, session: int, pos: int, hidden: torch.Tensor, route) -> torch.Tensor:
+        """Chain relay: send the activation to the HEAD holder carrying the rest of the
+        route; each node computes its layers then forwards to its next hop, and the final
+        result bubbles back up the chain (docs/CHAIN_RELAY.md). One coordinator round-trip
+        instead of N. Output is byte-identical to the star — same nodes, same pinned order,
+        same KV — only the data path changes. On a chain failure a node bubbles an ERROR
+        carrying the broken hop's host:port; we suspect that node, drop the pin, and raise
+        so the caller re-prefills on a fresh route (same failover contract as the star)."""
+        head, downstream = chain.chain_head_and_route(route)
+        key = self._node_key(head)
+        try:
+            sock = self._conn_for(head)
+            wire.write_frame(sock, key, wire.CHAIN_ACTIVATION,
+                             chain.encode_route(downstream)
+                             + pack_activation(session, pos, hidden.detach().cpu()))
+            mt, payload = wire.read_frame_keyed(sock, key)
+        except (wire.WireError, OSError):
+            self._drop_conn(head.node_id)
+            self.registry.mark_suspect(head.node_id)
+            self._session_routes.pop(session, None)
+            raise
+        if mt == wire.RESULT:
+            _, _, _, hidden = unpack_activation(payload)
+            return hidden.to(self.device)
+        if mt == wire.ERROR:                         # a hop downstream of the head broke
+            self._drop_conn(head.node_id)            # head's pooled conn may be stale now
+            self._suspect_by_endpoint(payload.decode("utf-8", "replace"), route, head)
+            self._session_routes.pop(session, None)
+            raise wire.WireError(f"chain hop failed: {payload[:64]!r}")
+        raise wire.WireError(f"chain expected RESULT/ERROR, got {wire.msg_name(mt)}")
+
+    def _suspect_by_endpoint(self, endpoint: str, route, head) -> None:
+        """Mark the route node whose `host:port` matches the failed hop SUSPECT (so the
+        next route_snapshot routes around it); fall back to the head if none matches."""
+        target = head
+        for node in route:
+            h, p = node.endpoint[0], int(node.endpoint[1])
+            if f"{h}:{p}" == endpoint:
+                target = node
+                break
+        self.registry.mark_suspect(target.node_id)
 
     def _reprefill(self, session: int, token_ids):
         """Rebuild a session's KV after a mid-session holder death: reset every stage's

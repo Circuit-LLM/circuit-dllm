@@ -17,13 +17,14 @@ a bad key raises WireError and the connection is dropped.
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import struct
 import threading
 
 import torch
 
-from engine import wire
+from engine import wire, chain
 from engine.tensors import pack_activation, unpack_activation, unpack_batch_activation
 from engine.stage import stage_for_range
 from engine.kv import StageKV
@@ -54,12 +55,32 @@ def _set_keepalive(conn):
         pass
 
 
+# Read timeout on an outbound chain-forward socket: it waits for the WHOLE downstream
+# chain to compute + return, so it must be generous (slow remote GPUs). Tunable.
+_FWD_READ_TIMEOUT = float(os.environ.get("CIRCUIT_FWD_READ_TIMEOUT", "180"))
+
+
+def _fwd_conn(pool, host, port):
+    """A pooled outbound TCP connection to the next chain hop, reused across tokens — a
+    fresh handshake per token would re-add a network round-trip and defeat the chain. On
+    a wire/socket error the caller drops it from the pool so the next token reconnects."""
+    s = pool.get((host, port))
+    if s is None:
+        s = socket.create_connection((host, port), timeout=10)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.settimeout(_FWD_READ_TIMEOUT)
+        _set_keepalive(s)
+        pool[(host, port)] = s
+    return s
+
+
 def _serve_conn(conn, addr, key, stage, config, device, compute_lock, log):
     """Serve one peer connection (its own session/KV space) until it closes."""
     log("INFO", "peer connected", addr=f"{addr[0]}:{addr[1]}")
     sessions: dict[int, StageKV] = {}
+    fwd_conns: dict = {}             # (host,port) -> outbound socket for chain forwarding
     try:
-        _handle(conn, key, stage, config, device, sessions, log, compute_lock)
+        _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_conns)
     except (wire.WireError, OSError) as e:
         log("WARN", "connection dropped", reason=str(e))
     finally:
@@ -67,6 +88,11 @@ def _serve_conn(conn, addr, key, stage, config, device, compute_lock, log):
             conn.close()
         except OSError:
             pass
+        for s in fwd_conns.values():      # close the chain-forward sockets this conn opened
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 def serve(port: int, start: int, end: int, model_id: str, key: bytes,
@@ -122,7 +148,9 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
 
 
 @torch.no_grad()
-def _handle(conn, key, stage, config, device, sessions, log, compute_lock):
+def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_conns=None):
+    if fwd_conns is None:
+        fwd_conns = {}
     while True:
         try:
             mt, payload = wire.read_frame_keyed(conn, key)
@@ -158,6 +186,44 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock):
                 out = stage.forward(hidden, position_ids, past_key_values=cache,
                                     use_cache=True, attention_mask=attn)
             wire.write_frame(conn, key, wire.RESULT, pack_activation(batch_id, pos, out.cpu()))
+
+        elif mt == wire.CHAIN_ACTIVATION:
+            # Chain relay: compute my layers, then FORWARD the activation to the next hop
+            # (carrying the shortened route) and bubble its reply back upstream — instead
+            # of returning to the coordinator. The coordinator only touches entry + exit.
+            # KV is maintained exactly as in the ACTIVATION path (pos==0 resets), so output
+            # is byte-identical to the star. See docs/CHAIN_RELAY.md.
+            route, rest = chain.decode_route(payload)
+            session, pos, _flags, hidden = unpack_activation(rest)
+            hidden = hidden.to(device)
+            cache = sessions.get(session)
+            if cache is None or pos == 0:
+                cache = StageKV(config)
+                sessions[session] = cache
+            position_ids = _position_ids(hidden.shape[1], pos, device)
+            with compute_lock:
+                out = stage.forward(hidden, position_ids, past_key_values=cache, use_cache=True)
+            nxt, remaining = chain.pop_next(route)
+            if nxt is None:                                  # tail: return result upstream
+                wire.write_frame(conn, key, wire.RESULT, pack_activation(session, pos, out.cpu()))
+            else:                                            # forward + bubble reply back
+                nhost, nport, nkey = nxt
+                try:
+                    fsock = _fwd_conn(fwd_conns, nhost, nport)
+                    wire.write_frame(fsock, nkey, wire.CHAIN_ACTIVATION,
+                                     chain.encode_route(remaining)
+                                     + pack_activation(session, pos, out.cpu()))
+                    mt2, payload2 = wire.read_frame_keyed(fsock, nkey)
+                    wire.write_frame(conn, key, mt2, payload2)   # RESULT (or ERROR) up, unchanged
+                except (wire.WireError, OSError):
+                    s = fwd_conns.pop((nhost, nport), None)
+                    if s is not None:
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+                    # tell the coordinator WHICH hop broke so it suspects the right node
+                    wire.write_frame(conn, key, wire.ERROR, f"{nhost}:{nport}".encode())
 
         elif mt == wire.KV_CTRL:
             session, op, arg = struct.unpack(">IBI", payload[:9])
