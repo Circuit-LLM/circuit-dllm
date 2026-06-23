@@ -290,10 +290,10 @@ class Handler(BaseHTTPRequestHandler):
                     # speculative decode when a draft is loaded (CIRCUIT_DRAFT),
                     # else plain greedy — same output either way, draft only speeds
                     # it up by verifying K tokens per pipeline round-trip. K is tunable
-                    # via CIRCUIT_SPEC_K: a higher K amortizes an expensive (e.g. cross-DC)
-                    # round-trip over more tokens, at the cost of more wasted draft compute
-                    # when acceptance is low.
-                    _spec_k = int(os.environ.get("CIRCUIT_SPEC_K", "4"))
+                    # via per-request "spec_k" (for sweeps with no restart) else CIRCUIT_SPEC_K:
+                    # a higher K amortizes an expensive (e.g. cross-DC) round-trip over more
+                    # tokens, at the cost of more wasted draft compute when acceptance is low.
+                    _spec_k = int(body.get("spec_k") or os.environ.get("CIRCUIT_SPEC_K", "4"))
                     gen = (_coord.generate_speculative_stream(prompt, max_tokens, K=_spec_k)
                            if _coord.has_draft()
                            else _coord.generate_stream(prompt, max_tokens))

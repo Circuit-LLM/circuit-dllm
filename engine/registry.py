@@ -48,11 +48,12 @@ class Registry:
     _lock: object = field(default_factory=threading.RLock, repr=False, compare=False)
 
     # ── admission ─────────────────────────────────────────────────────────────
-    def register(self, node: Node, now: float = 0.0) -> dict:
+    def register(self, node: Node, now: float = 0.0, prefer_range=None) -> dict:
         with self._lock:
             if self.allowlist is not None and node.node_id not in self.allowlist:
                 raise PermissionError(f"node {node.node_id} not on allowlist")
-            slot = self.topo.register(node, now)   # raises on model mismatch / capacity
+            # prefer_range: a re-registering node asks for its already-loaded slot back.
+            slot = self.topo.register(node, now, prefer_range=prefer_range)   # raises on mismatch / capacity
             key = derive_node_key(self.master_secret, node.node_id)
             node.wire_key = key                    # coordinator uses this to talk to the node
             self.wallets[node.node_id] = node.payout_wallet
@@ -64,9 +65,10 @@ class Registry:
                 "replication": self.topo.replication,
             }
 
-    def heartbeat(self, node_id: str, now: float) -> None:
+    def heartbeat(self, node_id: str, now: float) -> bool:
+        """Returns False if the node is unknown (coordinator restarted) → it re-registers."""
         with self._lock:
-            self.topo.heartbeat(node_id, now)
+            return self.topo.heartbeat(node_id, now)
 
     def drain(self, node_id: str) -> None:
         with self._lock:

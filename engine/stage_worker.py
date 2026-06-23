@@ -330,43 +330,67 @@ def run_control_client(a):
             msg = _json.dumps(reg, sort_keys=True, separators=(",", ":")).encode()
             reg["sig"] = a._signing_key.sign(msg).hex()
 
-    # Register, retrying while the coordinator is still coming up — its control plane
-    # may not be listening yet when this node finishes its own (slow) model download,
-    # and a node should be able to JOIN a mesh whose coordinator starts later. A
-    # connection error / 5xx is transient (keep trying); a 4xx is a real rejection
-    # (bad signature, model_fp mismatch, no capacity) — fail fast, no point retrying.
-    deadline = _time.time() + float(getattr(a, "register_timeout", 2400))
-    attempt = 0
-    while True:
-        attempt += 1
-        _sign_register()
-        try:
-            code, resp = _control_post(base + "/register", reg)
-            break
-        except _ue.HTTPError as e:
-            if 400 <= e.code < 500:
-                body = ""
-                try: body = e.read().decode()[:200]
-                except Exception: pass
-                raise SystemExit(f"register rejected ({e.code}): {body}")
-            last = f"http {e.code}"          # 5xx — transient
-        except Exception as e:
-            last = str(e)                    # connection refused etc — coordinator not up yet
-        if _time.time() >= deadline:
-            raise SystemExit(f"register failed after {attempt} attempts ({int(_time.time()-(deadline-2400))}s): {last}")
-        clog("INFO", "coordinator not ready, retrying register", attempt=attempt, last=last)
-        _time.sleep(10)
-    start, end = resp["assignment"]["start"], resp["assignment"]["end"]
-    key = wire.normalize_key(bytes.fromhex(resp["session_key"]))
-    clog("INFO", "joined mesh", node=a.node_id[:12], layers=f"{start}:{end}",
-         coordinator=resp.get("coordinator"))
+    def _do_register(prefer_range=None, timeout=2400.0):
+        """POST /register (signed), retrying while the coordinator is still coming up — its
+        control plane may not be listening yet when this node finishes its own (slow) model
+        download, and a node should be able to JOIN a mesh whose coordinator starts later. A
+        connection error / 5xx is transient (keep trying); a 4xx is a real rejection (bad
+        signature, model_fp mismatch, no capacity) — fail fast. `prefer_range=(start,end)`
+        asks for an already-loaded slot back (used on re-register). Returns (start, end, key)."""
+        if prefer_range is not None:
+            reg["loaded_layers"] = list(prefer_range)
+        else:
+            reg.pop("loaded_layers", None)
+        deadline = _time.time() + float(timeout)
+        attempt = 0
+        while True:
+            attempt += 1
+            _sign_register()
+            try:
+                _code, resp = _control_post(base + "/register", reg)
+                break
+            except _ue.HTTPError as e:
+                if 400 <= e.code < 500:
+                    body = ""
+                    try: body = e.read().decode()[:200]
+                    except Exception: pass
+                    raise SystemExit(f"register rejected ({e.code}): {body}")
+                last = f"http {e.code}"          # 5xx — transient
+            except Exception as e:
+                last = str(e)                    # connection refused etc — coordinator not up yet
+            if _time.time() >= deadline:
+                raise SystemExit(f"register failed after {attempt} attempts: {last}")
+            clog("INFO", "coordinator not ready, retrying register", attempt=attempt, last=last)
+            _time.sleep(10)
+        return (resp["assignment"]["start"], resp["assignment"]["end"],
+                wire.normalize_key(bytes.fromhex(resp["session_key"])))
+
+    start, end, key = _do_register(timeout=float(getattr(a, "register_timeout", 2400)))
+    clog("INFO", "joined mesh", node=a.node_id[:12], layers=f"{start}:{end}")
 
     stop = threading.Event()
 
     def _heartbeat():
         while not stop.is_set():
             try:
-                _control_post(base + "/heartbeat", {"node_id": a.node_id}, timeout=5)
+                _c, _resp = _control_post(base + "/heartbeat", {"node_id": a.node_id}, timeout=5)
+                # If the coordinator no longer knows us (it restarted with an empty topology),
+                # RE-REGISTER for our already-loaded slot + re-announce READY — serve() keeps
+                # running and (same master secret → same derived key) its key stays valid. This
+                # is what makes a coordinator restart NOT orphan the nodes.
+                if isinstance(_resp, dict) and _resp.get("registered") is False:
+                    clog("WARN", "coordinator forgot us — re-registering", layers=f"{start}:{end}")
+                    try:
+                        s2, e2, _k2 = _do_register(prefer_range=(start, end), timeout=120)
+                        if (s2, e2) != (start, end):
+                            clog("ERROR", "re-register got a different slot — serving stale layers",
+                                 had=f"{start}:{end}", got=f"{s2}:{e2}")
+                        _control_post(base + "/ready", {"node_id": a.node_id}, timeout=5)
+                        clog("INFO", "re-registered + ready")
+                    except SystemExit as e:       # 4xx rejection — don't kill the heartbeat thread
+                        clog("ERROR", "re-register rejected", error=str(e))
+                    except Exception as e:
+                        clog("WARN", "re-register failed", error=str(e))
             except Exception:
                 pass
             stop.wait(a.hb_interval)

@@ -91,7 +91,9 @@ def _handler(registry, now_fn, verify_sig):
                         region=(str(body["region"]) if body.get("region") else None),
                         payout_wallet=str(body.get("payout_wallet", "")),
                     )
-                    resp = registry.register(node, now_fn())
+                    # loaded_layers (optional): a re-registering node asks for its already-
+                    # loaded slot back so it doesn't get a different range and serve stale layers.
+                    resp = registry.register(node, now_fn(), prefer_range=body.get("loaded_layers"))
                     log("INFO", "node registered", node=node.node_id[:12],
                         layers=f'{resp["assignment"]["start"]}:{resp["assignment"]["end"]}')
                     return self._send(200, resp)
@@ -99,8 +101,10 @@ def _handler(registry, now_fn, verify_sig):
                     registry.mark_ready(str(body["node_id"]))
                     return self._send(200, {"ok": True})
                 if self.path == "/heartbeat":
-                    registry.heartbeat(str(body["node_id"]), now_fn())
-                    return self._send(200, {"ok": True})
+                    # 'registered' lets a node detect a coordinator restart (it's no longer in
+                    # the topology) and re-register without being manually restarted.
+                    known = registry.heartbeat(str(body["node_id"]), now_fn())
+                    return self._send(200, {"ok": True, "registered": bool(known)})
                 if self.path == "/drain":
                     registry.drain(str(body["node_id"]))
                     return self._send(200, {"ok": True})

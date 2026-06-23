@@ -120,9 +120,14 @@ class Topology:
                    if h in self.nodes and self.nodes[h].state != DEAD)
 
     # ── registration / assignment ────────────────────────────────────────────
-    def register(self, node: Node, now: float = 0.0) -> Slot:
-        """Admit a node and assign it the slot that needs replicas most and that it
-        has the capacity to hold. Raises on model mismatch / insufficient capacity."""
+    def register(self, node: Node, now: float = 0.0,
+                 prefer_range: Optional[Tuple[int, int]] = None) -> Slot:
+        """Admit a node and assign it a slot. Normally the slot that needs replicas most and
+        that it can hold (_pick_slot). `prefer_range=(start,end)` asks for the slot covering
+        exactly those layers — used when a node RE-registers after a coordinator restart so it
+        gets back the slot whose weights it ALREADY loaded (else it could be handed a different
+        range and serve stale layers). Falls back to _pick_slot if that slot doesn't exist or
+        the node can't hold it. Raises on model mismatch / insufficient capacity."""
         if node.model_fp != self.model_fp:
             raise ValueError(f"model mismatch: node {node.model_fp!r} != mesh {self.model_fp!r}")
         # A node re-registering (e.g. its worker restarted — same persisted node_id) must
@@ -131,7 +136,13 @@ class Topology:
         for s in self.slots:
             if node.node_id in s.holders:
                 s.holders.remove(node.node_id)
-        slot = self._pick_slot(node)
+        slot = None
+        if prefer_range is not None:
+            pr = tuple(prefer_range)
+            slot = next((s for s in self.slots if (s.start, s.end) == pr
+                         and node.capacity_layers >= self._slot_size(s)), None)
+        if slot is None:
+            slot = self._pick_slot(node)
         if slot is None:
             raise ValueError("no slot this node can hold (capacity_layers too small)")
         node.slot = slot.index
@@ -151,12 +162,18 @@ class Topology:
         return cands[0]
 
     # ── health ───────────────────────────────────────────────────────────────
-    def heartbeat(self, node_id: str, now: float) -> None:
+    def heartbeat(self, node_id: str, now: float) -> bool:
+        """Refresh a node's liveness. Returns False if the node is UNKNOWN to this topology
+        (e.g. the coordinator restarted with an empty registry) — a heartbeating node uses
+        that 'False' as the signal to RE-REGISTER (so a coordinator restart doesn't orphan
+        already-loaded nodes)."""
         n = self.nodes.get(node_id)
         if n and n.state in (JOINING, READY, SUSPECT, DRAINING):
             n.last_hb = now
             if n.state == SUSPECT:          # a heartbeat clears a transient suspicion
                 n.state = READY
+            return True
+        return False
 
     def mark_ready(self, node_id: str) -> None:
         """Node finished downloading its layers and is serving."""
