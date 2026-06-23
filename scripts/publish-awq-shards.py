@@ -28,7 +28,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 # layout/manifest live in engine.shard_fetch so the publisher and the coordinator share ONE
 # definition of the slot boundaries (catalog alignment — see topology_from_catalog).
-from engine.shard_fetch import slot_dirname, parse_layout, build_manifest  # noqa: E402
+from engine.shard_fetch import slot_dirname, parse_layout, build_manifest, sha256_file  # noqa: E402
 
 
 def main(argv):
@@ -44,20 +44,35 @@ def main(argv):
 
     from huggingface_hub import snapshot_download
     full_dir = full if os.path.isdir(full) else snapshot_download(full)
+    # Pin the SOURCE checkpoint commit so slices can't silently mismatch a re-uploaded model.
+    revision = None
+    if not os.path.isdir(full):
+        try:
+            from huggingface_hub import HfApi
+            revision = HfApi().model_info(full).sha
+        except Exception as e:
+            print(f"[publish] could not resolve revision ({e}) — leaving null")
 
+    slot_meta = {}
     for (s, e, kh) in ranges:
-        dest = os.path.join(out_dir, slot_dirname(s, e, kh))
-        if os.path.isfile(os.path.join(dest, "model.safetensors")):
-            print(f"[publish] {dest} exists, skip"); continue
-        cmd = [sys.executable, os.path.join(REPO_ROOT, "scripts", "slice-awq.py"),
-               full_dir, dest, str(s), str(e)] + (["--keep-head"] if kh else [])
-        print(f"[publish] slicing {s}:{e} keep_head={kh} -> {dest}")
-        subprocess.run(cmd, check=True)
+        d = slot_dirname(s, e, kh)
+        dest = os.path.join(out_dir, d)
+        w = os.path.join(dest, "model.safetensors")
+        if not os.path.isfile(w):
+            cmd = [sys.executable, os.path.join(REPO_ROOT, "scripts", "slice-awq.py"),
+                   full_dir, dest, str(s), str(e)] + (["--keep-head"] if kh else [])
+            print(f"[publish] slicing {s}:{e} keep_head={kh} -> {dest}")
+            subprocess.run(cmd, check=True)
+        else:
+            print(f"[publish] {dest} exists, skip slice")
+        print(f"[publish] hashing {d} …")
+        slot_meta[d] = {"sha256": sha256_file(w), "bytes": os.path.getsize(w)}
 
-    manifest = build_manifest(full if not os.path.isdir(full) else "(local)", ranges)
+    manifest = build_manifest(full if not os.path.isdir(full) else "(local)", ranges,
+                              revision=revision, slot_meta=slot_meta)
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"[publish] wrote manifest: {json.dumps(manifest)}")
+    print(f"[publish] manifest: revision={revision} slots={[ (sl['dir'], sl.get('sha256','')[:12]) for sl in manifest['slots'] ]}")
 
     if do_upload:
         if not repo:

@@ -93,9 +93,33 @@ def main():
         except ValueError:
             pass
 
-    print("SHARD-FETCH TESTS PASSED — slot naming (coord vs stage), resolve_submodel cache path, "
-          "parse_layout contiguity, build_manifest ↔ node slot-name agreement, catalog→Topology "
-          "alignment (coordinator slots == published artifact dirs)")
+    # ── integrity + revision pinning (best-practice hardening) ────────────────
+    from engine.shard_fetch import sha256_file, verify_slice, build_manifest as bmf
+    with tempfile.TemporaryDirectory() as wd:
+        d = os.path.join(wd, "sub-16-48"); os.makedirs(d)
+        w = os.path.join(d, "model.safetensors")
+        with open(w, "wb") as f:
+            f.write(b"hello-awq-slice")
+        import hashlib
+        want = hashlib.sha256(b"hello-awq-slice").hexdigest()
+        assert sha256_file(w) == want, "streaming sha256 matches hashlib"
+        assert verify_slice(d, want) is True, "matching hash verifies"
+        assert verify_slice(d, "deadbeef") is False, "wrong hash rejected"
+        assert verify_slice(d, "") is True and verify_slice(d, None) is True, "no expected hash → skip"
+
+    # manifest carries revision + per-slot sha256/bytes
+    mh = bmf("Qwen/Qwen2.5-72B-Instruct-AWQ", pub.parse_layout("0:59,59:80"),
+             revision="abc123", slot_meta={"sub-59-80": {"sha256": "ff00", "bytes": 42}})
+    assert mh["revision"] == "abc123", "manifest pins source revision"
+    by_dir = {s["dir"]: s for s in mh["slots"]}
+    assert by_dir["sub-59-80"]["sha256"] == "ff00" and by_dir["sub-59-80"]["bytes"] == 42
+    assert "sha256" not in by_dir["coord-0-59"], "slots without meta carry no hash (not yet hashed)"
+    # back-compat: build_manifest still works with no revision/meta (old callers)
+    assert bmf("m", pub.parse_layout("0:16,16:48,48:80"))["revision"] is None
+
+    print("SHARD-FETCH TESTS PASSED — slot naming, resolve_submodel cache, parse_layout, "
+          "build_manifest↔node agreement, catalog→Topology alignment, sha256/verify_slice + "
+          "revision-pinned manifest (integrity hardening)")
 
 
 if __name__ == "__main__":

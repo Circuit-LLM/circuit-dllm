@@ -51,17 +51,43 @@ def parse_layout(spec: str):
     return ranges
 
 
-def build_manifest(model_id: str, ranges) -> dict:
-    """Manifest a node reads to find its slot's artifact. Pure."""
+def build_manifest(model_id: str, ranges, revision=None, slot_meta=None) -> dict:
+    """Manifest a node reads to find + verify its slot's artifact. Pure.
+    `revision` pins the SOURCE checkpoint commit the slices were cut from (so a node can refuse a
+    slice that doesn't match the model rev it expects). `slot_meta` maps a slot dir -> extra fields
+    (sha256, bytes) for integrity verification on download. Both are best-practice hardening for an
+    untrusted host: pin what it's from, prove it wasn't tampered."""
+    slot_meta = slot_meta or {}
+    slots = []
+    for (s, e, kh) in ranges:
+        d = slot_dirname(s, e, kh)
+        slots.append({"start": s, "end": e, "keep_head": kh, "dir": d, **slot_meta.get(d, {})})
     return {
         "model": model_id,
+        "revision": revision,
         "format": "awq-per-node-v1",
         "num_layers": ranges[-1][1],
-        "slots": [
-            {"start": s, "end": e, "keep_head": kh, "dir": slot_dirname(s, e, kh)}
-            for (s, e, kh) in ranges
-        ],
+        "slots": slots,
     }
+
+
+def sha256_file(path: str, _chunk: int = 1 << 20) -> str:
+    """Streaming sha256 of a file (1MB chunks — a slice's model.safetensors is GBs)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(_chunk), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def verify_slice(slice_dir: str, expected_sha256: str) -> bool:
+    """True if slice_dir/model.safetensors matches expected_sha256. Empty/None expected → True
+    (nothing to check — e.g. a locally-sliced slice with no published hash)."""
+    if not expected_sha256:
+        return True
+    p = os.path.join(slice_dir, "model.safetensors")
+    return os.path.isfile(p) and sha256_file(p) == expected_sha256
 
 
 def catalog_layout(spec) -> list:
@@ -130,6 +156,20 @@ def _try_download(repo: str, start: int, end: int, keep_head: bool, dest: str, l
                 os.symlink(src, dest)              # cheap: no 16GB copy, point at the HF cache
             except OSError:
                 return False                        # can't link (cross-fs) → slice locally instead
+        # integrity: verify the slice against the repo manifest's sha256 (best practice for an
+        # untrusted host — reject a tampered/corrupt slice rather than serve wrong weights).
+        # HF's own download already checks bytes; this also guards non-HF hosts + tampering.
+        if os.environ.get("CIRCUIT_VERIFY_SLICE", "1") == "1":
+            try:
+                mpath = snapshot_download(repo, allow_patterns=["manifest.json"])
+                man = json.load(open(os.path.join(mpath, "manifest.json")))
+                exp = next((sl.get("sha256") for sl in man.get("slots", []) if sl.get("dir") == sub), None)
+                if exp and not verify_slice(dest, exp):
+                    log("WARN", "downloaded slice FAILED sha256 verify — rejecting", slot=sub)
+                    return False
+                log("INFO", "slice integrity verified" if exp else "no sha256 in manifest (skip verify)", slot=sub)
+            except Exception as e:
+                log("INFO", "no manifest to verify against (skipping)", err=str(e)[:80])
         log("INFO", "downloaded published slice", repo=repo, slot=sub)
         return _has_weights(dest)
     except Exception as e:
