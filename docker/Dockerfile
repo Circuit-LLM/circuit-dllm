@@ -9,8 +9,9 @@
 #
 #   docker build -f docker/Dockerfile -t ghcr.io/circuit-llm/gpu-node:latest .
 #
-# Base: official PyTorch CUDA runtime (torch 2.4 + CUDA 12.1 + cuDNN9), matches the prod pods.
-FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+# Base: official PyTorch CUDA runtime — torch 2.8 + CUDA 12.8, matching the live prod pods
+# (gptqmodel 7.1.0 ships a prebuilt wheel for this combo, so no nvcc / source build is needed).
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -26,12 +27,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Engine deps. gptqmodel provides the Marlin AWQ kernels (2.1x over bnb); cryptography backs
 # the ed25519 node identity + the ChaCha20 data wire. Pinned-ish for reproducibility.
-RUN pip install --upgrade pip && \
-    pip install "transformers>=4.44,<4.49" "huggingface_hub>=0.24" "accelerate>=0.33" \
-                "cryptography>=42" "numpy<2" && \
-    # gptqmodel's build reads torch's metadata, which pip's build isolation hides (torch is in
-    # the base image) → install it without isolation so it sees the installed torch.
-    pip install --no-build-isolation "gptqmodel>=1.0"
+# Pinned to the exact versions the live prod mesh runs — all ship wheels for this base, so the
+# install is wheel-only (no compile, no nvcc).
+RUN pip install --upgrade pip && pip install \
+        "transformers==5.12.1" \
+        "huggingface_hub==1.20.1" \
+        "accelerate==1.14.0" \
+        "gptqmodel==7.1.0" \
+        "cryptography>=42" \
+        "numpy==2.2.6"
 
 # Bake the engine (build context = the circuit-dllm repo root).
 WORKDIR /opt/circuit-engine
