@@ -24,7 +24,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from engine.topology import Topology, Node
+from engine.topology import Topology, Node, PROBATION, TRUSTED
 
 
 def derive_node_key(master_secret: bytes, node_id: str) -> bytes:
@@ -39,7 +39,8 @@ class Registry:
     topo: Topology
     master_secret: bytes
     coordinator_endpoint: Tuple                  # how a node reaches the coordinator
-    allowlist: Optional[Set[str]] = None         # None = open; a set = permissioned
+    allowlist: Optional[Set[str]] = None         # None = open (default); a set = frozen kill-switch
+    seed_nodes: Optional[Set[str]] = None        # bootstrap fleet → TRUSTED on register (verify ref)
     fee_bps: int = 1000                          # protocol fee, basis points (10%)
     accrued: Dict[str, int] = field(default_factory=dict)  # node_id -> CIRC raw owed
     wallets: Dict[str, str] = field(default_factory=dict)  # node_id -> payout wallet
@@ -58,6 +59,10 @@ class Registry:
                 raise PermissionError(f"node {node.node_id} not on allowlist")
             # prefer_range: a re-registering node asks for its already-loaded slot back.
             slot = self.topo.register(node, now, prefer_range=prefer_range)   # raises on mismatch / capacity
+            # Bootstrap fleet is trusted outright so newcomers have a reference to be verified
+            # against; everyone else stays PROBATION (default) until they pass challenges.
+            if self.seed_nodes and node.node_id in self.seed_nodes:
+                self.topo.set_trusted(node.node_id)
             key = derive_node_key(self.master_secret, node.node_id)
             node.wire_key = key                    # coordinator uses this to talk to the node
             self.wallets[node.node_id] = node.payout_wallet
@@ -87,6 +92,38 @@ class Registry:
         with self._lock:
             self.topo.mark_suspect(node_id)
 
+    # ── trust / verification (docs/VERIFICATION.md) ────────────────────────────
+    def set_trusted(self, node_id: str) -> None:
+        with self._lock:
+            self.topo.set_trusted(node_id)
+
+    def record_check(self, node_id: str, ok: bool, promote_after: int = 3,
+                     strike_max: int = 2) -> Optional[str]:
+        """Fold one verification result into a node's trust (promote/evict). Returns
+        'promoted' | 'evicted' | None. Called by the auditor after each challenge."""
+        with self._lock:
+            return self.topo.record_check(node_id, ok, promote_after=promote_after,
+                                          strike_max=strike_max)
+
+    def audit_pairs(self) -> List[Tuple[str, str, int]]:
+        """(probation_node, trusted_reference, slot_index) for every slot that has BOTH a
+        probation holder to verify and a trusted holder to verify it against. The auditor
+        challenges each pair with the same input and compares outputs. A slot with no trusted
+        holder yet can't be audited (bootstrap seeds trust); a slot with no probation holder
+        needs no audit."""
+        with self._lock:
+            pairs: List[Tuple[str, str, int]] = []
+            for slot in self.topo.slots:
+                hs = self.topo.holders(slot.index)          # READY, trusted-first
+                trusted = [n for n in hs if n.trust == TRUSTED]
+                probation = [n for n in hs if n.trust == PROBATION]
+                if not trusted or not probation:
+                    continue
+                ref = trusted[0].node_id
+                for p in probation:
+                    pairs.append((p.node_id, ref, slot.index))
+            return pairs
+
     def set_rtt(self, node_id: str, ms: float) -> None:
         """Record a measured coordinator→node RTT (ms). The active RTT prober calls
         this; proximity routing (topo.route_by_latency) then prefers closer holders."""
@@ -103,6 +140,7 @@ class Registry:
                 "slots": [
                     {"slot": s.index, "layers": [s.start, s.end],
                      "holders": [{"node_id": h, "state": self.topo.nodes[h].state,
+                                  "trust": self.topo.nodes[h].trust,
                                   "region": self.topo.nodes[h].region,
                                   "rtt_ms": round(self.topo.rtt(h), 1)}
                                  for h in s.holders if h in self.topo.nodes]}

@@ -113,7 +113,9 @@ def _build_mesh():
     # a distinct mesh secret is best; fall back to the cluster key for a private net
     secret = bytes.fromhex(os.environ.get("CIRCUIT_MESH_SECRET") or os.environ["CIRCUIT_KEY"])
     allow = os.environ.get("CIRCUIT_MESH_ALLOWLIST", "").strip()
-    allowlist = {x.strip() for x in allow.split(",") if x.strip()} or None   # None = open
+    allowlist = {x.strip() for x in allow.split(",") if x.strip()} or None   # None = open (default); a set = frozen
+    seed = os.environ.get("CIRCUIT_MESH_SEED_NODES", "").strip()
+    seed_nodes = {x.strip() for x in seed.split(",") if x.strip()} or None    # bootstrap fleet → TRUSTED
     host = os.environ.get("CIRCUIT_CONTROL_HOST", "0.0.0.0")
     port = int(os.environ.get("CIRCUIT_CONTROL_PORT", "18932"))
     reap = float(os.environ.get("CIRCUIT_REAP_INTERVAL", "10"))
@@ -128,7 +130,7 @@ def _build_mesh():
                     coordinator_region=os.environ.get("CIRCUIT_REGION") or None,
                     route_by_latency=os.environ.get("CIRCUIT_ROUTE_LATENCY") == "1")
     reg = Registry(topo=topo, master_secret=secret, coordinator_endpoint=coord_ep,
-                   allowlist=allowlist)
+                   allowlist=allowlist, seed_nodes=seed_nodes)
     verify_sig = None
     if os.environ.get("CIRCUIT_MESH_VERIFY_SIG") == "1":
         from engine.control_server import make_ed25519_verifier
@@ -396,6 +398,22 @@ def main():
             allowlisted=(reg.allowlist is not None))
 
     _coord = _build_coordinator(registry=mesh[0] if mesh else None)
+
+    # Trustless verification auditor (docs/VERIFICATION.md): periodically challenge probation
+    # nodes against a trusted replica and promote/evict. OFF by default — enable with CIRCUIT_VERIFY=1
+    # once validated on a real multi-node mesh. No-op without a registry or with no probation nodes,
+    # and it never crashes the server (errors are logged and the loop continues).
+    if mesh and os.environ.get("CIRCUIT_VERIFY") == "1":
+        _audit_every = float(os.environ.get("CIRCUIT_VERIFY_INTERVAL", "30"))
+        def _audit_loop():
+            while True:
+                time.sleep(_audit_every)
+                try:
+                    _coord.run_audit_round()
+                except Exception as e:   # noqa: BLE001 — never let the auditor take down serving
+                    log("WARN", "audit round failed", err=str(e))
+        threading.Thread(target=_audit_loop, daemon=True).start()
+        log("INFO", "verification auditor on", interval_s=_audit_every)
 
     if os.environ.get("CIRCUIT_BATCH") == "1":   # intra-step batching (Win B)
         mb = int(os.environ.get("CIRCUIT_MAX_BATCH", "8"))

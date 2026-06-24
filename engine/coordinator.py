@@ -31,7 +31,13 @@ from engine.stage import stage_for_range
 from engine.kv import StageKV
 from engine.stage_worker import KVOP_RESET, KVOP_TRUNCATE, KVOP_FREE, KVOP_TREE_KEEP
 from engine.specdecode import speculative_greedy, speculative_greedy_stream, GreedyDraft
+from engine.verify import challenge_activation, outputs_agree
 from engine.log import make_logger
+
+# Throwaway session id for verification challenges — distinct from real session ids
+# (itertools.count(1), small) and batch ids (>=1<<31). pos==0 resets its KV each challenge,
+# so it never grows.
+_AUDIT_SESSION = 1 << 30
 
 
 # Failover must fail FAST: a routed mesh holder is already READY (it posted /ready
@@ -574,6 +580,60 @@ class Coordinator:
                 self._reset_sessions(old)
             except Exception:
                 pass
+
+    # ── trustless verification: audit probation nodes vs a trusted replica ──────────────
+    # (docs/VERIFICATION.md) Off the hot path. Challenge a probation node and a TRUSTED holder of
+    # the SAME slot with the same random input, compare outputs within numerical noise, and record
+    # pass/fail → promote after enough passes, evict on strikes. Lets the mesh stay open (anyone
+    # joins) without a bad node ever being a primary or going unchecked.
+    def _challenge_node(self, node, hidden: torch.Tensor) -> torch.Tensor:
+        """Send a single-stage ACTIVATION challenge to ONE node and return its output hidden.
+        Throwaway session at pos 0 (the node resets its KV on pos==0, so it never grows). Raises
+        on a wire/socket error — the caller treats that as 'skip this pair', not a failed check."""
+        key = self._node_key(node)
+        sock = self._conn_for(node)
+        wire.write_frame(sock, key, wire.ACTIVATION,
+                         pack_activation(_AUDIT_SESSION, 0, hidden.detach().cpu()))
+        mt, payload = wire.read_frame_keyed(sock, key)
+        if mt != wire.RESULT:
+            raise wire.WireError(f"audit: expected RESULT, got {wire.msg_name(mt)}")
+        _, _, _, out = unpack_activation(payload)
+        return out.to(self.device)
+
+    @torch.no_grad()
+    def run_audit_round(self, max_pairs: int = 4) -> dict:
+        """One round of verification. For up to `max_pairs` (probation, trusted-reference) pairs on
+        the same slot, challenge BOTH with the same fresh random activation and compare; record_check
+        then promotes the probation node after enough passes or evicts it on strikes. Dynamic-mesh +
+        registry only; a transient network error skips a pair (never counted as a failure). No-op when
+        there are no probation nodes to check. Thresholds tune via CIRCUIT_VERIFY_COS / _L2."""
+        if not self._dynamic or self.registry is None:
+            return {"audited": 0, "results": []}
+        cos_t = float(os.environ.get("CIRCUIT_VERIFY_COS", "0.99"))
+        l2_t = float(os.environ.get("CIRCUIT_VERIFY_L2", "0.05"))
+        width = self.config.hidden_size
+        w = getattr(self.embed, "weight", None)
+        dtype = w.dtype if w is not None else torch.float16
+        results = []
+        for test_id, ref_id, slot in self.registry.audit_pairs()[:max_pairs]:
+            test = self.registry.topo.nodes.get(test_id)
+            ref = self.registry.topo.nodes.get(ref_id)
+            if test is None or ref is None:
+                continue
+            nonce = os.urandom(8).hex()              # unpredictable → a node can't precompute outputs
+            x = challenge_activation(f"{test_id}:{slot}:{nonce}", width, dtype=dtype, device="cpu")
+            try:
+                out_ref = self._challenge_node(ref, x)
+                out_test = self._challenge_node(test, x)
+            except (wire.WireError, OSError):
+                self._drop_conn(ref_id); self._drop_conn(test_id)
+                continue                              # network blip ≠ wrong compute
+            ok, cos, rel = outputs_agree(out_test, out_ref, cos_t, l2_t)
+            action = self.registry.record_check(test_id, ok)
+            self.log("INFO", "audit", node=test_id[:8], slot=slot, ok=ok,
+                     cos=round(cos, 4), rel_l2=round(rel, 4), action=action)
+            results.append({"node": test_id, "slot": slot, "ok": ok, "action": action})
+        return {"audited": len(results), "results": results}
 
     # ── tree drafting: verify a draft TREE per round-trip (Medusa/SpecInfer-style) ──────
     # Same draft model as linear spec, but it proposes a BRANCHING tree; the mesh verifies the

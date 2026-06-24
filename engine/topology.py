@@ -34,6 +34,14 @@ DRAINING = "draining"  # leaving cleanly: finishes in-flight, takes no new sessi
 
 _ROUTABLE = (READY,)   # only READY nodes receive sessions / count toward coverage
 
+# ── trust tiers (orthogonal to liveness — see docs/VERIFICATION.md) ────────────
+# A node's liveness (above) says whether it's reachable; its TRUST says whether its
+# compute is proven correct. New nodes are PROBATION: they serve as redundant/shadow
+# holders but are never the PRIMARY whose output is used, until they pass enough
+# verification challenges (record_check) to be promoted to TRUSTED.
+PROBATION = "probation"
+TRUSTED = "trusted"
+
 # ── latency estimation (topology-aware routing foundation) ────────────────────
 # Neutral RTT (ms) used when neither a measured probe nor a region label is known —
 # so an unlabeled node neither wins nor loses proximity routing by default.
@@ -194,6 +202,10 @@ class Node:
     state: str = JOINING
     last_hb: float = 0.0          # last heartbeat timestamp
     wire_key: Optional[bytes] = None  # per-node data-wire key (issued at registration)
+    # trust (docs/VERIFICATION.md): new nodes are PROBATION until they pass challenges.
+    trust: str = PROBATION
+    checks_passed: int = 0        # verification challenges passed (→ promote)
+    strikes: int = 0              # verification challenges failed (→ evict)
 
 
 @dataclass
@@ -401,18 +413,55 @@ class Topology:
 
     # ── routing ──────────────────────────────────────────────────────────────
     def holders(self, slot_index: int) -> List[Node]:
-        """Routable holders for a slot, primary first. Default order is freshest
-        heartbeat (liveness). With route_by_latency, the LOWEST-RTT holder is primary —
-        i.e. the slot is served by its closest replica to the coordinator (cheapest hop
-        in the star), heartbeat freshness breaking ties. The rest are failover fallbacks."""
+        """Routable holders for a slot, primary first. Ordered TRUSTED-first (a probation
+        node — unverified compute — must not be the primary whose output is used; it stays a
+        fallback/shadow until promoted, but still counts for coverage), then by the liveness
+        order: freshest heartbeat, or LOWEST-RTT with route_by_latency (closest replica is
+        primary), heartbeat breaking ties. So route() picks a trusted primary whenever one
+        exists and only falls back to a probation holder to avoid a coverage hole."""
         slot = self.slots[slot_index]
         live = [self.nodes[h] for h in slot.holders
                 if h in self.nodes and self.nodes[h].state in _ROUTABLE]
+        trank = lambda n: 0 if n.trust == TRUSTED else 1   # trusted before probation
         if self.route_by_latency:
-            live.sort(key=lambda n: (self.rtt(n.node_id), -n.last_hb))
+            live.sort(key=lambda n: (trank(n), self.rtt(n.node_id), -n.last_hb))
         else:
-            live.sort(key=lambda n: -n.last_hb)
+            live.sort(key=lambda n: (trank(n), -n.last_hb))
         return live
+
+    # ── trust transitions (verification — see docs/VERIFICATION.md) ────────────
+    def set_trusted(self, node_id: str) -> None:
+        """Mark a node TRUSTED outright — used to seed the bootstrap fleet so there's a
+        reference to verify newcomers against from t=0 (CIRCUIT_SEED_NODES)."""
+        n = self.nodes.get(node_id)
+        if n:
+            n.trust = TRUSTED
+
+    def record_check(self, node_id: str, ok: bool, promote_after: int = 3,
+                     strike_max: int = 2) -> Optional[str]:
+        """Fold one verification result into a node's trust. A pass advances a probation node
+        toward promotion (TRUSTED after `promote_after` cumulative passes); a fail adds a strike
+        and EVICTS the node (→ DEAD, freeing its slot) once strikes reach `strike_max`. A pass
+        also forgives one prior strike (transient blips shouldn't doom an otherwise-honest node).
+        Returns 'promoted' | 'evicted' | None. A node already TRUSTED keeps being checked — a
+        strike can still demote+evict it, so trust isn't permanent."""
+        n = self.nodes.get(node_id)
+        if n is None:
+            return None
+        if ok:
+            n.checks_passed += 1
+            if n.strikes > 0:
+                n.strikes -= 1
+            if n.trust != TRUSTED and n.checks_passed >= promote_after and n.strikes == 0:
+                n.trust = TRUSTED
+                return "promoted"
+            return None
+        n.strikes += 1
+        if n.strikes >= strike_max:
+            n.trust = PROBATION          # lose trust before leaving, so nothing routes to it as primary
+            n.state = DEAD               # evict: reap()/purge() reclaim the slot, route() skips it
+            return "evicted"
+        return None
 
     def route(self) -> List[Tuple[Slot, List[Node]]]:
         """The full pipeline: each slot in order with its ordered routable holders.
