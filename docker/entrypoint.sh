@@ -12,7 +12,7 @@ STATE_DIR="${CIRCUIT_STATE_DIR:-/var/lib/circuit}"
 cd "$ENGINE_DIR" || die "engine dir $ENGINE_DIR missing (bad image?)"
 
 # ── required / defaulted config ───────────────────────────────────────────────────────────
-: "${CIRCUIT_CONTROL_URL:?set CIRCUIT_CONTROL_URL — the coordinator control endpoint, e.g. https://join.circuitllm.xyz}"
+: "${CIRCUIT_CONTROL_URL:?set CIRCUIT_CONTROL_URL — the coordinator control endpoint, e.g. https://node.circuitllm.xyz}"
 export CIRCUIT_MODEL="${CIRCUIT_MODEL:-Qwen/Qwen2.5-72B-Instruct-AWQ}"
 export CIRCUIT_MODEL_FP="${CIRCUIT_MODEL_FP:-qwen2.5-72b-awq}"
 export CIRCUIT_AWQ_SHARDS="${CIRCUIT_AWQ_SHARDS:-circuitllmdev/qwen2.5-72b-awq-shards}"
