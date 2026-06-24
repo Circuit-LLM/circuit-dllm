@@ -65,14 +65,17 @@ def speculative_greedy(target, draft, prompt_ids: torch.Tensor, n_new: int,
     head = int(logits[0, -1].argmax())
     out = [head]
     pos = target.kv_len()
+    # EAGLE hook (needs_hidden): give the head the prompt context, then extend it each round with
+    # the committed tokens + their target features so the head attends over the WHOLE sequence.
+    # GreedyDraft.needs_hidden is False → these are skipped and the standalone path is byte-identical.
+    nh = getattr(draft, "needs_hidden", False)
+    if nh:
+        draft.eagle_prefill(prompt_ids, target.last_hidden())
 
     local = {"rounds": 0, "accepted": 0, "proposed": 0}
     while len(out) < n_new:
-        # EAGLE hook: when draft.needs_hidden, the EAGLE GPU integration passes
-        # target_hidden=target.last_hidden() here (the seed-position indexing is finalized
-        # against the real head — docs/EAGLE.md). GreedyDraft.needs_hidden is False, so this
-        # call is unchanged; the same hook applies in speculative_greedy_stream below.
-        drafts = draft.propose(head, K, pos, perturb=draft_perturb)
+        drafts = draft.propose(head, K, pos, perturb=draft_perturb,
+                               target_hidden=(target.last_hidden() if nh else None))
         batch = torch.tensor([[head] + drafts], device=device)
         tlogits = target.forward_tokens(batch, pos)      # [1, K+1, V]
 
@@ -85,6 +88,9 @@ def speculative_greedy(target, draft, prompt_ids: torch.Tensor, n_new: int,
         extra = int(tlogits[0, m].argmax())              # corrected (m<K) or bonus (m==K)
 
         out.extend(drafts[:m] + [extra])
+        if nh:
+            # commit positions pos..pos+m (head + accepted drafts) with their verify-pass features
+            draft.eagle_commit([head] + drafts[:m], target.last_hidden()[:, :m + 1, :])
         keep = pos + m + 1
         target.rollback(keep)
         draft.rollback(keep)
@@ -110,16 +116,27 @@ def speculative_greedy_stream(target, draft, prompt_ids: torch.Tensor, n_new: in
     condition. Generation stops at n_new tokens, or as soon as an EOS id is
     committed — EOS itself is not yielded. The draft only affects speed."""
     eos = set(eos_ids)
+    import os as _os, sys as _sys, time as _time
+    _dbg = _os.environ.get("CIRCUIT_TTFT_DEBUG")
+    _t = _time.time() if _dbg else 0
     logits = target.forward_tokens(prompt_ids, 0)
+    if _dbg:
+        print(f"[ttft] mesh_prefill={_time.time()-_t:.2f}s kv={target.kv_len()}", file=_sys.stderr, flush=True); _t = _time.time()
     draft.prefill(prompt_ids)
+    if _dbg:
+        print(f"[ttft] draft_prefill={_time.time()-_t:.2f}s", file=_sys.stderr, flush=True)
     head = int(logits[0, -1].argmax())
     if head in eos:
         return
     yield head
     produced = 1
     pos = target.kv_len()
+    nh = getattr(draft, "needs_hidden", False)           # EAGLE context feed (see speculative_greedy)
+    if nh:
+        draft.eagle_prefill(prompt_ids, target.last_hidden())
     while produced < n_new:
-        drafts = draft.propose(head, K, pos, perturb=draft_perturb)
+        drafts = draft.propose(head, K, pos, perturb=draft_perturb,
+                               target_hidden=(target.last_hidden() if nh else None))
         batch = torch.tensor([[head] + drafts], device=device)
         tlogits = target.forward_tokens(batch, pos)      # [1, K+1, V]
         m = 0
@@ -130,6 +147,8 @@ def speculative_greedy_stream(target, draft, prompt_ids: torch.Tensor, n_new: in
                 break
         extra = int(tlogits[0, m].argmax())              # corrected (m<K) or bonus (m==K)
         committed = drafts[:m] + [extra]
+        if nh:
+            draft.eagle_commit([head] + drafts[:m], target.last_hidden()[:, :m + 1, :])
         keep = pos + m + 1
         target.rollback(keep)
         draft.rollback(keep)
@@ -156,9 +175,15 @@ class SplitTarget:
         self.config = model.config
         self.device = device
         self.caches = [StageKV(self.config) for _ in stages]
+        self._last_hidden = None
 
     def kv_len(self) -> int:
         return self.caches[0].get_seq_length()
+
+    def last_hidden(self) -> torch.Tensor:
+        """The final pre-norm hidden [1,T,D] from the most recent forward_tokens — the feature
+        an EAGLE draft conditions on (the target's argmax still decides every committed token)."""
+        return self._last_hidden
 
     @torch.no_grad()
     def forward_tokens(self, token_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
@@ -166,6 +191,7 @@ class SplitTarget:
         pos = (torch.arange(token_ids.shape[1], device=self.device) + start_pos).unsqueeze(0)
         for st, c in zip(self.stages, self.caches):
             h = st.forward(h, pos, past_key_values=c, use_cache=True)
+        self._last_hidden = h
         return self.lm_head(self.norm(h))
 
     def rollback(self, length: int) -> None:
@@ -195,7 +221,9 @@ class GreedyDraft:
 
     @torch.no_grad()
     def propose(self, head_tok: int, K: int, start_pos: int,
-                perturb: Optional[Callable[[int, int], int]] = None) -> List[int]:
+                perturb: Optional[Callable[[int, int], int]] = None,
+                target_hidden=None) -> List[int]:
+        # target_hidden is the EAGLE seed feature — a standalone GreedyDraft never reads it.
         assert self.kv_len() == start_pos, (self.kv_len(), start_pos)
         props: List[int] = []
         cur = head_tok

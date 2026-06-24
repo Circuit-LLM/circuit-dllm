@@ -24,11 +24,12 @@ from typing import List, Tuple
 import torch
 
 from engine import wire, chain
-from engine.tensors import pack_activation, unpack_activation, pack_batch_activation
+from engine.tensors import (pack_activation, unpack_activation, pack_batch_activation,
+                            pack_tree_activation, build_tree_mask)
 from engine.model import load_model, load_tokenizer, prune_to_layers
 from engine.stage import stage_for_range
 from engine.kv import StageKV
-from engine.stage_worker import KVOP_RESET, KVOP_TRUNCATE, KVOP_FREE
+from engine.stage_worker import KVOP_RESET, KVOP_TRUNCATE, KVOP_FREE, KVOP_TREE_KEEP
 from engine.specdecode import speculative_greedy, speculative_greedy_stream, GreedyDraft
 from engine.log import make_logger
 
@@ -77,11 +78,16 @@ class _Conn:
     """One request's connection set. `socks` = the static-path stage list (lazy);
     `conns` = the dynamic-path node_id -> socket map. A coordinator uses one or the
     other depending on mode; both live here so the relay code is mode-agnostic."""
-    __slots__ = ("socks", "conns")
+    __slots__ = ("socks", "conns", "pc")
 
     def __init__(self):
         self.socks = None
         self.conns = {}
+        # Per-slot system-prompt prefix cache: this connection set's warm session +
+        # the prompt token ids it currently holds. Each in-flight request owns its _Conn
+        # exclusively (the pool lends one per request), so no locking is needed and the
+        # cache works at any concurrency — every slot keeps its own warm prefix.
+        self.pc = {"ids": None, "sid": None, "len": 0}
 
 
 class _ConnPool:
@@ -184,7 +190,9 @@ class Coordinator:
         gc = getattr(model, "generation_config", None)
         eos = gc.eos_token_id if (gc and gc.eos_token_id is not None) else self.tok.eos_token_id
         self._eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
-        self._draft_model = load_model(draft_model_id, device=device) if draft_model_id else None
+        # sdpa attn so tree drafting can hand the draft a 4D (non-causal) tree mask
+        self._draft_model = (load_model(draft_model_id, device=device, attn_implementation="sdpa")
+                             if draft_model_id else None)
         # CIRCUIT_DRAFT_KIND selects the speculative draft: "model" (default) = the proven
         # standalone GreedyDraft; "eagle" = an EAGLE head conditioned on the target's final
         # hidden (docs/EAGLE.md) — far higher acceptance, zero extra hop. Output stays
@@ -200,6 +208,14 @@ class Coordinator:
         self._pool = _ConnPool(self._max_conc)
         self._session_ids = itertools.count(1)    # atomic id source (no lock needed)
         self._spec_lock = threading.Lock()        # guards the _spec counters/window
+        # System-prompt prefix cache: the dominant TTFT cost is re-prefilling the (large,
+        # identical-every-request) system prompt through the mesh. Each connection slot keeps
+        # a warm session (stored on its _Conn) whose mesh+local KV holds the longest token
+        # prefix shared across that slot's requests (auto-discovered by LCP); a new request
+        # rolls that KV back to the shared prefix and prefills only the divergent suffix.
+        # Per-slot state → works at any concurrency, lock-free (each _Conn is request-exclusive).
+        self._pc_enabled = os.environ.get("CIRCUIT_PREFIX_CACHE", "1") != "0"
+        self._pc_min = int(os.environ.get("CIRCUIT_PREFIX_MIN", "16"))
         # Win B: intra-step batching. Batch ids live in a HIGH id space (>=2^31) so
         # they never collide with session ids in a worker's shared cache dict; the
         # local co-located stage keeps a per-batch KV alongside the per-session one.
@@ -455,7 +471,10 @@ class Coordinator:
                 conn.socks = None   # drop -> reconnect on the next request
                 break
 
-    def _kv_truncate(self, session: int, length: int):
+    def _kv_truncate(self, session: int, length: int, strict: bool = False):
+        """Truncate a session's KV to `length` everywhere. `strict` (used by the prefix
+        cache before reusing a warm session) re-raises on any stage write failure so the
+        caller can fall back to a fresh prefill rather than append onto a stale KV."""
         if session in self._local_caches:
             self._local_caches[session].truncate_to(length)
         conn = self._active_conn()
@@ -468,10 +487,316 @@ class Coordinator:
                                      struct.pack(">IBI", session, KVOP_TRUNCATE, length))
                 except OSError:
                     self._drop_conn(nid)
+                    if strict:
+                        raise
             return
         for s in (conn.socks or []):
             wire.write_frame(s, self.key, wire.KV_CTRL,
                              struct.pack(">IBI", session, KVOP_TRUNCATE, length))
+
+    # ── system-prompt prefix cache ──────────────────────────────────────────────────────
+    @staticmethod
+    def _lcp_len(a: list, b: list) -> int:
+        n = min(len(a), len(b))
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        return i
+
+    def _begin_session(self, ids: torch.Tensor):
+        """Pick the session to decode this prompt on. With prefix caching active, reuse the
+        warm session and roll its KV back to the longest prefix it shares with this prompt,
+        so only the divergent suffix gets prefilled through the mesh. Returns
+        (session_id, prefilled_len) — prefilled_len tokens of `ids` are already in the
+        session's KV; a fresh session returns (id, 0)."""
+        if not self._pc_enabled:
+            return next(self._session_ids), 0
+        row = ids[0].tolist()
+        pc = self._active_conn().pc                  # per-slot warm session (request-exclusive)
+        common = self._lcp_len(row, pc["ids"]) if pc["ids"] is not None else 0
+        common = min(common, ids.shape[1] - 1)       # always leave ≥1 token to forward
+        if pc["sid"] is not None and common >= self._pc_min and self._warm_route_ok(pc["sid"]):
+            sid = pc["sid"]
+            try:
+                if common < pc["len"]:
+                    self._kv_truncate(sid, common, strict=True)   # drop past the shared prefix
+                pc["len"] = common
+                if os.environ.get("CIRCUIT_TTFT_DEBUG"):
+                    import sys as _s; print(f"[ttft] prefix HIT common={common} prompt={ids.shape[1]}", file=_s.stderr, flush=True)
+                return sid, common
+            except Exception as _e:                  # warm KV unusable -> rebuild fresh
+                if os.environ.get("CIRCUIT_TTFT_DEBUG"):
+                    import sys as _s; print(f"[ttft] prefix HIT->EXC {_e!r}", file=_s.stderr, flush=True)
+                self._invalidate_prefix(pc)
+        if os.environ.get("CIRCUIT_TTFT_DEBUG"):
+            import sys as _s
+            _have = (pc["sid"] is not None); _cm = (self._lcp_len(row, pc["ids"]) if pc["ids"] is not None else -1)
+            _rok = (self._warm_route_ok(pc["sid"]) if pc["sid"] is not None else False)
+            print(f"[ttft] prefix MISS prompt={ids.shape[1]} have_warm={_have} lcp={_cm} min={self._pc_min} route_ok={_rok}", file=_s.stderr, flush=True)
+        return next(self._session_ids), 0
+
+    def _warm_route_ok(self, sid: int) -> bool:
+        """Reuse the warm session only when every node holding its KV is currently connected —
+        otherwise we can't reliably roll that KV back and would risk appending onto a stale
+        prefix. Static (non-dynamic) path has a single fixed socket set, so it's always ok."""
+        if not self._dynamic:
+            return True
+        route = self._session_routes.get(sid)
+        if not route:
+            return False
+        conns = self._active_conn().conns
+        return all(n.node_id in conns for n in route)
+
+    def _end_session(self, sid: int, ids: torch.Tensor):
+        """Finish a generation: keep `sid` warm as the prefix cache by rolling its KV back to
+        the prompt (dropping the generated tokens) and recording the prompt as the new cache
+        key. On any failure (or when prefix caching is off) just free the session normally."""
+        if not self._pc_enabled:
+            self._reset_sessions(sid)
+            return
+        pc = self._active_conn().pc
+        P = ids.shape[1]
+        try:
+            self._kv_truncate(sid, P)                # keep prompt KV, drop the generation
+            old = pc.get("sid")
+            if old is not None and old != sid:
+                self._reset_sessions(old)            # free this slot's previous warm session
+            pc["ids"], pc["sid"], pc["len"] = ids[0].tolist(), sid, P
+        except Exception:
+            self._invalidate_prefix(pc)
+            self._reset_sessions(sid)
+
+    def _invalidate_prefix(self, pc: dict):
+        old = pc.get("sid")
+        pc["ids"], pc["sid"], pc["len"] = None, None, 0
+        if old is not None:
+            try:
+                self._reset_sessions(old)
+            except Exception:
+                pass
+
+    # ── tree drafting: verify a draft TREE per round-trip (Medusa/SpecInfer-style) ──────
+    # Same draft model as linear spec, but it proposes a BRANCHING tree; the mesh verifies the
+    # whole tree in ONE relay (tree attention mask) and we commit the longest accepted branch.
+    # Output is token-identical to greedy — the tree only changes how many tokens a single
+    # network round-trip can commit. Gated by CIRCUIT_TREE=1.
+    def _run_local_tree(self, session, pos, hidden, tree_positions, parents):
+        cache = self._local_caches.get(session)
+        if cache is None or pos == 0:
+            cache = StageKV(self.config)
+            self._local_caches[session] = cache
+        tm = build_tree_mask(parents, pos, self.device, hidden.dtype)
+        tpos = tree_positions.to(self.device).long().view(1, -1)
+        return self.local_stage.forward(hidden, tpos, past_key_values=cache,
+                                        use_cache=True, tree_mask=tm)
+
+    def _relay_tree(self, session, pos, hidden, tree_positions, parents):
+        """Tree verify across the mesh: local stage (tree mask) then each remote stage via
+        TREE_ACTIVATION, on the session's pinned route. Returns the per-node hidden [1,T,D]."""
+        if self.local_stage is not None:
+            hidden = self._run_local_tree(session, pos, hidden, tree_positions, parents)
+        if not self._dynamic:
+            for s in self._ensure_connected():
+                wire.write_frame(s, self.key, wire.TREE_ACTIVATION,
+                                 pack_tree_activation(session, pos, hidden.detach().cpu(),
+                                                      tree_positions, parents))
+                mt, payload = wire.read_frame_keyed(s, self.key)
+                if mt != wire.RESULT:
+                    raise wire.WireError(f"expected RESULT, got {wire.msg_name(mt)}")
+                _, _, _, hidden = unpack_activation(payload)
+                hidden = hidden.to(self.device)
+            return hidden
+        route = self._session_routes.get(session)
+        if route is None:
+            route = self.registry.acquire_route(session)
+            self._session_routes[session] = route
+        for node in route:
+            key = self._node_key(node)
+            sock = self._conn_for(node)
+            wire.write_frame(sock, key, wire.TREE_ACTIVATION,
+                             pack_tree_activation(session, pos, hidden.detach().cpu(),
+                                                  tree_positions, parents))
+            mt, payload = wire.read_frame_keyed(sock, key)
+            if mt != wire.RESULT:
+                raise wire.WireError(f"expected RESULT, got {wire.msg_name(mt)}")
+            _, _, _, hidden = unpack_activation(payload)
+            hidden = hidden.to(self.device)
+        return hidden
+
+    def _kv_tree_keep(self, session, prefix_len, accepted_slots):
+        """Compact every stage's KV (local + remote) to prefix + the accepted-path tree slots."""
+        if session in self._local_caches:
+            self._local_caches[session].keep_tree_path(prefix_len, accepted_slots)
+        body = (struct.pack(">IBI", session, KVOP_TREE_KEEP, prefix_len)
+                + struct.pack(">I", len(accepted_slots))
+                + struct.pack(">%dI" % len(accepted_slots), *[int(s) for s in accepted_slots]))
+        conn = self._active_conn()
+        if self._dynamic:
+            for nid, sock in list(conn.conns.items()):
+                node = self.registry.topo.nodes.get(nid)
+                key = self._node_key(node) if node else self.key
+                try:
+                    wire.write_frame(sock, key, wire.KV_CTRL, body)
+                except OSError:
+                    self._drop_conn(nid)
+            return
+        for s in (conn.socks or []):
+            wire.write_frame(s, self.key, wire.KV_CTRL, body)
+
+    @torch.no_grad()
+    def _build_tree(self, base_ids, head, n_nodes, branch, max_depth):
+        """Best-first draft tree rooted at `head` (node 0); node['suffix'] = tokens below head
+        down to the node. Expand a node via draft(base_ids + [head] + suffix)."""
+        import heapq
+        draft = self._draft_model
+        nodes = [{"tok": int(head), "parent": -1, "depth": 0, "suffix": [], "clp": 0.0}]
+        fr = [(0.0, 0)]
+        while len(nodes) < n_nodes and fr:
+            _, idx = heapq.heappop(fr)
+            nd = nodes[idx]
+            if nd["depth"] >= max_depth:
+                continue
+            ctx = torch.cat([base_ids, torch.tensor([[int(head)] + nd["suffix"]],
+                                                    device=self.device)], 1)
+            lp = torch.log_softmax(draft(ctx).logits[0, -1].float(), -1)
+            tb = torch.topk(lp, branch)
+            for j in range(branch):
+                if len(nodes) >= n_nodes:
+                    break
+                ct, clp = int(tb.indices[j]), nd["clp"] + float(tb.values[j])
+                nodes.append({"tok": ct, "parent": idx, "depth": nd["depth"] + 1,
+                              "suffix": nd["suffix"] + [ct], "clp": clp})
+                heapq.heappush(fr, (-clp, len(nodes) - 1))
+        return nodes
+
+    @torch.no_grad()
+    def _build_tree_batched(self, base_ids, head, n_nodes, branch, max_depth, beam):
+        """Efficient tree-draft: prefill the prefix ONCE into the draft KV, then expand
+        depth-by-depth — each depth processes the current beam (≤`beam` nodes) in ONE batched
+        draft forward with a tree mask + incremental KV (no per-node re-prefill). ~depth
+        forwards instead of ~n_nodes — that's the cost cut that makes tree drafting net-faster.
+        Returns the same node list shape (tok/parent/depth) as the naive _build_tree."""
+        from transformers import DynamicCache
+        draft, dev = self._draft_model, self.device
+        dt = next(draft.parameters()).dtype
+        neg = torch.finfo(dt).min
+        prefix = torch.cat([base_ids, torch.tensor([[int(head)]], device=dev)], 1)
+        L = prefix.shape[1]
+        kv = DynamicCache()
+        lp = torch.log_softmax(draft(prefix, past_key_values=kv, use_cache=True).logits[0, -1].float(), -1)
+        nodes = [{"tok": int(head), "parent": -1, "depth": 0}]
+        # initial frontier = top-`beam` children of the root (head)
+        tb = torch.topk(lp, branch)
+        cand = sorted(((float(tb.values[j]), 0, int(tb.indices[j])) for j in range(branch)), reverse=True)
+        frontier = []   # {node, anc:[kv slots of ancestors], clp}
+        for clp, par, tok in cand[:beam]:
+            nodes.append({"tok": tok, "parent": par, "depth": 1})
+            frontier.append({"node": len(nodes) - 1, "anc": [], "clp": clp})
+        depth = 1
+        while frontier and len(nodes) < n_nodes and depth < max_depth:
+            W = len(frontier)
+            cache_len = kv.get_seq_length()
+            toks = torch.tensor([[nodes[f["node"]]["tok"] for f in frontier]], device=dev)
+            pos = torch.full((1, W), L - 1 + depth, device=dev, dtype=torch.long)
+            m = torch.full((W, cache_len + W), neg, device=dev, dtype=dt)
+            for k, f in enumerate(frontier):
+                m[k, :L] = 0.0                      # prefix
+                for s in f["anc"]:
+                    m[k, s] = 0.0                   # ancestors
+                m[k, cache_len + k] = 0.0           # self
+            logits = draft(toks, past_key_values=kv, position_ids=pos,
+                           attention_mask=m[None, None], use_cache=True).logits[0].float()  # [W,V]
+            slot = [cache_len + k for k in range(W)]
+            nxt = []
+            for k, f in enumerate(frontier):
+                tbk = torch.topk(torch.log_softmax(logits[k], -1), branch)
+                nxt.extend((f["clp"] + float(tbk.values[j]), f["node"], slot[k], f["anc"], int(tbk.indices[j]))
+                           for j in range(branch))
+            nxt.sort(key=lambda c: -c[0])
+            new_frontier = []
+            for clp, par, par_slot, par_anc, tok in nxt:
+                if len(nodes) >= n_nodes:
+                    break
+                nodes.append({"tok": tok, "parent": par, "depth": depth + 1})  # all candidates join the tree
+                if len(new_frontier) < beam:                                   # top-`beam` keep expanding
+                    new_frontier.append({"node": len(nodes) - 1, "anc": par_anc + [par_slot], "clp": clp})
+            frontier = new_frontier
+            depth += 1
+        return nodes
+
+    @staticmethod
+    def _accept_tree(nodes, logits):
+        """Root (head) always accepted; follow children matching the target's argmax. Returns
+        (committed_after_head, accepted_node_indices_incl_head, bonus)."""
+        ch = {}
+        for i, n in enumerate(nodes):
+            ch.setdefault(n["parent"], []).append(i)
+            ch.setdefault(i, [])
+        path, cur = [0], 0
+        while True:
+            pred = int(logits[cur].argmax())
+            nx = next((c for c in ch.get(cur, []) if nodes[c]["tok"] == pred), None)
+            if nx is None:
+                break
+            path.append(nx); cur = nx
+        bonus = int(logits[cur].argmax())
+        committed = [nodes[i]["tok"] for i in path[1:]] + [bonus]
+        return committed, path, bonus
+
+    def has_tree(self) -> bool:
+        return self._draft_model is not None and os.environ.get("CIRCUIT_TREE") == "1"
+
+    @torch.no_grad()
+    def generate_tree_stream(self, prompt: str, n_new: int = 256,
+                             n_nodes=None, branch=None, max_depth=None, beam=None):
+        """Streaming tree-drafting decode. Token-identical to greedy; the tree only affects
+        speed (more committed tokens per mesh round-trip). Requires a draft model."""
+        if self._draft_model is None:
+            raise RuntimeError("generate_tree_stream requires a draft model (set CIRCUIT_DRAFT)")
+        n_nodes = n_nodes or int(os.environ.get("CIRCUIT_TREE_NODES", "48"))
+        branch = branch or int(os.environ.get("CIRCUIT_TREE_BRANCH", "2"))
+        max_depth = max_depth or int(os.environ.get("CIRCUIT_TREE_DEPTH", "24"))
+        beam = beam or int(os.environ.get("CIRCUIT_TREE_BEAM", "4"))
+        _naive = os.environ.get("CIRCUIT_TREE_NAIVE") == "1"
+        sid = next(self._session_ids)
+        local = {"rounds": 0, "accepted": 0, "proposed": 0, "window": []}
+        try:
+            ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
+            hidden = self._relay(sid, 0, self.embed(ids))            # prefill the prompt KV
+            head = int(self.lm_head(self.norm(hidden))[0, -1].argmax())
+            produced, prev_text, pos = [], "", ids.shape[1]
+            if head in self._eos_ids:
+                return
+            produced.append(head); prev_text = self.tok.decode(produced); yield prev_text
+            while len(produced) < n_new:
+                base = (torch.cat([ids, torch.tensor([produced[:-1]], device=self.device,
+                                                     dtype=torch.long)], 1)
+                        if len(produced) > 1 else ids)
+                nodes = (self._build_tree(base, head, n_nodes, branch, max_depth) if _naive
+                         else self._build_tree_batched(base, head, n_nodes, branch, max_depth, beam))
+                flat = torch.tensor([[n["tok"] for n in nodes]], device=self.device)
+                tpos = torch.tensor([pos + n["depth"] for n in nodes], device=self.device)
+                parents = torch.tensor([n["parent"] for n in nodes], device=self.device)
+                th = self._relay_tree(sid, pos, self.embed(flat), tpos, parents)
+                logits = self.lm_head(self.norm(th))[0].float()
+                committed, path, bonus = self._accept_tree(nodes, logits)
+                self._kv_tree_keep(sid, pos, path)
+                pos += len(path)
+                local["rounds"] += 1
+                local["accepted"] += len(path) - 1
+                local["proposed"] += len(nodes) - 1
+                head = bonus
+                for t in committed:
+                    if t in self._eos_ids or len(produced) >= n_new:
+                        return
+                    produced.append(t)
+                    text = self.tok.decode(produced)
+                    if len(text) > len(prev_text):
+                        yield text[len(prev_text):]
+                        prev_text = text
+        finally:
+            self._merge_spec(local)
+            self._reset_sessions(sid)
 
     # ── Win B: intra-step batching (the static batch primitive the scheduler drives) ──
     def _batch_inputs(self, prompts: List[str]):
@@ -646,7 +971,7 @@ class Coordinator:
                 self._eagle_head = load_eagle_head(
                     os.environ["CIRCUIT_EAGLE_HEAD"], self._model, self.device)
             return EagleDraft(self._eagle_head, self._model.model.embed_tokens,
-                              self._model.lm_head, device=self.device)
+                              self._model.lm_head, self.norm, device=self.device)
         return GreedyDraft(self._draft_model or self._model, device=self.device)
 
     @torch.no_grad()
@@ -677,11 +1002,13 @@ class Coordinator:
         a separate model (CIRCUIT_DRAFT) or an EAGLE head (CIRCUIT_DRAFT_KIND=eagle)."""
         if self._draft_kind == "model" and self._draft_model is None:
             raise RuntimeError("generate_speculative_stream requires a draft model (set CIRCUIT_DRAFT)")
-        sid = next(self._session_ids)
+        sid = None
+        ids = None
         local = {"rounds": 0, "accepted": 0, "proposed": 0, "window": []}
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
-            target = SocketTarget(self, sid)
+            sid, prefilled = self._begin_session(ids)   # reuse warm system-prompt KV if it matches
+            target = SocketTarget(self, sid, prefilled)
             draft = self._make_draft()
             produced: List[int] = []
             prev_text = ""
@@ -695,7 +1022,8 @@ class Coordinator:
                     prev_text = text
         finally:
             self._merge_spec(local)
-            self._reset_sessions(sid)
+            if sid is not None:
+                self._end_session(sid, ids)   # keep the session warm as the prefix cache
 
     def _merge_spec(self, local: dict):
         """Fold one finished call's speculative stats into the cumulative counters.
@@ -769,19 +1097,38 @@ class SocketTarget:
     KV_CTRL truncate to every stage. KV length is tracked locally (the stages
     track their own; this just mirrors it for the scheduler)."""
 
-    def __init__(self, coord: "Coordinator", session: int):
+    def __init__(self, coord: "Coordinator", session: int, prefilled: int = 0):
         self.coord = coord
         self.session = session
-        self._kv = 0
+        self._prefilled = prefilled       # tokens of the prompt already warm in this session's KV
+        self._kv = prefilled
+        self._last_hidden = None
 
     def kv_len(self) -> int:
         return self._kv
 
+    def last_hidden(self) -> torch.Tensor:
+        """The mesh's final pre-norm hidden [1,T,D] from the most recent forward_tokens — the
+        feature an EAGLE draft conditions on. Already in hand here (the coordinator applies
+        norm+lm_head locally), so EAGLE adds zero extra hops."""
+        return self._last_hidden
+
     @torch.no_grad()
     def forward_tokens(self, token_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+        # Prefix cache: on the prompt prefill (start_pos==0) the session's KV already holds
+        # token_ids[:self._prefilled] (the shared system-prompt prefix), so relay only the
+        # divergent suffix at that position. The returned logits' last row is unchanged, which
+        # is all the speculative loop reads.
+        if start_pos == 0 and self._prefilled > 0:
+            suffix = token_ids[:, self._prefilled:]
+            hidden = self.coord._relay(self.session, self._prefilled, self.coord.embed(suffix))
+            self._kv = token_ids.shape[1]
+            self._last_hidden = hidden
+            return self.coord.lm_head(self.coord.norm(hidden))
         hidden = self.coord.embed(token_ids)
         hidden = self.coord._relay(self.session, start_pos, hidden)
         self._kv = start_pos + token_ids.shape[1]
+        self._last_hidden = hidden
         return self.coord.lm_head(self.coord.norm(hidden))
 
     def rollback(self, length: int) -> None:

@@ -326,9 +326,19 @@ class Handler(BaseHTTPRequestHandler):
                     # a higher K amortizes an expensive (e.g. cross-DC) round-trip over more
                     # tokens, at the cost of more wasted draft compute when acceptance is low.
                     _spec_k = int(body.get("spec_k") or os.environ.get("CIRCUIT_SPEC_K", "4"))
-                    gen = (_coord.generate_speculative_stream(prompt, max_tokens, K=_spec_k)
-                           if _coord.has_draft()
-                           else _coord.generate_stream(prompt, max_tokens))
+                    # tree drafting (verify a draft TREE per round-trip) when enabled globally
+                    # (CIRCUIT_TREE=1) or per-request ("tree": true) — lets us A/B on the live
+                    # mesh with no restart. Falls back to linear speculative, then plain greedy.
+                    if (body.get("tree") or _coord.has_tree()) and getattr(_coord, "_draft_model", None) is not None:
+                        gen = _coord.generate_tree_stream(prompt, max_tokens,
+                                                          n_nodes=body.get("tree_nodes"),
+                                                          branch=body.get("tree_branch"),
+                                                          max_depth=body.get("tree_depth"),
+                                                          beam=body.get("tree_beam"))
+                    elif _coord.has_draft():
+                        gen = _coord.generate_speculative_stream(prompt, max_tokens, K=_spec_k)
+                    else:
+                        gen = _coord.generate_stream(prompt, max_tokens)
                     for piece in gen:
                         chunk = {"id": cid, "object": "chat.completion.chunk",
                                  "created": created, "model": model,

@@ -64,15 +64,25 @@ class Stage:
     @torch.no_grad()
     def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor,
                 past_key_values=None, use_cache: bool = False,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                attention_mask: Optional[torch.Tensor] = None,
+                tree_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Run this stage's layer block. Returns the updated hidden state.
 
         attention_mask: optional 2D padding mask [B, kv_len] (1=real, 0=pad) for
         ragged batched decode — create_causal_mask folds it into the causal mask so
         each row attends only to its own real KV. None (default) = pure causal,
-        byte-identical to the single-sequence path."""
+        byte-identical to the single-sequence path.
+
+        tree_mask: optional pre-built 4D additive mask [B, 1, q_len, kv_len] for TREE
+        verification — each draft-tree node attends to the prefix + its own ancestors
+        (not causal-by-position). When given it is used verbatim for every layer
+        (rotary still uses the depth-based position_ids); attention_mask is ignored.
+        Requires an SDPA/eager attention impl (flash-attn can't take arbitrary masks)."""
         position_embeddings = self.rotary_emb(hidden, position_ids)
-        masks = self._masks(hidden, position_ids, past_key_values, attention_mask)
+        if tree_mask is not None:
+            masks = {"full_attention": tree_mask, "sliding_attention": tree_mask}
+        else:
+            masks = self._masks(hidden, position_ids, past_key_values, attention_mask)
         for gidx, layer in zip(self.layer_indices, self.layers):
             hidden = layer(
                 hidden,

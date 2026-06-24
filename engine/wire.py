@@ -63,11 +63,16 @@ BATCH_ACTIVATION = 10  # batched hidden states (Win B): [B,T,D] + per-row pos + 
 CHAIN_ACTIVATION = 11  # chain relay: encode_route(downstream) ++ pack_activation(...) —
                        # the node forwards node->next instead of returning to the coordinator
                        # (engine/chain.py, docs/CHAIN_RELAY.md). Gated by CIRCUIT_CHAIN.
+TREE_ACTIVATION = 12   # tree-drafting verify: [1,T,D] tree hidden + per-node depth pos +
+                       # parent pointers; the stage reconstructs the tree mask and appends the
+                       # tree KV. Paired with a KVOP_TREE_KEEP control to compact to the
+                       # accepted path. Gated by CIRCUIT_TREE.
 
 _NAMES = {
     HELLO: "HELLO", WELCOME: "WELCOME", ACTIVATION: "ACTIVATION", RESULT: "RESULT",
     KV_CTRL: "KV_CTRL", PING: "PING", PONG: "PONG", ERROR: "ERROR", BYE: "BYE",
     BATCH_ACTIVATION: "BATCH_ACTIVATION", CHAIN_ACTIVATION: "CHAIN_ACTIVATION",
+    TREE_ACTIVATION: "TREE_ACTIVATION",
 }
 
 

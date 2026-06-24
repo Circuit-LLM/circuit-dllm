@@ -125,8 +125,56 @@ def unpack_batch_activation(payload: bytes):
     return batch_id, position, flags, hidden, position_ids, attention_mask
 
 
+def build_tree_mask(parents, prefix_len: int, device, dtype) -> torch.Tensor:
+    """Reconstruct the 4D tree attention mask [1,1,T,prefix_len+T] from parent pointers.
+    Tree node i attends to the whole prefix [0,prefix_len) plus its own ancestor chain
+    (parents[i], parents[parents[i]], ... , -1 = attaches to the prefix). Additive: 0 where
+    attended, large-negative elsewhere. Shared by the coordinator (build) and each stage
+    (reconstruct from the few bytes of parent pointers carried on the wire)."""
+    T = len(parents)
+    neg = torch.finfo(dtype).min
+    m = torch.full((T, prefix_len + T), neg, device=device, dtype=dtype)
+    for i in range(T):
+        m[i, :prefix_len] = 0.0
+        a = i
+        while a != -1:
+            m[i, prefix_len + a] = 0.0
+            a = int(parents[a])
+    return m[None, None]
+
+
+def pack_tree_activation(session_id: int, pos: int, hidden: torch.Tensor,
+                         tree_positions: torch.Tensor, tree_parents: torch.Tensor,
+                         flags: int = FLAG_NONE) -> bytes:
+    """Payload for a wire.TREE_ACTIVATION frame: the [1,T,D] tree hidden plus the per-node
+    depth position_ids [T] and parent pointers [T] (int32). `pos` = the prefix length already
+    in the stage's KV; the tree nodes append at slots pos..pos+T-1. Length-delimited."""
+    parts = [pack_tensor(hidden),
+             pack_tensor(tree_positions.to(torch.int32)),
+             pack_tensor(tree_parents.to(torch.int32))]
+    body = b"".join(struct.pack(">I", len(p)) + p for p in parts)
+    return struct.pack(">IIB", session_id & 0xFFFFFFFF, pos & 0xFFFFFFFF, flags) + body
+
+
+def unpack_tree_activation(payload: bytes):
+    """Inverse -> (session_id, pos, flags, hidden, tree_positions, tree_parents)."""
+    if len(payload) < 9:
+        raise TensorError("tree activation payload too short")
+    session_id, pos, flags = struct.unpack(">IIB", payload[:9])
+    off = 9
+    tensors = []
+    for _ in range(3):
+        (n,) = struct.unpack(">I", payload[off:off + 4])
+        off += 4
+        tensors.append(unpack_tensor(payload[off:off + n]))
+        off += n
+    hidden, tree_positions, tree_parents = tensors
+    return session_id, pos, flags, hidden, tree_positions, tree_parents
+
+
 __all__ = [
     "FLAG_NONE", "FLAG_LAST_STAGE", "TensorError",
     "pack_tensor", "unpack_tensor", "pack_activation", "unpack_activation",
     "pack_batch_activation", "unpack_batch_activation",
+    "build_tree_mask", "pack_tree_activation", "unpack_tree_activation",
 ]

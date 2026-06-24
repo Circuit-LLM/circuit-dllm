@@ -15,6 +15,7 @@ and truncate_to(length) (roll the cache back after rejected speculative tokens).
 
 from __future__ import annotations
 
+import torch
 from transformers.cache_utils import DynamicCache
 
 
@@ -63,3 +64,22 @@ class StageKV(DynamicCache):
                 t = getattr(layer, attr, None)
                 if t is not None and hasattr(t, "shape") and t.dim() >= 3:
                     setattr(layer, attr, t[..., :length, :].contiguous())
+
+    def keep_tree_path(self, prefix_len: int, accepted_slots) -> None:
+        """Compact the KV after a tree verify: keep the prefix [0, prefix_len) plus the
+        accepted-path tree nodes, dropped to a contiguous run. This is what lets tree
+        drafting commit a whole accepted branch in ONE round-trip — no re-prefill.
+
+        accepted_slots: tree-node indices (0-based within the tree batch just appended,
+        i.e. tree node j lives at absolute cache position prefix_len + j) on the accepted
+        path, in order. Resulting length = prefix_len + len(accepted_slots).
+        """
+        keep = list(range(prefix_len)) + [prefix_len + int(s) for s in accepted_slots]
+        for layer in self.layers:
+            if not layer.get_seq_length():
+                continue
+            for attr in ("keys", "values", "key_cache", "value_cache"):
+                t = getattr(layer, attr, None)
+                if t is not None and hasattr(t, "shape") and t.dim() >= 3:
+                    idx = torch.as_tensor(keep, dtype=torch.long, device=t.device)
+                    setattr(layer, attr, t.index_select(-2, idx).contiguous())

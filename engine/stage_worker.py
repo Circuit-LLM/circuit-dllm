@@ -25,7 +25,8 @@ import threading
 import torch
 
 from engine import wire, chain
-from engine.tensors import pack_activation, unpack_activation, unpack_batch_activation
+from engine.tensors import (pack_activation, unpack_activation, unpack_batch_activation,
+                            unpack_tree_activation, build_tree_mask)
 from engine.stage import Stage, stage_for_range
 from engine.kv import StageKV
 from engine.model import load_model
@@ -35,6 +36,8 @@ from engine.log import make_logger
 KVOP_RESET = 1
 KVOP_TRUNCATE = 2
 KVOP_FREE = 3       # drop the session/batch entry entirely (free its KV; Win B batches)
+KVOP_TREE_KEEP = 4  # tree drafting: compact KV to prefix + accepted-path slots (payload carries
+                    # prefix_len in `arg` then n_slots + the slot indices)
 
 
 def _position_ids(seq_len: int, start_pos: int, device):
@@ -208,6 +211,27 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_c
                                     use_cache=True, attention_mask=attn)
             wire.write_frame(conn, key, wire.RESULT, pack_activation(batch_id, pos, out.cpu()))
 
+        elif mt == wire.TREE_ACTIVATION:
+            # Tree-drafting verify: a [1,T,D] tree batch with per-node depth position_ids and
+            # parent pointers. The prefix KV is already in this session's cache (from the prompt
+            # prefill + prior accepted rounds); pos = that prefix length. The stage reconstructs
+            # the tree mask (node -> prefix + its ancestors), appends the tree KV at slots
+            # pos..pos+T-1, and returns the per-node hidden. A following KVOP_TREE_KEEP compacts
+            # the cache to just the accepted path.
+            session, pos, _flags, hidden, tpos, parents = unpack_tree_activation(payload)
+            hidden = hidden.to(device)
+            tpos = tpos.to(device).long().view(1, -1)
+            parents = [int(x) for x in parents.tolist()]
+            cache = sessions.get(session)
+            if cache is None or pos == 0:
+                cache = StageKV(config)
+                sessions[session] = cache
+            tm = build_tree_mask(parents, pos, device, hidden.dtype)
+            with compute_lock:
+                out = stage.forward(hidden, tpos, past_key_values=cache,
+                                    use_cache=True, tree_mask=tm)
+            wire.write_frame(conn, key, wire.RESULT, pack_activation(session, pos, out.cpu()))
+
         elif mt == wire.CHAIN_ACTIVATION:
             # Chain relay: compute my layers, then FORWARD the activation to the next hop
             # (carrying the shortened route) and bubble its reply back upstream — instead
@@ -254,6 +278,13 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_c
             session, op, arg = struct.unpack(">IBI", payload[:9])
             if op == KVOP_FREE:
                 sessions.pop(session, None)         # drop the entry; frees its KV
+            elif op == KVOP_TREE_KEEP:
+                # compact KV to prefix [0,arg) + the accepted-path tree slots that follow
+                cache = sessions.get(session)
+                if cache is not None:
+                    (n,) = struct.unpack(">I", payload[9:13])
+                    slots = struct.unpack(">%dI" % n, payload[13:13 + 4 * n]) if n else ()
+                    cache.keep_tree_path(arg, slots)
             else:
                 cache = sessions.get(session)
                 if cache is not None:

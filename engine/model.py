@@ -12,15 +12,20 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 
-def load_model(model_id: str, dtype=None, device: str = "cpu"):
+def load_model(model_id: str, dtype=None, device: str = "cpu", attn_implementation=None):
     # GPU: fp16 + device_map (required for quantized AWQ/GPTQ — can't .to() after
     # load). CPU: fp32 + .to(). dtype defaults by device unless overridden.
+    # attn_implementation: e.g. "sdpa" — tree drafting passes a 4D (non-causal) mask to
+    # the draft, which flash-attn can't take; sdpa can.
     if dtype is None:
         dtype = torch.float16 if device != "cpu" else torch.float32
+    kw = dict(dtype=dtype)
+    if attn_implementation:
+        kw["attn_implementation"] = attn_implementation
     if device == "cpu":
-        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype).to(device)
+        model = AutoModelForCausalLM.from_pretrained(model_id, **kw).to(device)
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map=device)
+        model = AutoModelForCausalLM.from_pretrained(model_id, device_map=device, **kw)
     return model.eval()
 
 
