@@ -5,23 +5,38 @@ that turns "cloud GPUs only" into "anyone with a desktop GPU." **IMPLEMENTED** (
 + node/coordinator integration; relay server covered by `tests/test_relay.py`). Needs validation
 on a real cross-NAT mesh.
 
-## Run it
+## When you need it
+
+**Only for home-desktop GPUs behind NAT.** A cloud GPU (RunPod/Vast/any public-IP box — including
+every node in the live mesh today) is directly reachable and needs **no** relay. The relay exists
+solely so someone's home PC, which can't accept inbound connections, can still contribute without
+configuring their router.
+
+## Where to run it — co-located on the coordinator (recommended)
+
+The relay needs no GPU (pure sockets) and the coordinator reaches it over **localhost**, so the
+clean home is the coordinator pod itself — only the relay's port needs to be public. The deploy
+script does this when you set `CIRCUIT_RELAY_HOST=1` **and the pod exposes the relay port**:
 
 ```bash
-# relay server (a small public box near the coordinator):
-CIRCUIT_RELAY_TOKEN=<shared-coord-token> python3 -m engine.relay --port 18940
+# coordinator pod: expose CIRCUIT_RELAY_PORT (default 18940) at deploy time, then:
+CIRCUIT_RELAY_HOST=1 bash deploy/run-coordinator-mesh.sh
+# → run-relay.sh runs alongside the coordinator (self-supervising, survives restarts)
 
-# coordinator: presents the token when dialing through the relay
-export CIRCUIT_RELAY_TOKEN=<shared-coord-token>
-
-# home node: just set the relay URL — the one-line installer passes it through
-CIRCUIT_RELAY_URL=relay.circuitllm.xyz:18940 CIRCUIT_RELAY_TOKEN=<...> ...
+# home node: point at the coordinator pod's PUBLIC relay endpoint (the one-liner passes it through)
+CIRCUIT_RELAY_URL=<coordinator-public-ip>:<exposed-relay-port> curl -fsSL https://circuitllm.xyz/join | bash
 ```
+
+> RunPod fixes a pod's exposed ports at creation, so add the relay port to the coordinator pod's
+> port list **when it's deployed** — you can't bolt it onto a running pod without recreating it.
+> A standalone host works too (`python3 -m engine.relay --port 18940` on any cheap public box +
+> a `relay.circuitllm.xyz` DNS record), but co-locating avoids a second machine entirely.
 
 A relay node advertises `reachability:"relay"` with the relay's address as its endpoint, so the
 coordinator's `_conn_for` dials *through* the relay transparently — the rest of the engine is
-unchanged. Knobs: `CIRCUIT_RELAY_URL` (node), `CIRCUIT_RELAY_TOKEN` (node + coordinator),
-`CIRCUIT_RELAY_PORT` (server).
+unchanged. Knobs: `CIRCUIT_RELAY_HOST`/`CIRCUIT_RELAY_PORT` (coordinator pod), `CIRCUIT_RELAY_URL`
+(node), `CIRCUIT_RELAY_TOKEN` (relay + coordinator; empty = open dial — fine since the wire is
+encrypted end-to-end, set it to gate who can bridge).
 
 ---
 

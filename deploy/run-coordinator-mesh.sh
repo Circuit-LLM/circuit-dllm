@@ -38,4 +38,14 @@ export CIRCUIT_COORDINATOR_ADVERTISE="${CIRCUIT_COORDINATOR_ADVERTISE:-}"
 # unsigned joins (legacy/debug).
 export CIRCUIT_MESH_VERIFY_SIG="${CIRCUIT_MESH_VERIFY_SIG:-1}"
 
+# ── co-located NAT relay (docs/RELAY.md) ─────────────────────────────────────
+# Set CIRCUIT_RELAY_HOST=1 to host the relay ON THIS POD so home-desktop GPUs behind NAT can join
+# (they dial OUT to it; the coordinator reaches them THROUGH it over localhost). Cloud nodes don't
+# need the relay. The pod MUST EXPOSE CIRCUIT_RELAY_PORT (default 18940) publicly so home nodes can
+# connect. No GPU needed. Backgrounded + self-supervising; survives coordinator restarts.
+if [ "${CIRCUIT_RELAY_HOST:-0}" = "1" ]; then
+  echo "[coord] hosting co-located NAT relay on :${CIRCUIT_RELAY_PORT:-18940} — EXPOSE this port on the pod"
+  setsid bash "$ENGINE_DIR/deploy/run-relay.sh" </dev/null >>/root/relay.log 2>&1 &
+fi
+
 exec python3 -u -m engine.api
