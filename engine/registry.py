@@ -24,7 +24,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
-from engine.topology import Topology, Node, PROBATION, TRUSTED
+from engine.topology import Topology, Node, PROBATION, TRUSTED, READY
 
 
 def derive_node_key(master_secret: bytes, node_id: str) -> bytes:
@@ -244,6 +244,15 @@ class Registry:
                 share = (pool * w // total) if i < len(weights) - 1 else (pool - assigned)
                 self.accrued[nid] = self.accrued.get(nid, 0) + share
                 assigned += share
+
+    def payout_eligible(self) -> List[dict]:
+        """[{node_id, wallet, trust}] for live (READY) nodes that declared a payout wallet — the set
+        the off-chain payout executor distributes revenue across (∝ stake, weighted/gated by the
+        executor via StakePoint). Read-only; the executor polls this, then pays from the treasury."""
+        with self._lock:
+            return [{"node_id": nid, "wallet": self.wallets[nid], "trust": n.trust}
+                    for nid, n in self.topo.nodes.items()
+                    if n.state == READY and self.wallets.get(nid)]
 
     def settle(self, min_payout_raw: int) -> List[Tuple[str, int]]:
         """Return the batch of (wallet, amount_raw) for nodes whose accrued balance

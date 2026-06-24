@@ -122,6 +122,8 @@ def _handler(registry, now_fn, verify_sig):
             if self.path == "/health":
                 snap = registry.snapshot()
                 return self._send(200, {"ok": True, "coverage_ok": snap["coverage_ok"]})
+            if self.path == "/payouts/eligible":   # live nodes + payout wallets (the payout executor polls this)
+                return self._send(200, {"nodes": registry.payout_eligible()})
             return self._send(404, {"error": "not found"})
 
     return H
