@@ -19,8 +19,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 # nvidia-smi (capacity detection) ships via the NVIDIA Container Toolkit at runtime; we only
 # need a couple of host tools for the entrypoint.
+# build-essential: the -runtime base has no gcc, and gptqmodel pulls a source-built dep (pypcre).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl \
+        ca-certificates curl build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Engine deps. gptqmodel provides the Marlin AWQ kernels (2.1x over bnb); cryptography backs
