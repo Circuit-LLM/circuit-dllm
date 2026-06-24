@@ -26,13 +26,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Engine deps. gptqmodel provides the Marlin AWQ kernels (2.1x over bnb); cryptography backs
 # the ed25519 node identity + the ChaCha20 data wire. Pinned-ish for reproducibility.
-RUN pip install --upgrade pip && pip install \
-        "transformers>=4.44,<4.49" \
-        "huggingface_hub>=0.24" \
-        "accelerate>=0.33" \
-        "gptqmodel>=1.0" \
-        "cryptography>=42" \
-        "numpy<2"
+RUN pip install --upgrade pip && \
+    pip install "transformers>=4.44,<4.49" "huggingface_hub>=0.24" "accelerate>=0.33" \
+                "cryptography>=42" "numpy<2" && \
+    # gptqmodel's build reads torch's metadata, which pip's build isolation hides (torch is in
+    # the base image) → install it without isolation so it sees the installed torch.
+    pip install --no-build-isolation "gptqmodel>=1.0"
 
 # Bake the engine (build context = the circuit-dllm repo root).
 WORKDIR /opt/circuit-engine
