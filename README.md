@@ -78,6 +78,20 @@ The split leaves exactly one network crossing in the per-token loop. **Predictiv
 
 So one network round-trip yields several tokens instead of one. The committed output is **token-for-token identical to plain greedy decoding** — the full model's argmax decides every token; the draft only affects *speed*, never *which* tokens. Proven for any draft (right or wrong) by the test suite. Enable it by setting `CIRCUIT_DRAFT` to a small model that shares the target's tokenizer.
 
+### System-prompt prefix cache (fast first token)
+
+Predictive drafting speeds up *per-token* decode, but the **first** token still waits on the
+prefill — and chat apps resend the same (often large) system prompt on every request, so that
+prefill dominates time-to-first-token. The prefix cache removes it: each concurrency slot keeps a
+**warm session** whose KV holds the longest token prefix it shares with the slot's previous
+request. A new request rolls that KV back to the shared prefix and prefills **only the divergent
+suffix** (the user's new message), instead of re-running the whole system prompt through the mesh.
+
+The output is unchanged — it's the same KV the full prefill would have produced — and it falls back
+to a fresh prefill whenever a stage holding the warm KV isn't reachable. In practice this drops TTFT
+from several seconds to **sub-second** on every request after the first. On by default
+(`CIRCUIT_PREFIX_CACHE=1`); minimum shared-prefix length is `CIRCUIT_PREFIX_MIN` (default 16 tokens).
+
 ---
 
 ## Quick Start

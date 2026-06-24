@@ -38,6 +38,28 @@ assuming nodes are nearby. They make *genuinely distributed* nodes fast.
    (Qwen2.5-72B text) has NO published head → a SpecForge training run. Not worth it unless a
    higher single-stream bar is set after 1-3.
 
+### Shipped since (2026-06-24) — outcomes, not plans
+
+- **Speculation trees (§2.1) — BUILT, MEASURED, then REVERTED on the website.** Full distributed
+  tree-draft works end-to-end on the live 72B mesh (tree attention mask + cross-node KV
+  path-compaction; output equivalent to greedy). The efficient *batched* tree-draft (prefill the
+  prefix once, expand depth-by-depth) gives **+24% avg single-stream (up to +45%)** on SHORT
+  contexts. **But it regresses on long contexts**: the per-round draft re-prefills the prefix, so
+  with the website's ~750-tok system prompt it ran *slower* than the linear chain. Left **off on
+  the website** (linear + K=12) until the draft gets cross-round KV reuse. Lesson: validate the
+  lever on the *real* prompt shape (system prompt included), not bare prompts.
+- **Prefix-KV cache (Front 4) — BUILT + LIVE. The real single-stream latency win.** The dominant
+  cost wasn't decode tok/s — it was **TTFT**: the mesh re-prefilled the identical ~750-tok system
+  prompt every request (~4-6s before the first token). Now each concurrency slot keeps a **warm
+  session** (per-`_Conn`, lock-free at `MAX_CONCURRENCY=8`) whose mesh+local KV holds the longest
+  token prefix it shares with the slot's last prompt; a new request rolls that KV back to the
+  shared prefix (strict truncate; falls back to fresh if a route node's conn is down) and prefills
+  only the divergent suffix. **TTFT ~4s → 0.74s on the website (~6× on a real prompt; 12× on a
+  1668-tok one).** Output verified correct (the new message is incorporated, not the cached one).
+  Auto-applies to `generate_speculative_stream` (no API/website change). `CIRCUIT_PREFIX_CACHE`
+  (default on), `CIRCUIT_PREFIX_MIN=16`. Not yet wired into the tree/plain-greedy paths.
+- **Banked decode tuning:** **K=12** per-request spec_k (+12% single-stream; K=16 regresses).
+
 ---
 
 ## The frame
