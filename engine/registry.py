@@ -39,6 +39,8 @@ class Registry:
     topo: Topology
     master_secret: bytes
     coordinator_endpoint: Tuple                  # how a node reaches the coordinator
+    coordinator_wallet: str = ""                 # the coordinator's OWN payout wallet (it serves the co-located
+                                                 # layer slice [0, CIRCUIT_COORD_LAYERS); "" = hub not paid out)
     allowlist: Optional[Set[str]] = None         # None = open (default); a set = frozen kill-switch
     seed_nodes: Optional[Set[str]] = None        # bootstrap fleet → TRUSTED on register (verify ref)
     fee_bps: int = 1000                          # protocol fee, basis points (10%)
@@ -248,11 +250,19 @@ class Registry:
     def payout_eligible(self) -> List[dict]:
         """[{node_id, wallet, trust}] for live (READY) nodes that declared a payout wallet — the set
         the off-chain payout executor distributes revenue across (∝ stake, weighted/gated by the
-        executor via StakePoint). Read-only; the executor polls this, then pays from the treasury."""
+        executor via StakePoint). Read-only; the executor polls this, then pays from the treasury.
+
+        The coordinator serves the co-located slice [0, CIRCUIT_COORD_LAYERS) but isn't a registered
+        holder, so it's included explicitly when it declares its own payout wallet — otherwise the hub
+        does real compute for free."""
         with self._lock:
-            return [{"node_id": nid, "wallet": self.wallets[nid], "trust": n.trust}
-                    for nid, n in self.topo.nodes.items()
-                    if n.state == READY and self.wallets.get(nid)]
+            out = [{"node_id": nid, "wallet": self.wallets[nid], "trust": n.trust}
+                   for nid, n in self.topo.nodes.items()
+                   if n.state == READY and self.wallets.get(nid)]
+            if self.coordinator_wallet:
+                out.insert(0, {"node_id": "coordinator", "wallet": self.coordinator_wallet,
+                               "trust": TRUSTED})
+            return out
 
     def settle(self, min_payout_raw: int) -> List[Tuple[str, int]]:
         """Return the batch of (wallet, amount_raw) for nodes whose accrued balance

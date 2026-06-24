@@ -130,6 +130,7 @@ def _build_mesh():
                     coordinator_region=os.environ.get("CIRCUIT_REGION") or None,
                     route_by_latency=os.environ.get("CIRCUIT_ROUTE_LATENCY") == "1")
     reg = Registry(topo=topo, master_secret=secret, coordinator_endpoint=coord_ep,
+                   coordinator_wallet=os.environ.get("CIRCUIT_COORD_PAYOUT_WALLET", ""),
                    allowlist=allowlist, seed_nodes=seed_nodes)
     verify_sig = None
     if os.environ.get("CIRCUIT_MESH_VERIFY_SIG") == "1":
