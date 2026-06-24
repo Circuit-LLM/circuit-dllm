@@ -323,12 +323,37 @@ class Coordinator:
         conns = self._active_conn().conns
         sock = conns.get(node.node_id)
         if sock is None:
-            host, port = node.endpoint
-            # short timeout — a routed holder is READY, so this connects instantly;
-            # a dead one must fail fast so failover can move on (not hang ~300s).
-            sock = _connect((host, int(port)), self._node_key(node),
-                            timeout=_DYNAMIC_CONNECT_TIMEOUT)
+            if getattr(node, "reachability", "public") == "relay":
+                sock = self._relay_dial(node)        # NAT node — reach it through the relay
+            else:
+                host, port = node.endpoint
+                # short timeout — a routed holder is READY, so this connects instantly;
+                # a dead one must fail fast so failover can move on (not hang ~300s).
+                sock = _connect((host, int(port)), self._node_key(node),
+                                timeout=_DYNAMIC_CONNECT_TIMEOUT)
             conns[node.node_id] = sock
+        return sock
+
+    def _relay_dial(self, node):
+        """Reach a NAT node THROUGH the relay (docs/RELAY.md). Connect to the relay (the node's
+        advertised endpoint), ask it to bridge to this node_id, then speak the normal engine wire
+        over the piped socket — the relay only ever sees ciphertext frames. Raises like _connect
+        on failure so the caller's failover treats a dead relay/node the same as a dead direct one."""
+        from engine.relay import read_preamble, write_preamble
+        host, port = node.endpoint
+        sock = socket.create_connection((host, int(port)), timeout=_DYNAMIC_CONNECT_TIMEOUT)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            write_preamble(sock, {"role": "dial", "node_id": node.node_id,
+                                  "token": os.environ.get("CIRCUIT_RELAY_TOKEN", "")})
+            resp = read_preamble(sock)
+        except (OSError, ValueError) as e:
+            sock.close()
+            raise wire.WireError(f"relay dial to {node.node_id[:8]} failed: {e}")
+        if not resp.get("ok"):
+            sock.close()
+            raise wire.WireError(f"relay refused {node.node_id[:8]}: {resp.get('err')}")
+        sock.settimeout(_STAGE_READ_TIMEOUT)
         return sock
 
     def _drop_conn(self, node_id: str):

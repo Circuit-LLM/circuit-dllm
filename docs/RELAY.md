@@ -1,7 +1,27 @@
 # Circuit DLLM — NAT relay (home-desktop GPUs)
 
 How a GPU behind a home router joins the mesh **without port-forwarding**. This is the piece
-that turns "cloud GPUs only" into "anyone with a desktop GPU." Design doc — not yet built.
+that turns "cloud GPUs only" into "anyone with a desktop GPU." **IMPLEMENTED** (`engine/relay.py`
++ node/coordinator integration; relay server covered by `tests/test_relay.py`). Needs validation
+on a real cross-NAT mesh.
+
+## Run it
+
+```bash
+# relay server (a small public box near the coordinator):
+CIRCUIT_RELAY_TOKEN=<shared-coord-token> python3 -m engine.relay --port 18940
+
+# coordinator: presents the token when dialing through the relay
+export CIRCUIT_RELAY_TOKEN=<shared-coord-token>
+
+# home node: just set the relay URL — the one-line installer passes it through
+CIRCUIT_RELAY_URL=relay.circuitllm.xyz:18940 CIRCUIT_RELAY_TOKEN=<...> ...
+```
+
+A relay node advertises `reachability:"relay"` with the relay's address as its endpoint, so the
+coordinator's `_conn_for` dials *through* the relay transparently — the rest of the engine is
+unchanged. Knobs: `CIRCUIT_RELAY_URL` (node), `CIRCUIT_RELAY_TOKEN` (node + coordinator),
+`CIRCUIT_RELAY_PORT` (server).
 
 ---
 
@@ -65,14 +85,15 @@ relay **near the coordinator** so the added leg is the node's home uplink — wh
 critical path regardless. Expect home nodes to be the slowest stages; topology-aware routing
 (`TOPOLOGY_AWARE_ROUTING.md`) should weight them lighter / place them as a single short stage.
 
-## What to build
+## Status
 
-| Piece | Where | Effort |
-|------|-------|--------|
-| Relay server (control + data pairing, node-id auth, keepalive) | new `engine/relay.py` + a hosted service | medium |
-| Node-side relay dialer (control conn + on-demand data conns) | `engine/stage_worker.py` — `CIRCUIT_RELAY_URL` | medium |
-| Coordinator "dial via relay" | already transparent if the relay is advertised as the endpoint; add a relay-aware connect for the session tag | small |
-| Reconnect/backoff, idle reaping, metrics | relay + node | small |
+| Piece | Where | State |
+|------|-------|-------|
+| Relay server (control + data pairing, ed25519 node auth, keepalive) | `engine/relay.py` | DONE (loopback-tested) |
+| Node-side relay dialer (control conn + on-demand data conns) | `engine/stage_worker.py` — `CIRCUIT_RELAY_URL` | DONE |
+| Coordinator "dial via relay" | `coordinator._relay_dial` / `_conn_for` (reachability=relay) | DONE |
+| Reconnect/backoff (node control) | `_relay_client` | DONE |
+| Cross-NAT mesh validation; idle reaping + metrics; HA (multiple relays) | relay + node | TODO |
 
 **Phasing:** ship cloud/public-IP onboarding first (works today, biggest GPUs). Add the relay as
 Phase 3 so home desktops join with the same one-line installer — just `CIRCUIT_RELAY_URL` set.

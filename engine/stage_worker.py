@@ -98,11 +98,55 @@ def _serve_conn(conn, addr, key, stage, config, device, compute_lock, log):
                 pass
 
 
+def _parse_relay_addr(url: str):
+    """'host:port' or 'tcp://host:port' → (host, int(port)). The relay is a raw TCP endpoint."""
+    u = url.split("://", 1)[-1].strip().rstrip("/")
+    host, _, port = u.rpartition(":")
+    return host, int(port)
+
+
+def _relay_client(relay: dict, on_data, log):
+    """NAT-node side of the relay (docs/RELAY.md): hold an OUTBOUND control connection to the relay
+    open; on each OPEN signal dial an outbound DATA connection and hand it to `on_data`, which serves
+    it exactly like an inbound peer. Reconnects the control channel with backoff. This is what lets a
+    node behind a home router join with no inbound reachability / port-forwarding."""
+    import time
+    from engine.relay import read_preamble, write_preamble
+    host, port = _parse_relay_addr(relay["url"])
+    node_id, sk, token = relay["node_id"], relay["signing_key"], relay.get("token", "")
+    backoff = 1.0
+    while True:
+        try:
+            ctrl = socket.create_connection((host, port), timeout=15)
+            ctrl.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            write_preamble(ctrl, {"role": "control", "node_id": node_id})
+            nonce = bytes.fromhex(read_preamble(ctrl)["nonce"])
+            write_preamble(ctrl, {"sig": sk.sign(nonce).hex()})
+            if not read_preamble(ctrl).get("ok"):
+                raise ConnectionError("relay rejected control auth")
+            log("INFO", "relay control up", relay=f"{host}:{port}")
+            backoff = 1.0
+            while True:
+                msg = read_preamble(ctrl)          # blocks until the relay signals an OPEN
+                if msg.get("op") == "open":
+                    try:
+                        data = socket.create_connection((host, port), timeout=15)
+                        data.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        write_preamble(data, {"role": "data", "node_id": node_id, "tag": msg.get("tag", "")})
+                        on_data(data)
+                    except OSError as e:
+                        log("WARN", "relay data conn failed", err=str(e))
+        except Exception as e:                     # control dropped / auth failed — reconnect
+            log("WARN", "relay control dropped; reconnecting", err=str(e))
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
 def serve(port: int, start: int, end: int, model_id: str, key: bytes,
           device: str = "cpu", host: str = "0.0.0.0",
           prune: bool = False, keep_head: bool = False,
           shard: bool = False, other_device: str = "cpu", quant: str = "",
-          submodel: str = "", on_listening=None):
+          submodel: str = "", on_listening=None, relay=None):
     log = make_logger(f"stage[{start}:{end}]")
     log("INFO", "loading model", model=model_id, device=device, shard=shard,
         quant=quant or "fp16", submodel=submodel or "-")
@@ -156,6 +200,18 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
     log("INFO", "listening", port=port)
     if on_listening is not None:       # control-client mode flips JOINING -> READY here
         on_listening()
+
+    # NAT relay (docs/RELAY.md): a node behind a home router can't be dialed inbound, so it dials
+    # OUT to the relay and serves data connections the relay hands back — using this same stage
+    # context + key. Inbound accept still runs (harmless for a public node; never fires for NAT).
+    if relay is not None:
+        def _on_relay_data(sock):
+            _set_keepalive(sock)
+            threading.Thread(target=_serve_conn,
+                             args=(sock, ("relay", 0), key, stage, config, device, compute_lock, log),
+                             daemon=True).start()
+        threading.Thread(target=_relay_client, args=(relay, _on_relay_data, log), daemon=True).start()
+        log("INFO", "relay client started", relay=relay.get("url"))
 
     # One handler thread per peer. A stalled or half-open peer (e.g. the
     # coordinator pod restarting and its old socket lingering through the RunPod
@@ -359,13 +415,25 @@ def run_control_client(a):
     # externally-reachable port when given, else the bind port.
     advertise_port = a.advertise_port or a.port
 
+    # NAT relay (docs/RELAY.md): with CIRCUIT_RELAY_URL set, the node is unreachable inbound, so it
+    # advertises the RELAY's address (the coordinator dials the relay, which bridges to us) and marks
+    # itself reachability=relay. Otherwise it advertises its own externally-reachable host:port.
+    relay_url = os.environ.get("CIRCUIT_RELAY_URL", "").strip()
+    if relay_url:
+        relay_host, relay_port = _parse_relay_addr(relay_url)
+        endpoint = [relay_host, relay_port]
+        reachability = "relay"
+    else:
+        endpoint = [advertise, advertise_port]
+        reachability = "public"
+
     import json as _json, time as _time
     reg = {
         "node_id": a.node_id,
-        "endpoint": [advertise, advertise_port],
+        "endpoint": endpoint,
         "capacity_layers": a.capacity_layers,
         "model_fp": a.model_fp,
-        "reachability": "public",
+        "reachability": reachability,
         "region": a.region or "",          # coarse geo label for proximity routing (signed)
         "payout_wallet": a.payout_wallet or "",
         "ts": int(_time.time()),
@@ -471,10 +539,14 @@ def run_control_client(a):
         except Exception as e:
             clog("WARN", "ready post failed", error=str(e))
 
+    relay = ({"url": relay_url, "node_id": a.node_id, "signing_key": getattr(a, "_signing_key", None),
+              "token": os.environ.get("CIRCUIT_RELAY_TOKEN", "")} if relay_url else None)
+    if relay is not None and relay["signing_key"] is None:
+        raise SystemExit("CIRCUIT_RELAY_URL set but no node signing key — relay control auth needs one")
     try:
         serve(a.port, start, end, a.model, key, device=a.device, host=a.host,
               prune=a.prune, shard=a.shard, other_device=a.other_device, quant=a.quant,
-              submodel=submodel, on_listening=_on_listening)
+              submodel=submodel, on_listening=_on_listening, relay=relay)
     finally:
         stop.set()
         try:
