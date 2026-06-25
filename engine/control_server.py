@@ -87,7 +87,7 @@ def _node_json(registry, n, with_key=False):
     return out
 
 
-def _handler(registry, now_fn, verify_sig):
+def _handler(registry, now_fn, verify_sig, entry_require_sig=False):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -148,10 +148,24 @@ def _handler(registry, now_fn, verify_sig):
                 # Without verify_sig configured these are unavailable (403), so deploying them exposes
                 # nothing until orchestrator auth is turned on. /route/acquire returns the data-plane
                 # wire keys ONLY to a verified caller.
-                if self.path in ("/route/acquire", "/route/release", "/route/suspect",
-                                 "/entry/acquire", "/entry/release"):
+                # ── entry RPCs: orchestrator SELECTION (acquire_entry/release_entry) ──────────────
+                # These return only PUBLIC orchestrator endpoints (no wire keys), so they're OPEN by
+                # default — the stateless gateway calls them once per request with no signing. Set
+                # CIRCUIT_ENTRY_REQUIRE_SIG=1 to gate them like the route RPCs (e.g. if the control
+                # plane is internet-exposed and entry-load-skew abuse is a concern).
+                if self.path in ("/entry/acquire", "/entry/release"):
+                    if entry_require_sig and (verify_sig is None or not verify_sig(body)):
+                        return self._send(401, {"error": "entry RPCs require a valid signature"})
+                    session = str(body["session"])
+                    if self.path == "/entry/acquire":
+                        o = registry.acquire_entry(session)
+                        return self._send(200, {"orchestrator": (_node_json(registry, o) if o else None)})
+                    registry.release_entry(session)            # /entry/release
+                    return self._send(200, {"ok": True})
+                # ── route RPCs: hand out data-wire KEYS / failover → ALWAYS authenticated ─────────
+                if self.path in ("/route/acquire", "/route/release", "/route/suspect"):
                     if verify_sig is None:
-                        return self._send(403, {"error": "orchestrator RPCs require CIRCUIT_MESH_VERIFY_SIG=1"})
+                        return self._send(403, {"error": "route RPCs require CIRCUIT_MESH_VERIFY_SIG=1"})
                     if not verify_sig(body):
                         return self._send(401, {"error": "signature verification failed"})
                     if self.path == "/route/suspect":      # failover: a remote orchestrator reports a dead holder
@@ -164,13 +178,7 @@ def _handler(registry, now_fn, verify_sig):
                         except RuntimeError as e:              # coverage gap
                             return self._send(503, {"error": str(e)})
                         return self._send(200, {"route": [_node_json(registry, n, with_key=True) for n in route]})
-                    if self.path == "/route/release":
-                        registry.release_route(session)
-                        return self._send(200, {"ok": True})
-                    if self.path == "/entry/acquire":
-                        o = registry.acquire_entry(session)
-                        return self._send(200, {"orchestrator": (_node_json(registry, o) if o else None)})
-                    registry.release_entry(session)            # /entry/release
+                    registry.release_route(session)            # /route/release
                     return self._send(200, {"ok": True})
                 return self._send(404, {"error": "not found"})
             except PermissionError as e:
@@ -195,7 +203,8 @@ def _handler(registry, now_fn, verify_sig):
 
 def make_server(registry, host="0.0.0.0", port=18932, reap_interval=10.0,
                 now_fn=time.time, verify_sig=None,
-                rtt_probe_interval: float = 30.0) -> ThreadingHTTPServer:
+                rtt_probe_interval: float = 30.0,
+                entry_require_sig: bool = False) -> ThreadingHTTPServer:
     """Build the control server + start its background reaper. The caller runs
     srv.serve_forever() (typically in a daemon thread alongside the inference API)."""
     def reaper():
@@ -222,6 +231,6 @@ def make_server(registry, host="0.0.0.0", port=18932, reap_interval=10.0,
         from engine.rtt_probe import start_rtt_prober
         start_rtt_prober(registry, interval=rtt_probe_interval)
 
-    srv = ThreadingHTTPServer((host, port), _handler(registry, now_fn, verify_sig))
+    srv = ThreadingHTTPServer((host, port), _handler(registry, now_fn, verify_sig, entry_require_sig))
     log("INFO", "control channel listening", port=port)
     return srv

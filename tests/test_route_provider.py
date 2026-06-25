@@ -120,6 +120,29 @@ def test_suspect_rpc_marks_only_the_target():
         srv.shutdown()
 
 
+def test_entry_acquire_is_open_no_signature():
+    """Entry RPCs return only PUBLIC orchestrator endpoints, so they're callable WITHOUT a signature
+    (the stateless gateway's path) even when verify_sig is configured for the route RPCs."""
+    reg = _covered_registry()                        # 3 holders, no orchestrator registered
+    srv, url = _serve(reg, make_ed25519_verifier())  # route RPCs authed; entry stays open
+    try:
+        body = json.dumps({"session": "g1"}).encode()   # NOTE: no node_id/ts/sig
+        r = urllib.request.urlopen(urllib.request.Request(url + "/entry/acquire", data=body,
+                                   headers={"Content-Type": "application/json"}, method="POST"))
+        assert r.status == 200
+        resp = json.loads(r.read())
+        assert resp["orchestrator"] is None          # none registered yet → null, but the call is allowed
+        # and /route/acquire is STILL gated (unsigned → 401), proving only entry was opened
+        try:
+            urllib.request.urlopen(urllib.request.Request(url + "/route/acquire", data=body,
+                                   headers={"Content-Type": "application/json"}, method="POST"))
+            assert False, "expected 401 on unsigned /route/acquire"
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

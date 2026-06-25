@@ -434,7 +434,8 @@ def _run_control_plane():
     if not mesh:
         raise SystemExit("CIRCUIT_ROLE=control needs CIRCUIT_MESH=1 (+ CIRCUIT_MESH_LAYERS / _STAGES)")
     reg, chost, cport, reap, verify_sig = mesh
-    csrv = make_server(reg, host=chost, port=cport, reap_interval=reap, verify_sig=verify_sig)
+    csrv = make_server(reg, host=chost, port=cport, reap_interval=reap, verify_sig=verify_sig,
+                       entry_require_sig=os.environ.get("CIRCUIT_ENTRY_REQUIRE_SIG") == "1")
     log("INFO", "standalone control plane up", port=cport, stages=len(reg.topo.slots),
         replication=reg.topo.replication, verify_sig=bool(verify_sig))
     csrv.serve_forever()
