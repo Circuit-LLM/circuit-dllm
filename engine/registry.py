@@ -46,6 +46,14 @@ class Registry:
     fee_bps: int = 1000                          # protocol fee, basis points (10%)
     accrued: Dict[str, int] = field(default_factory=dict)  # node_id -> CIRC raw owed
     wallets: Dict[str, str] = field(default_factory=dict)  # node_id -> payout wallet
+    # adversarial hardening: a node the auditor evicts too many times is permanently BANNED
+    # (re-registration refused) so it can't oscillate dead<->ready forever. Counts + bans persist.
+    ban_after: int = 3                                     # evictions before a permanent ban
+    eviction_counts: Dict[str, int] = field(default_factory=dict)
+    banned: Set[str] = field(default_factory=set)
+    # durable state (accrued/wallets/eviction_counts/banned) survives a coordinator restart when
+    # state_path is set; otherwise it's re-derived from re-registration as before.
+    state_path: str = ""
     # one lock serializes control-plane mutations (control-server threads) against
     # the coordinator reading a route snapshot (inference thread).
     _lock: object = field(default_factory=threading.RLock, repr=False, compare=False)
@@ -54,9 +62,15 @@ class Registry:
     _load: Dict[str, int] = field(default_factory=dict, repr=False, compare=False)
     _session_load: Dict[object, list] = field(default_factory=dict, repr=False, compare=False)
 
+    def __post_init__(self):
+        if self.state_path:
+            self._load_state()
+
     # ── admission ─────────────────────────────────────────────────────────────
     def register(self, node: Node, now: float = 0.0, prefer_range=None) -> dict:
         with self._lock:
+            if node.node_id in self.banned:
+                raise PermissionError(f"node {node.node_id} is banned (evicted {self.ban_after}+ times)")
             if self.allowlist is not None and node.node_id not in self.allowlist:
                 raise PermissionError(f"node {node.node_id} not on allowlist")
             # prefer_range: a re-registering node asks for its already-loaded slot back.
@@ -68,6 +82,7 @@ class Registry:
             key = derive_node_key(self.master_secret, node.node_id)
             node.wire_key = key                    # coordinator uses this to talk to the node
             self.wallets[node.node_id] = node.payout_wallet
+            self._save_state()
             return {
                 "assignment": {"start": slot.start, "end": slot.end},
                 "model_fp": self.topo.model_fp,
@@ -102,10 +117,17 @@ class Registry:
     def record_check(self, node_id: str, ok: bool, promote_after: int = 3,
                      strike_max: int = 2) -> Optional[str]:
         """Fold one verification result into a node's trust (promote/evict). Returns
-        'promoted' | 'evicted' | None. Called by the auditor after each challenge."""
+        'promoted' | 'evicted' | None. Called by the auditor after each challenge.
+        After ban_after evictions a node is permanently banned (re-registration refused)."""
         with self._lock:
-            return self.topo.record_check(node_id, ok, promote_after=promote_after,
-                                          strike_max=strike_max)
+            action = self.topo.record_check(node_id, ok, promote_after=promote_after,
+                                            strike_max=strike_max)
+            if action == "evicted":
+                self.eviction_counts[node_id] = self.eviction_counts.get(node_id, 0) + 1
+                if self.eviction_counts[node_id] >= self.ban_after:
+                    self.banned.add(node_id)
+                self._save_state()
+            return action
 
     def audit_pairs(self) -> List[Tuple[str, str, int]]:
         """(probation_node, trusted_reference, slot_index) for every slot that has BOTH a
@@ -246,6 +268,7 @@ class Registry:
                 share = (pool * w // total) if i < len(weights) - 1 else (pool - assigned)
                 self.accrued[nid] = self.accrued.get(nid, 0) + share
                 assigned += share
+            self._save_state()
 
     def payout_eligible(self) -> List[dict]:
         """[{node_id, wallet, trust}] for live (READY) nodes that declared a payout wallet — the set
@@ -274,4 +297,38 @@ class Registry:
                 if amount >= min_payout_raw and self.wallets.get(nid):
                     batch.append((self.wallets[nid], amount))
                     self.accrued[nid] = 0
+            self._save_state()
             return batch
+
+    # ── durable state ──────────────────────────────────────────────────────────
+    # Persist the survive-a-restart bits (accrued earnings, payout wallets, eviction counts, bans)
+    # to a JSON file (atomic write). Best-effort: persistence must NEVER break the control plane.
+    def _save_state(self) -> None:
+        if not self.state_path:
+            return
+        import json, os, tempfile
+        try:
+            data = {"accrued": self.accrued, "wallets": self.wallets,
+                    "eviction_counts": self.eviction_counts, "banned": sorted(self.banned)}
+            d = os.path.dirname(self.state_path) or "."
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".regstate-")
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_path)
+        except Exception:
+            pass
+
+    def _load_state(self) -> None:
+        import json, os
+        try:
+            if not os.path.exists(self.state_path):
+                return
+            with open(self.state_path) as f:
+                data = json.load(f)
+            self.accrued.update({k: int(v) for k, v in data.get("accrued", {}).items()})
+            self.wallets.update(data.get("wallets", {}))
+            self.eviction_counts.update({k: int(v) for k, v in data.get("eviction_counts", {}).items()})
+            self.banned.update(data.get("banned", []))
+        except Exception:
+            pass

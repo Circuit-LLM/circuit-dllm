@@ -131,7 +131,9 @@ def _build_mesh():
                     route_by_latency=os.environ.get("CIRCUIT_ROUTE_LATENCY") == "1")
     reg = Registry(topo=topo, master_secret=secret, coordinator_endpoint=coord_ep,
                    coordinator_wallet=os.environ.get("CIRCUIT_COORD_PAYOUT_WALLET", ""),
-                   allowlist=allowlist, seed_nodes=seed_nodes)
+                   allowlist=allowlist, seed_nodes=seed_nodes,
+                   state_path=os.environ.get("CIRCUIT_REGISTRY_STATE", ""),
+                   ban_after=int(os.environ.get("CIRCUIT_BAN_AFTER", "3")))
     verify_sig = None
     if os.environ.get("CIRCUIT_MESH_VERIFY_SIG") == "1":
         from engine.control_server import make_ed25519_verifier
