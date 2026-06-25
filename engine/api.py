@@ -480,9 +480,12 @@ def _run_orchestrator():
     priv, node_id = _resolve_orch_identity()
     signer = make_ed25519_signer(priv, node_id)
 
-    api_port = int(os.environ.get("CIRCUIT_API_PORT", "18931"))
+    api_port = int(os.environ.get("CIRCUIT_API_PORT", "18931"))                 # local BIND port
     advertise = os.environ.get("CIRCUIT_ORCH_ADVERTISE") or os.environ.get("CIRCUIT_API_HOST", "127.0.0.1")
-    reg_body = {"endpoint": [advertise, api_port], "capacity_layers": 0,
+    # The endpoint the GATEWAY dials may be a proxied EXTERNAL port (RunPod maps ext->18931), so
+    # advertise that when set; else the bind port.
+    adv_port = int(os.environ.get("CIRCUIT_ORCH_ADVERTISE_PORT") or api_port)
+    reg_body = {"endpoint": [advertise, adv_port], "capacity_layers": 0,
                 "model_fp": os.environ.get("CIRCUIT_MESH_FP", ""), "orchestrator": True,
                 "reachability": os.environ.get("CIRCUIT_REACHABILITY", "public"),
                 "payout_wallet": os.environ.get("CIRCUIT_COORD_PAYOUT_WALLET", "")}
