@@ -2,14 +2,14 @@
 # Provision a clean L4 pod (250GB container disk, NO network volume) and hunt past
 # oversubscribed machines (needs >MIN_FREE MiB free VRAM). Usage:
 #   prov72.py <name> <role> <ports> <min_free_mib>
-import json, subprocess, sys, time, urllib.request, urllib.error
+import json, os, subprocess, sys, time, urllib.request, urllib.error
 
 def secret(n):
     return subprocess.check_output(["/home/watchtower/.openclaw/credentials/infisical-get.sh", n]).decode().strip()
 
 RPK = secret("RUNPOD_API_KEY")
 UA = {"User-Agent": "curl/8.5.0"}
-AUTHID = "cmqoxrw9s009s4qofbvitg0qh"           # Circuit-LLM private GHCR auth
+AUTHID = os.environ.get("CIRCUIT_RUNPOD_AUTHID", "cmqt3hdwr000z13yr15hgooyh")  # Circuit-LLM private GHCR auth (RunPod registry-auth id; recreate via saveRegistryAuth + override here if myself.containerRegistryAuths is empty — a stale id silently fails the image pull)
 IMAGE  = "ghcr.io/circuit-llm/circuit-dllm:v2-indep"   # has bitsandbytes baked
 NAME, ROLE, PORTS, MIN_FREE = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 CLOUD = sys.argv[5] if len(sys.argv) > 5 else "SECURE"      # SECURE | COMMUNITY
@@ -83,9 +83,9 @@ for attempt in range(1, 9):
     pid = create()
     if not pid:
         print(f"att {attempt}: create failed"); time.sleep(5); continue
-    # poll for RUNNING + ssh port
+    # poll for RUNNING + ssh port (window must cover a cold pull of a multi-GB private image)
     ip = sshport = None
-    for _ in range(40):
+    for _ in range(90):
         time.sleep(6)
         d = rest("GET", "pods/"+pid)
         if d.get("desiredStatus") == "RUNNING" and d.get("publicIp"):
