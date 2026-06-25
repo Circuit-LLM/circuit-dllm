@@ -44,13 +44,14 @@ def _serve(reg, verify_sig):
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
 
 
-def test_local_provider_byte_identical():
+def test_local_provider_passthrough_byte_identical():
     reg = _covered_registry()
-    hops = LocalRouteProvider(reg).acquire("s1")
-    assert len(hops) == 3
-    assert all(h.wire_key is not None for h in hops)             # local already holds the keys
-    assert all(h.layers is not None for h in hops)
-    LocalRouteProvider(reg).release("s1")
+    lp = LocalRouteProvider(reg)
+    nodes = lp.acquire("s1")                                     # Node objects, passthrough (byte-identical)
+    assert len(nodes) == 3 and all(n.wire_key is not None for n in nodes)
+    hops = lp.to_hops(nodes)                                     # normalize for wire callers
+    assert all(h.wire_key == n.wire_key and h.layers is not None for h, n in zip(hops, nodes))
+    lp.release("s1")
     assert reg.load_snapshot() == {}                            # released
 
 

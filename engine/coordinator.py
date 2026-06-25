@@ -24,6 +24,7 @@ from typing import List, Tuple
 import torch
 
 from engine import wire, chain
+from engine.route_provider import LocalRouteProvider
 from engine.tensors import (pack_activation, unpack_activation, pack_batch_activation,
                             pack_tree_activation, build_tree_mask)
 from engine.model import load_model, load_tokenizer, prune_to_layers
@@ -133,7 +134,8 @@ class Coordinator:
                  draft_model_id: Optional[str] = None,
                  shard: bool = False, other_device: str = "cpu", quant: str = "",
                  submodel: str = "",
-                 registry=None, max_concurrency: int = 1, chain_relay: bool = False):
+                 registry=None, max_concurrency: int = 1, chain_relay: bool = False,
+                 route_provider=None):
         """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
         so a big model loads once on this pod (layers + head) instead of a
         coordinator and a stage worker each loading the whole model. The model
@@ -232,6 +234,10 @@ class Coordinator:
         # path below is left exactly as-is (backward-compatible, zero risk).
         self.registry = registry
         self._dynamic = registry is not None
+        # Route acquisition goes through a provider (docs/FLOATING_COORDINATOR.md). Default is the
+        # in-process registry (LocalRouteProvider = pure passthrough → byte-identical); a head-only
+        # orchestrator injects a RemoteRouteProvider. None when there's no registry (static path).
+        self._route_provider = route_provider or (LocalRouteProvider(registry) if registry is not None else None)
         # Chain relay (CIRCUIT_CHAIN): forward the activation node→node instead of
         # returning it to the coordinator between every stage (the star). Only meaningful
         # in dynamic/mesh mode (it needs the route's node endpoints + per-node keys).
@@ -375,7 +381,7 @@ class Coordinator:
         if route is None or pos == 0:
             # acquire_route load-balances across each slot's replicas (replication → parallel
             # pipelines); ==route_snapshot when replication=1. Pins for the session's KV affinity.
-            route = self.registry.acquire_route(session)   # locked; raises on a coverage gap
+            route = self._route_provider.acquire(session)  # locked; raises on a coverage gap
             self._session_routes[session] = route
         if self._chain:                              # forward node→node (1 round-trip)
             return self._relay_chain(session, pos, hidden, route)
@@ -482,8 +488,8 @@ class Coordinator:
         conn = self._active_conn()
         if self._dynamic:
             self._session_routes.pop(session, None)
-            if self.registry is not None:
-                self.registry.release_route(session)   # free this session's replica load
+            if self._route_provider is not None:
+                self._route_provider.release(session)  # free this session's replica load
 
             for nid, sock in list(conn.conns.items()):
                 node = self.registry.topo.nodes.get(nid)

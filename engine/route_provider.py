@@ -28,15 +28,30 @@ class RouteHop:
 
 
 class LocalRouteProvider:
-    """In-process registry — today's behavior, byte-identical. The orchestrator IS the coordinator,
-    so it already holds the registry and the wire keys; this just normalizes to RouteHops."""
+    """In-process registry — today's behavior, BYTE-IDENTICAL. The orchestrator IS the coordinator,
+    so it already holds the registry + wire keys. This is a pure passthrough: it returns the
+    registry's Node objects unchanged, so the Coordinator's existing relay/failover/reset code (which
+    consumes Nodes) is untouched — there is no behavioral change at replication=1 or otherwise.
+
+    NOTE on the contract: LocalRouteProvider.acquire returns Node objects (in-process Coordinator);
+    RemoteRouteProvider.acquire returns RouteHops (the future head-only Orchestrator). Both are
+    "a dialable route"; unifying the Coordinator onto RouteHops is a follow-up done alongside the
+    remote-orchestrator build (they share the RouteHop consumer)."""
 
     def __init__(self, registry):
         self._reg = registry
 
-    def acquire(self, session) -> List[RouteHop]:
+    def acquire(self, session):
+        return self._reg.acquire_route(session)   # Node objects, exactly as the Coordinator expects
+
+    def release(self, session) -> None:
+        self._reg.release_route(session)
+
+    def to_hops(self, nodes) -> List[RouteHop]:
+        """Normalize Node objects → RouteHops (for callers that want the wire form; not used by the
+        in-process relay). Kept here so the Node→RouteHop mapping lives in one place."""
         hops: List[RouteHop] = []
-        for n in self._reg.acquire_route(session):          # raises on a coverage gap, as today
+        for n in nodes:
             sl = None
             if n.slot is not None and 0 <= n.slot < len(self._reg.topo.slots):
                 s = self._reg.topo.slots[n.slot]
@@ -44,9 +59,6 @@ class LocalRouteProvider:
             hops.append(RouteHop(node_id=n.node_id, host=n.endpoint[0], port=n.endpoint[1],
                                  layers=sl, reachability=n.reachability, wire_key=n.wire_key))
         return hops
-
-    def release(self, session) -> None:
-        self._reg.release_route(session)
 
 
 class RemoteRouteProvider:
