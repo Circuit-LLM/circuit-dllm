@@ -153,7 +153,7 @@ This is mostly a refactor — the engine was built with the joints:
 | Dimension | Effect | Why |
 |---|---|---|
 | Single-stream latency | ≈ unchanged (≈ −1 hop if head-only) | physics-bound; draft already at ~3.3 tok/round |
-| Aggregate throughput | **scales ~linearly with (orchestrators × replicas)** | no coordinator funnel; draft compute distributed |
+| Aggregate throughput | **scales with orchestrators** (measured **1.73× at conc 8**, 1→2 orchestrators on a scattered staging mesh; 1-orch plateaus, 2-orch scales — see §9 step 3) | no coordinator funnel; draft compute distributed |
 | Resilience | **no SPOF** (head or slice can die) | head-only orchestrators + KV-on-slices re-home |
 | VRAM cost | +~4 GB per node (head bundle) | embed+norm+lm_head+1.5B draft |
 
@@ -185,14 +185,28 @@ This is mostly a refactor — the engine was built with the joints:
      self-register + heartbeat + serve), gateway `resolveTarget`→acquire_entry→proxy (fallback to the
      fixed engine). Gated: scripts/e2e-orchestrator.sh (full three-process mesh on one pod serves a
      real completion); test_floating (slotless registration); gateway-entry.test.js; entry-open auth.*
-   - *Remaining — the empirical study: ≥2 orchestrators + replication≥2 holders on a **scattered**
-     mesh; measure aggregate throughput scaling (the only valid test; needs scale — at small model /
-     few lanes the orchestrator funnel doesn't dominate, so use the prod 72B mesh or synthetic
-     orchestrator load); confirm draft compute distributes; orchestrator-kill mid-session continues
-     the conversation. NB: re-home KV-affinity is automatic at replication=1; at replication>1 the
-     control plane must pin a session's replicas so re-home re-acquires the SAME holders (acquire_route
-     session-affinity across orchestrators). HTTP-level KV-reuse re-home needs the session-id carried
-     in the request so a survivor orchestrator attaches via generate_resume instead of re-prefilling.*
+   - *Measured (staging, scripts/staging-throughput.py) — a real scattered 4-DC mesh: standalone
+     control plane + 2 holder replicas (replication=2) + 2 head-only orchestrators, 1.5B target /
+     0.5B draft. Aggregate streaming tok/s, 1 orchestrator vs 2, concurrency sweep:*
+
+     | concurrency | 1 orchestrator | 2 orchestrators | speedup |
+     |---|---|---|---|
+     | 1 | 6.9 | 9.5 | (noise — conc 1 hits one orchestrator either way) |
+     | 2 | 9.5 | 10.4 | 1.09× |
+     | 4 | 9.8 | 11.6 | 1.18× |
+     | 8 | 9.3 | **16.0** | **1.73×** |
+
+     *The funnel signature is unmistakable: 1 orchestrator PLATEAUS at ~9–10 tok/s (orchestrator-bound
+     — adding concurrency doesn't help), while 2 orchestrators SCALE to 16 tok/s, and the gap GROWS
+     with load (1.09→1.18→1.73). The single coordinator is the throughput funnel; distributing
+     orchestration removes it. The gain is bounded here only by the 2-lane holder pool; at 72B
+     (1.5B draft + large lm_head per lane) with more replicas the orchestrator funnel dominates more,
+     so the effect is larger. Orchestrator-kill continuity is validated separately
+     (scripts/e2e-multi-orchestrator.sh: survivor keeps serving).*
+   - *Remaining: replication>1 re-home KV-affinity — the control plane must pin a session's replicas
+     so re-home re-acquires the SAME holders (acquire_route session-affinity across orchestrators);
+     and HTTP-level KV-reuse re-home — carry the session-id in the request so a survivor orchestrator
+     attaches via generate_resume instead of re-prefilling.*
 4. **Control-plane HA** (standby/Raft) — last, off the hot path.
 
 ## 10. Risks / open questions
