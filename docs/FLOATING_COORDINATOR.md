@@ -178,11 +178,21 @@ This is mostly a refactor — the engine was built with the joints:
      diverges.*
    - *Remaining for full 2: gateway `acquire_entry` (3.3) — only meaningful once orchestrators run as
      registered HTTP services (§4 below), so it lands with step 3.*
-3. **[NEXT — GPU mesh]** **Second orchestrator + session re-home on the shared replica pool + gateway
-   `acquire_entry`.** DoD: measure aggregate throughput scaling on a **scattered** mesh (the only
-   valid test); confirm draft compute distributes; orchestrator-kill mid-session continues the
-   conversation. NB: re-home KV-affinity is automatic at replication=1; at replication>1 the control
-   plane must pin a session's replicas so re-home re-acquires the SAME holders.
+3. **[SERVICE MODES + GATEWAY DONE; throughput study NEXT]** **Second orchestrator + session re-home
+   on the shared replica pool + gateway `acquire_entry`.**
+   - *Done — orchestrator registration (head-only, slotless), `CIRCUIT_ROLE=control` (standalone
+     control plane) + `CIRCUIT_ROLE=orchestrator` (head-only Coordinator + RemoteRouteProvider +
+     self-register + heartbeat + serve), gateway `resolveTarget`→acquire_entry→proxy (fallback to the
+     fixed engine). Gated: scripts/e2e-orchestrator.sh (full three-process mesh on one pod serves a
+     real completion); test_floating (slotless registration); gateway-entry.test.js; entry-open auth.*
+   - *Remaining — the empirical study: ≥2 orchestrators + replication≥2 holders on a **scattered**
+     mesh; measure aggregate throughput scaling (the only valid test; needs scale — at small model /
+     few lanes the orchestrator funnel doesn't dominate, so use the prod 72B mesh or synthetic
+     orchestrator load); confirm draft compute distributes; orchestrator-kill mid-session continues
+     the conversation. NB: re-home KV-affinity is automatic at replication=1; at replication>1 the
+     control plane must pin a session's replicas so re-home re-acquires the SAME holders (acquire_route
+     session-affinity across orchestrators). HTTP-level KV-reuse re-home needs the session-id carried
+     in the request so a survivor orchestrator attaches via generate_resume instead of re-prefilling.*
 4. **Control-plane HA** (standby/Raft) — last, off the hot path.
 
 ## 10. Risks / open questions
