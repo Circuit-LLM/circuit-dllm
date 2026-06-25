@@ -61,6 +61,10 @@ class Registry:
     # so concurrent sessions spread across a slot's replicas (R replicas → ~R parallel pipelines).
     _load: Dict[str, int] = field(default_factory=dict, repr=False, compare=False)
     _session_load: Dict[object, list] = field(default_factory=dict, repr=False, compare=False)
+    # floating coordinator (docs/FLOATING_COORDINATOR.md): entry-orchestrator load balancing —
+    # which head-capable node drives each session's decode loop. Separate from slice _load.
+    _entry_load: Dict[str, int] = field(default_factory=dict, repr=False, compare=False)
+    _session_entry: Dict[object, str] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self):
         if self.state_path:
@@ -241,6 +245,42 @@ class Registry:
                 self._load[nid] = c
             else:
                 self._load.pop(nid, None)
+
+    # ── floating coordinator: entry-orchestrator selection (docs/FLOATING_COORDINATOR.md) ───────
+    def acquire_entry(self, session) -> Optional[Node]:
+        """Pick the LEAST-LOADED orchestrator-capable READY node to drive this session's decode loop
+        (head + draft). Tie-break by node_id for determinism. Returns None when no orchestrator has
+        joined yet → the caller falls back to the in-process coordinator (today's behavior, so this
+        is inert until head-capable nodes register). Tracks entry load; release_entry frees it;
+        re-acquiring for the same session releases its prior pick first."""
+        with self._lock:
+            self._release_entry_locked(session)
+            cands = [n for n in self.topo.nodes.values() if n.orchestrator and n.state == READY]
+            if not cands:
+                return None
+            pick = min(cands, key=lambda n: (self._entry_load.get(n.node_id, 0), n.node_id))
+            self._entry_load[pick.node_id] = self._entry_load.get(pick.node_id, 0) + 1
+            self._session_entry[session] = pick.node_id
+            return pick
+
+    def release_entry(self, session) -> None:
+        """Free a session's entry-orchestrator load (call on end/reset/failover). Idempotent."""
+        with self._lock:
+            self._release_entry_locked(session)
+
+    def _release_entry_locked(self, session) -> None:
+        nid = self._session_entry.pop(session, None)
+        if nid is not None:
+            c = self._entry_load.get(nid, 0) - 1
+            if c > 0:
+                self._entry_load[nid] = c
+            else:
+                self._entry_load.pop(nid, None)
+
+    def entry_snapshot(self) -> Dict[str, int]:
+        """Active-session count per orchestrator (observability)."""
+        with self._lock:
+            return dict(self._entry_load)
 
     def load_snapshot(self) -> Dict[str, int]:
         """Active-session count per holder (observability / /health)."""

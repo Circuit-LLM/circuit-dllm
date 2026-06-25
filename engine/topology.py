@@ -198,6 +198,9 @@ class Node:
     region: Optional[str] = None # coarse geo label (e.g. "na-east") — a routing HINT,
                                  # superseded by measured RTT; see Topology.rtt()
     payout_wallet: str = ""       # where CIRC earnings settle
+    orchestrator: bool = False    # holds the head bundle (embed/lm_head/draft) → can run a session's
+                                  # decode loop (floating coordinator, docs/FLOATING_COORDINATOR.md).
+                                  # Default False = current behavior (only the in-process coord drives).
     slot: Optional[int] = None    # assigned slot index
     state: str = JOINING
     last_hb: float = 0.0          # last heartbeat timestamp

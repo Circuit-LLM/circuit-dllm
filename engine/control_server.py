@@ -54,6 +54,18 @@ def make_ed25519_verifier():
     return verify
 
 
+def _node_json(registry, n):
+    """Serialize a Node to route metadata for the floating-coordinator RPCs (no wire key — that's a
+    Phase-2 security design). `layers` is the node's assigned slice [start, end), or None for the
+    entry orchestrator (head-only)."""
+    sl = None
+    if n.slot is not None and 0 <= n.slot < len(registry.topo.slots):
+        s = registry.topo.slots[n.slot]
+        sl = [s.start, s.end]
+    return {"node_id": n.node_id, "endpoint": list(n.endpoint), "layers": sl,
+            "reachability": n.reachability, "trust": n.trust, "orchestrator": n.orchestrator}
+
+
 def _handler(registry, now_fn, verify_sig):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -90,6 +102,7 @@ def _handler(registry, now_fn, verify_sig):
                         reachability=str(body.get("reachability", "public")),
                         region=(str(body["region"]) if body.get("region") else None),
                         payout_wallet=str(body.get("payout_wallet", "")),
+                        orchestrator=bool(body.get("orchestrator", False)),
                     )
                     # loaded_layers (optional): a re-registering node asks for its already-
                     # loaded slot back so it doesn't get a different range and serve stale layers.
@@ -107,6 +120,26 @@ def _handler(registry, now_fn, verify_sig):
                     return self._send(200, {"ok": True, "registered": bool(known)})
                 if self.path == "/drain":
                     registry.drain(str(body["node_id"]))
+                    return self._send(200, {"ok": True})
+                # ── floating coordinator route/entry RPCs (docs/FLOATING_COORDINATOR.md) ──────────
+                # Let a REMOTE orchestrator/gateway get a slice route + an entry orchestrator from the
+                # control plane. Additive (existing routes unchanged); inert until remote orchestrators
+                # exist. Returns metadata only — wire-key distribution is a Phase-2 security design, and
+                # Phase 2 must authenticate these (today they're open like /topology).
+                if self.path == "/route/acquire":
+                    try:
+                        route = registry.acquire_route(str(body["session"]))
+                    except RuntimeError as e:                 # coverage gap
+                        return self._send(503, {"error": str(e)})
+                    return self._send(200, {"route": [_node_json(registry, n) for n in route]})
+                if self.path == "/route/release":
+                    registry.release_route(str(body["session"]))
+                    return self._send(200, {"ok": True})
+                if self.path == "/entry/acquire":
+                    o = registry.acquire_entry(str(body["session"]))
+                    return self._send(200, {"orchestrator": (_node_json(registry, o) if o else None)})
+                if self.path == "/entry/release":
+                    registry.release_entry(str(body["session"]))
                     return self._send(200, {"ok": True})
                 return self._send(404, {"error": "not found"})
             except PermissionError as e:
