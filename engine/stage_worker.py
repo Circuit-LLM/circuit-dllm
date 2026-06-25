@@ -453,7 +453,14 @@ def run_control_client(a):
     reaped during the weight load); /ready flips it to READY once listening; /drain
     on exit."""
     clog = make_logger("node")
-    base = a.control_url.rstrip("/")
+    # Control planes: active + warm standbys (docs/CONTROL_PLANE_HA.md). CIRCUIT_CONTROL_URLS (comma
+    # list, first = active) or --control-urls overrides the single --control-url. The holder registers
+    # its already-loaded slot on the standbys too (prefer_range) so they can route over to it instantly.
+    _spec = (getattr(a, "control_urls", "") or os.environ.get("CIRCUIT_CONTROL_URLS", "")
+             or a.control_url or "")
+    bases = [u.strip().rstrip("/") for u in _spec.split(",") if u.strip()]
+    base = bases[0]                                  # active (the slow retry-until-up register target)
+    standbys = bases[1:]
     advertise = a.advertise_host or ("127.0.0.1" if a.host in ("0.0.0.0", "") else a.host)
     # the endpoint the COORDINATOR dials may differ from the local bind (NAT / a
     # RunPod TCP proxy maps an external port -> the internal --port). Advertise the
@@ -530,8 +537,33 @@ def run_control_client(a):
         return (resp["assignment"]["start"], resp["assignment"]["end"],
                 wire.normalize_key(bytes.fromhex(resp["session_key"])))
 
+    def _register_standby(target, prefer_range):
+        """Best-effort: register our ALREADY-loaded slot on a warm-standby control plane (+ ready),
+        so it can route to us the instant the active dies. prefer_range pins the SAME slot the active
+        gave us → identical layout across control planes. Never raises (a down standby is fine)."""
+        try:
+            reg2 = dict(reg)
+            reg2["loaded_layers"] = list(prefer_range)
+            reg2["ts"] = int(_time.time()); reg2.pop("sig", None)
+            if getattr(a, "_signing_key", None) is not None:
+                msg = _json.dumps(reg2, sort_keys=True, separators=(",", ":")).encode()
+                reg2["sig"] = a._signing_key.sign(msg).hex()
+            _c, _resp = _control_post(target + "/register", reg2, timeout=15)
+            asn = (_resp or {}).get("assignment") or {}
+            if asn and (asn.get("start"), asn.get("end")) != tuple(prefer_range):
+                clog("ERROR", "standby assigned a different slot — not honoring prefer_range",
+                     target=target, want=f"{prefer_range[0]}:{prefer_range[1]}",
+                     got=f"{asn.get('start')}:{asn.get('end')}")
+            _control_post(target + "/ready", {"node_id": a.node_id}, timeout=5)
+            return True
+        except Exception as e:                       # noqa: BLE001 — best-effort warm-up
+            clog("WARN", "standby register failed (will retry on heartbeat)", target=target, error=str(e))
+            return False
+
     start, end, key = _do_register(timeout=float(getattr(a, "register_timeout", 2400)))
     clog("INFO", "joined mesh", node=a.node_id[:12], layers=f"{start}:{end}")
+    for _sb in standbys:                             # warm the standbys with our exact slot
+        _register_standby(_sb, (start, end))
 
     # AWQ-per-node in the DYNAMIC mesh (docs/AWQ_PER_NODE.md): the coordinator just told us our
     # range, so now obtain a complete n-layer AWQ sub-model for exactly [start,end) and serve it
@@ -552,37 +584,31 @@ def run_control_client(a):
 
     def _heartbeat():
         while not stop.is_set():
-            try:
-                _c, _resp = _control_post(base + "/heartbeat", {"node_id": a.node_id}, timeout=5)
-                # If the coordinator no longer knows us (it restarted with an empty topology),
-                # RE-REGISTER for our already-loaded slot + re-announce READY — serve() keeps
-                # running and (same master secret → same derived key) its key stays valid. This
-                # is what makes a coordinator restart NOT orphan the nodes.
-                if isinstance(_resp, dict) and _resp.get("registered") is False:
-                    clog("WARN", "coordinator forgot us — re-registering", layers=f"{start}:{end}")
-                    try:
-                        s2, e2, _k2 = _do_register(prefer_range=(start, end), timeout=120)
-                        if (s2, e2) != (start, end):
-                            clog("ERROR", "re-register got a different slot — serving stale layers",
-                                 had=f"{start}:{end}", got=f"{s2}:{e2}")
-                        _control_post(base + "/ready", {"node_id": a.node_id}, timeout=5)
-                        clog("INFO", "re-registered + ready")
-                    except SystemExit as e:       # 4xx rejection — don't kill the heartbeat thread
-                        clog("ERROR", "re-register rejected", error=str(e))
-                    except Exception as e:
-                        clog("WARN", "re-register failed", error=str(e))
-            except Exception:
-                pass
+            # Heartbeat EVERY control plane (keeps the standbys warm). If any no longer knows us (it
+            # restarted with an empty topology, or it's a standby we just brought up), RE-REGISTER our
+            # already-loaded slot + re-announce READY there — serve() keeps running and (same master
+            # secret → same derived key) its key stays valid. This is what makes a control-plane
+            # restart NOT orphan the nodes, now across the active + standbys.
+            for b in bases:
+                try:
+                    _c, _resp = _control_post(b + "/heartbeat", {"node_id": a.node_id}, timeout=5)
+                    if isinstance(_resp, dict) and _resp.get("registered") is False:
+                        clog("WARN", "control plane forgot us — re-registering", base=b,
+                             layers=f"{start}:{end}")
+                        _register_standby(b, (start, end))   # idempotent; prefer_range pins our slot
+                except Exception:
+                    pass                                     # a down control plane is fine; try next tick
             stop.wait(a.hb_interval)
 
     threading.Thread(target=_heartbeat, daemon=True).start()
 
     def _on_listening():
-        try:
-            _control_post(base + "/ready", {"node_id": a.node_id}, timeout=5)
-            clog("INFO", "ready (serving)")
-        except Exception as e:
-            clog("WARN", "ready post failed", error=str(e))
+        for b in bases:                              # announce READY to every control plane
+            try:
+                _control_post(b + "/ready", {"node_id": a.node_id}, timeout=5)
+            except Exception as e:
+                clog("WARN", "ready post failed", base=b, error=str(e))
+        clog("INFO", "ready (serving)", control_planes=len(bases))
 
     relay = ({"url": relay_url, "node_id": a.node_id, "signing_key": getattr(a, "_signing_key", None),
               "token": os.environ.get("CIRCUIT_RELAY_TOKEN", "")} if relay_url else None)
@@ -594,10 +620,11 @@ def run_control_client(a):
               submodel=submodel, on_listening=_on_listening, relay=relay)
     finally:
         stop.set()
-        try:
-            _control_post(base + "/drain", {"node_id": a.node_id}, timeout=5)
-        except Exception:
-            pass
+        for b in bases:                              # drain from every control plane on exit
+            try:
+                _control_post(b + "/drain", {"node_id": a.node_id}, timeout=5)
+            except Exception:
+                pass
 
 
 def main():
@@ -631,6 +658,10 @@ def main():
     ap.add_argument("--key", help="64-char hex cluster key for static mode")
     # ── control-client mode: join a coordinator's mesh; receive layers + a per-node key ──
     ap.add_argument("--control-url", help="join the mesh via this coordinator control URL")
+    ap.add_argument("--control-urls", default="",
+                    help="HA: comma list of control URLs (active,standby,...) — register the active "
+                         "slot on all so a standby can route over instantly. Env: CIRCUIT_CONTROL_URLS. "
+                         "Overrides --control-url.")
     ap.add_argument("--node-id", help="this node's id (ed25519 pubkey hex); derived from the key if a key is resolved")
     ap.add_argument("--node-key", help="ed25519 private key hex; node-id derives from it (signs /register)")
     ap.add_argument("--node-key-file", help="persist/load the node key here (default /workspace/node_key.hex) for a stable identity across restarts")
@@ -648,6 +679,10 @@ def main():
     ap.add_argument("--hb-interval", type=float, default=10.0)
     a = ap.parse_args()
 
+    # control-client mode if any control URL is given (single, list arg, or env).
+    _ctrl_list = a.control_urls or os.environ.get("CIRCUIT_CONTROL_URLS", "")
+    if _ctrl_list and not a.control_url:
+        a.control_url = _ctrl_list.split(",")[0].strip()   # first = active (identity/gate use it)
     if a.control_url:
         sk, node_id = _resolve_node_identity(a)
         if a.node_id and a.node_id != node_id:

@@ -7,3 +7,5 @@ test-ledger
 .yarn
 # keypairs are environment secrets — never commit (regenerate per the README)
 keys/*.json
+# local ops helpers (the deploy command is documented in README.md)
+keys/*.sh

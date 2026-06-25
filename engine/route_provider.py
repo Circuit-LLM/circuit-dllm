@@ -73,21 +73,89 @@ class LocalRouteProvider:
         return hops
 
 
-class RemoteRouteProvider:
-    """Head-only orchestrator → standalone control plane over the authenticated control channel.
-    `sign` is a control_server.make_ed25519_signer(...) that stamps node_id+ts+sig on each body."""
+class ControlEndpoints:
+    """A failover-aware client for one-OR-MORE standalone control planes.
 
-    def __init__(self, control_url: str, sign, timeout: float = 8.0):
-        self._url = control_url.rstrip("/")
+    The control plane is no longer a single process (the SPOF in docs/CUTOVER_FLOATING.md):
+    an active + one or more warm standbys run on different pods (docs/CONTROL_PLANE_HA.md).
+    Clients (orchestrators, holders, the gateway) hold the LIST and use:
+      * ``post``     — FAILOVER: try the sticky last-good url, then the rest in order; the
+                       first that answers becomes preferred. For per-request RPCs (route /
+                       heartbeat) where any one live control plane is enough.
+      * ``post_all`` — best-effort fan-out to EVERY url so register/ready keep all control
+                       planes warm; a standby is then ready to take over with no cold start.
+
+    Pure stdlib so it unit-tests on a CPU box. ``sign``, if given, is applied to a FRESH copy
+    of the body per attempt, so each POST carries a fresh ts+sig and can't drift outside the
+    control plane's replay window during a slow failover."""
+
+    def __init__(self, urls, sign=None, timeout: float = 8.0):
+        if isinstance(urls, str):
+            urls = [u.strip() for u in urls.split(",")]
+        self._urls = [u.rstrip("/") for u in urls if u and u.strip()]
+        if not self._urls:
+            raise ValueError("ControlEndpoints needs at least one url")
         self._sign = sign
         self._timeout = timeout
+        self._preferred = 0                       # index of the last url that answered (sticky)
+
+    @property
+    def urls(self) -> List[str]:
+        return list(self._urls)
+
+    @property
+    def preferred(self) -> str:
+        return self._urls[self._preferred]
+
+    def _post_one(self, url: str, path: str, body: dict, timeout: float) -> Tuple[int, dict]:
+        data = json.dumps(self._sign(dict(body)) if self._sign else dict(body)).encode()
+        req = urllib.request.Request(url + path, data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return getattr(r, "status", 200), json.loads(r.read() or b"{}")
+
+    def post(self, path: str, body: dict, timeout: Optional[float] = None) -> Tuple[int, dict]:
+        """Failover POST. Tries the sticky-preferred url first, then the others; the first to
+        answer becomes preferred. Raises the last error only if EVERY control plane fails."""
+        t = self._timeout if timeout is None else timeout
+        order = [self._preferred] + [i for i in range(len(self._urls)) if i != self._preferred]
+        last: Optional[Exception] = None
+        for i in order:
+            try:
+                st, resp = self._post_one(self._urls[i], path, body, t)
+                self._preferred = i                # stick to whoever answered
+                return st, resp
+            except Exception as e:                 # noqa: BLE001 — fall through to the next control plane
+                last = e
+        raise last if last else RuntimeError("no control endpoints")
+
+    def post_all(self, path: str, body: dict, timeout: Optional[float] = None):
+        """Best-effort fan-out to EVERY control plane (keeps standbys warm). Never raises.
+        Returns [(url, status|None, parsed|None, err|None)] in url order."""
+        t = self._timeout if timeout is None else timeout
+        out = []
+        for u in self._urls:
+            try:
+                st, resp = self._post_one(u, path, body, t)
+                out.append((u, st, resp, None))
+            except Exception as e:                 # noqa: BLE001
+                out.append((u, None, None, e))
+        return out
+
+
+class RemoteRouteProvider:
+    """Head-only orchestrator → standalone control plane over the authenticated control channel.
+    `sign` is a control_server.make_ed25519_signer(...) that stamps node_id+ts+sig on each body.
+    `control` is a ControlEndpoints, or a url / comma-list / [urls] (+ sign) for back-compat — so
+    a multi-control-plane orchestrator fails routing over to a standby transparently."""
+
+    def __init__(self, control, sign=None, timeout: float = 8.0):
+        self._eps = control if isinstance(control, ControlEndpoints) \
+            else ControlEndpoints(control, sign=sign, timeout=timeout)
 
     def _post(self, path: str, body: dict) -> dict:
-        data = json.dumps(self._sign(dict(body))).encode()
-        req = urllib.request.Request(self._url + path, data=data,
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=self._timeout) as r:
-            return json.loads(r.read() or b"{}")
+        _st, resp = self._eps.post(path, body)
+        return resp
 
     def acquire(self, session) -> List[RouteHop]:
         resp = self._post("/route/acquire", {"session": str(session)})

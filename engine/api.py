@@ -475,10 +475,13 @@ def _run_orchestrator():
     so draft + head + orchestration compute distribute across the network."""
     global _coord
     from engine.control_server import make_ed25519_signer
-    from engine.route_provider import RemoteRouteProvider
-    control_url = os.environ["CIRCUIT_CONTROL_URL"].rstrip("/")
+    from engine.route_provider import RemoteRouteProvider, ControlEndpoints
+    # Active + warm standby control planes (docs/CONTROL_PLANE_HA.md): CIRCUIT_CONTROL_URLS is a
+    # comma list (first = active). CIRCUIT_CONTROL_URL stays supported as the single-url form.
+    control_spec = os.environ.get("CIRCUIT_CONTROL_URLS") or os.environ["CIRCUIT_CONTROL_URL"]
     priv, node_id = _resolve_orch_identity()
     signer = make_ed25519_signer(priv, node_id)
+    endpoints = ControlEndpoints(control_spec, sign=signer)
 
     api_port = int(os.environ.get("CIRCUIT_API_PORT", "18931"))                 # local BIND port
     advertise = os.environ.get("CIRCUIT_ORCH_ADVERTISE") or os.environ.get("CIRCUIT_API_HOST", "127.0.0.1")
@@ -491,10 +494,18 @@ def _run_orchestrator():
                 "payout_wallet": os.environ.get("CIRCUIT_COORD_PAYOUT_WALLET", "")}
     # Register FIRST (JOINING) to claim our unique session-id prefix, THEN load the head + mark READY.
     # acquire_entry only targets READY nodes, so nothing routes to us until the head is up.
-    st, resp = _control_post(control_url + "/register", signer(dict(reg_body)))   # signed (authed register)
-    prefix = int(resp.get("orch_index") or 0)
-    log("INFO", "orchestrator registered", status=st, node=node_id[:12], control=control_url,
-        advertise=f"{advertise}:{api_port}", session_prefix=prefix)
+    # Register on ALL control planes (keeps the standby warm). Our session-id prefix comes from the
+    # first that answers — it's private to us (namespaces our session ids), so it need not match
+    # across control planes; only uniqueness-per-orchestrator matters, which each CP guarantees.
+    reg_results = endpoints.post_all("/register", dict(reg_body))                 # signer applied per-CP
+    ok_urls = [u for (u, _st, _r, e) in reg_results if e is None]
+    if not ok_urls:
+        raise SystemExit("orchestrator could not register with ANY control plane: "
+                         + "; ".join(f"{u}: {e}" for (u, _s, _r, e) in reg_results))
+    prefix = next((int(r["orch_index"]) for (_u, _s, r, _e) in reg_results
+                   if r and r.get("orch_index") is not None), 0)
+    log("INFO", "orchestrator registered", registered=len(ok_urls), control=endpoints.urls,
+        node=node_id[:12], advertise=f"{advertise}:{api_port}", session_prefix=prefix)
 
     key = bytes.fromhex(os.environ["CIRCUIT_KEY"])
     _coord = Coordinator(
@@ -509,22 +520,24 @@ def _run_orchestrator():
         shard=os.environ.get("CIRCUIT_SHARD") == "1",
         quant=os.environ.get("CIRCUIT_QUANT", ""),
         other_device=os.environ.get("CIRCUIT_OTHER_DEVICE", "cpu"),
-        route_provider=RemoteRouteProvider(control_url, signer),
+        route_provider=RemoteRouteProvider(endpoints),   # fails routing over to a standby
         max_concurrency=int(os.environ.get("CIRCUIT_MAX_CONCURRENCY", "1")),
         chain_relay=os.environ.get("CIRCUIT_CHAIN") == "1",
         session_prefix=prefix,                      # globally-unique session ids (no cross-orch KV collision)
     )
-    _control_post(control_url + "/ready", {"node_id": node_id})                # head loaded → READY
+    endpoints.post_all("/ready", {"node_id": node_id})                         # head loaded → READY (all CPs)
 
     def _heartbeat():
         while True:
             time.sleep(float(os.environ.get("CIRCUIT_HEARTBEAT_INTERVAL", "10")))
             try:
-                _, r = _control_post(control_url + "/heartbeat", {"node_id": node_id})
-                if not r.get("registered"):           # control plane restarted/forgot us → re-register
-                    _control_post(control_url + "/register", signer(dict(reg_body)))
-                    _control_post(control_url + "/ready", {"node_id": node_id})
-                    log("INFO", "re-registered after control-plane restart", node=node_id[:12])
+                results = endpoints.post_all("/heartbeat", {"node_id": node_id})   # warm every CP
+                # Any control plane that restarted/forgot us (or a standby we just brought up)
+                # answers registered=False → re-register + re-ready everywhere (idempotent).
+                if any(r and r.get("registered") is False for (_u, _s, r, _e) in results):
+                    endpoints.post_all("/register", dict(reg_body))
+                    endpoints.post_all("/ready", {"node_id": node_id})
+                    log("INFO", "re-registered after control-plane (re)start", node=node_id[:12])
             except Exception as e:   # noqa: BLE001 — heartbeat must never take down serving
                 log("WARN", "heartbeat failed", err=str(e))
     threading.Thread(target=_heartbeat, daemon=True).start()
