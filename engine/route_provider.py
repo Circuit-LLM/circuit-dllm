@@ -26,6 +26,13 @@ class RouteHop:
     reachability: str = "public"
     wire_key: Optional[bytes] = None    # None until an authenticated control plane provides it
 
+    @property
+    def endpoint(self) -> Tuple[Optional[str], Optional[int]]:
+        """(host, port) — so a RouteHop is a drop-in for a topology Node in the relay path: the
+        in-process Coordinator consumes Node.endpoint; a head-only orchestrator consumes
+        RouteHop.endpoint identically. `node_id`/`reachability`/`wire_key` already line up."""
+        return (self.host, self.port)
+
 
 class LocalRouteProvider:
     """In-process registry — today's behavior, BYTE-IDENTICAL. The orchestrator IS the coordinator,
@@ -46,6 +53,11 @@ class LocalRouteProvider:
 
     def release(self, session) -> None:
         self._reg.release_route(session)
+
+    def mark_suspect(self, node_id) -> None:
+        """Failover: tell the (in-process) registry a holder is dead so the next acquire routes
+        around it. Identical to today's direct registry.mark_suspect call it replaces."""
+        self._reg.mark_suspect(node_id)
 
     def to_hops(self, nodes) -> List[RouteHop]:
         """Normalize Node objects → RouteHops (for callers that want the wire form; not used by the
@@ -93,3 +105,12 @@ class RemoteRouteProvider:
             self._post("/route/release", {"session": str(session)})
         except Exception:
             pass   # best-effort; the control plane also reaps a session on its load-timeout
+
+    def mark_suspect(self, node_id) -> None:
+        """Report a dead/misbehaving holder so the control plane's next acquire_route routes
+        around it. The target goes in `suspect`, NOT `node_id` — the signer overwrites `node_id`
+        with the CALLER's identity. Best-effort: the control plane also reaps on heartbeat timeout."""
+        try:
+            self._post("/route/suspect", {"suspect": str(node_id)})
+        except Exception:
+            pass

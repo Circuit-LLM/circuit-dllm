@@ -104,6 +104,22 @@ def test_auth_gate_401_on_bad_signature():
         srv.shutdown()
 
 
+def test_suspect_rpc_marks_only_the_target():
+    reg = _covered_registry()
+    assert all(reg.topo.nodes[n].state == "ready" for n in ("stage0", "stage1", "stage2"))
+    srv, url = _serve(reg, make_ed25519_verifier())
+    try:
+        priv, pub = _ed25519_pair()
+        rp = RemoteRouteProvider(url, make_ed25519_signer(priv, pub))
+        rp.mark_suspect("stage0")                       # failover report over the authed channel
+        assert reg.topo.nodes["stage0"].state == "suspect", "control plane did not suspect the holder"
+        # the target rides in `suspect`, so the signer's own node_id must NOT clobber it:
+        assert reg.topo.nodes["stage1"].state == "ready"
+        assert reg.topo.nodes["stage2"].state == "ready"
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

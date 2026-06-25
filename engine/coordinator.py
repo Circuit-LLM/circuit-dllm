@@ -233,7 +233,10 @@ class Coordinator:
         # Topology + per-node keys instead of the static stage list. The static
         # path below is left exactly as-is (backward-compatible, zero risk).
         self.registry = registry
-        self._dynamic = registry is not None
+        # Dynamic (mesh) routing is driven by a route PROVIDER, not necessarily a local registry:
+        # the in-process Coordinator has both; a head-only orchestrator has only a RemoteRouteProvider
+        # (its registry lives in the standalone control plane). Either presence means "route live".
+        self._dynamic = registry is not None or route_provider is not None
         # Route acquisition goes through a provider (docs/FLOATING_COORDINATOR.md). Default is the
         # in-process registry (LocalRouteProvider = pure passthrough → byte-identical); a head-only
         # orchestrator injects a RemoteRouteProvider. None when there's no registry (static path).
@@ -243,6 +246,11 @@ class Coordinator:
         # in dynamic/mesh mode (it needs the route's node endpoints + per-node keys).
         self._chain = bool(chain_relay) and self._dynamic
         self._session_routes: dict = {}   # session -> pinned [node per slot] (affinity)
+        # node_id -> data-wire key, learned from every acquired route. KV-control frames
+        # (reset/truncate/tree-keep/close) address holders by node_id; a head-only orchestrator
+        # has no local registry to look the key up in, so we cache it off the route elements
+        # (Node or RouteHop — both carry wire_key). Bounded by mesh size; keys are stable.
+        self._route_keys: dict = {}
 
     def _active_conn(self) -> _Conn:
         """The connection set for the current request: a per-request pooled _Conn when
@@ -325,6 +333,18 @@ class Coordinator:
         k = getattr(node, "wire_key", None)
         return wire.normalize_key(k) if k else self.key
 
+    def _remember_route_keys(self, route) -> None:
+        """Cache node_id -> wire key for every element of a freshly-acquired route, so later
+        KV-control frames can address those holders without a local registry (head-only path)."""
+        for el in route:
+            self._route_keys[el.node_id] = self._node_key(el)
+
+    def _key_for(self, nid: str) -> bytes:
+        """Wire key for a node_id seen on a recent route (cached by _remember_route_keys). Falls
+        back to the cluster key. Replaces self.registry.topo.nodes.get(nid) so KV-control framing
+        works whether the registry is in-process (Coordinator) or remote (head-only orchestrator)."""
+        return self._route_keys.get(nid, self.key)
+
     def _conn_for(self, node):
         conns = self._active_conn().conns
         sock = conns.get(node.node_id)
@@ -383,6 +403,7 @@ class Coordinator:
             # pipelines); ==route_snapshot when replication=1. Pins for the session's KV affinity.
             route = self._route_provider.acquire(session)  # locked; raises on a coverage gap
             self._session_routes[session] = route
+            self._remember_route_keys(route)
         if self._chain:                              # forward node→node (1 round-trip)
             return self._relay_chain(session, pos, hidden, route)
         for node in route:                           # star: a round-trip per stage
@@ -398,7 +419,7 @@ class Coordinator:
                 hidden = hidden.to(self.device)
             except (wire.WireError, OSError):
                 self._drop_conn(node.node_id)
-                self.registry.mark_suspect(node.node_id)
+                self._route_provider.mark_suspect(node.node_id)
                 self._session_routes.pop(session, None)
                 raise
         return hidden
@@ -421,7 +442,7 @@ class Coordinator:
             mt, payload = wire.read_frame_keyed(sock, key)
         except (wire.WireError, OSError):
             self._drop_conn(head.node_id)
-            self.registry.mark_suspect(head.node_id)
+            self._route_provider.mark_suspect(head.node_id)
             self._session_routes.pop(session, None)
             raise
         if mt == wire.RESULT:
@@ -443,7 +464,7 @@ class Coordinator:
         for node in route:
             h, p = node.endpoint[0], int(node.endpoint[1])
             if f"{h}:{p}" == endpoint:
-                self.registry.mark_suspect(node.node_id)
+                self._route_provider.mark_suspect(node.node_id)
                 return
         self.log("WARN", "chain hop-failure endpoint not in route — not suspecting any node",
                  endpoint=endpoint)
@@ -492,8 +513,7 @@ class Coordinator:
                 self._route_provider.release(session)  # free this session's replica load
 
             for nid, sock in list(conn.conns.items()):
-                node = self.registry.topo.nodes.get(nid)
-                key = self._node_key(node) if node else self.key
+                key = self._key_for(nid)
                 try:
                     wire.write_frame(sock, key, wire.KV_CTRL,
                                      struct.pack(">IBI", session, KVOP_RESET, 0))
@@ -517,8 +537,7 @@ class Coordinator:
         conn = self._active_conn()
         if self._dynamic:
             for nid, sock in list(conn.conns.items()):
-                node = self.registry.topo.nodes.get(nid)
-                key = self._node_key(node) if node else self.key
+                key = self._key_for(nid)
                 try:
                     wire.write_frame(sock, key, wire.KV_CTRL,
                                      struct.pack(">IBI", session, KVOP_TRUNCATE, length))
@@ -699,8 +718,9 @@ class Coordinator:
             return hidden
         route = self._session_routes.get(session)
         if route is None:
-            route = self.registry.acquire_route(session)
+            route = self._route_provider.acquire(session)   # provider, not registry → head-only works
             self._session_routes[session] = route
+            self._remember_route_keys(route)
         for node in route:
             key = self._node_key(node)
             sock = self._conn_for(node)
@@ -724,8 +744,7 @@ class Coordinator:
         conn = self._active_conn()
         if self._dynamic:
             for nid, sock in list(conn.conns.items()):
-                node = self.registry.topo.nodes.get(nid)
-                key = self._node_key(node) if node else self.key
+                key = self._key_for(nid)
                 try:
                     wire.write_frame(sock, key, wire.KV_CTRL, body)
                 except OSError:
@@ -1155,8 +1174,7 @@ class Coordinator:
     def _close_conn(self, conn: _Conn):
         if self._dynamic:
             for nid, sock in list(conn.conns.items()):
-                node = self.registry.topo.nodes.get(nid)
-                key = self._node_key(node) if node else self.key
+                key = self._key_for(nid)
                 try:
                     wire.write_frame(sock, key, wire.BYE, b"")
                     sock.close()

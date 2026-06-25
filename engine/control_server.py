@@ -147,11 +147,15 @@ def _handler(registry, now_fn, verify_sig):
                 # Without verify_sig configured these are unavailable (403), so deploying them exposes
                 # nothing until orchestrator auth is turned on. /route/acquire returns the data-plane
                 # wire keys ONLY to a verified caller.
-                if self.path in ("/route/acquire", "/route/release", "/entry/acquire", "/entry/release"):
+                if self.path in ("/route/acquire", "/route/release", "/route/suspect",
+                                 "/entry/acquire", "/entry/release"):
                     if verify_sig is None:
                         return self._send(403, {"error": "orchestrator RPCs require CIRCUIT_MESH_VERIFY_SIG=1"})
                     if not verify_sig(body):
                         return self._send(401, {"error": "signature verification failed"})
+                    if self.path == "/route/suspect":      # failover: a remote orchestrator reports a dead holder
+                        registry.mark_suspect(str(body["suspect"]))
+                        return self._send(200, {"ok": True})
                     session = str(body["session"])
                     if self.path == "/route/acquire":
                         try:
