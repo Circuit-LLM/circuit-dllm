@@ -80,6 +80,18 @@ def main():
     assert _kept_tensor_names(wm.keys(), 0, 16, keep_norm=False, keep_head=True).get(
         "lm_head.weight") == "lm_head.weight", "keep_head kept-names includes lm_head"
 
+    # ── HEAD-ONLY slice (floating orchestrator): start==end + keep_head → head, ZERO layers ──
+    out_ho = remap_weight_map(wm, 0, 0, keep_head=True)
+    assert {"model.embed_tokens.weight", "lm_head.weight", "model.norm.weight"} <= set(out_ho), \
+        "head-only slice keeps embed/norm/lm_head"
+    assert not any(k.startswith("model.layers.") for k in out_ho), "head-only slice has NO decoder layers"
+    assert sub_config({"num_hidden_layers": 80, "tie_word_embeddings": True}, 0, 0,
+                      keep_head=True)["num_hidden_layers"] == 0, "head-only config has 0 layers"
+    try:                                              # 0 layers + no head kept → still rejected
+        remap_weight_map(wm, 0, 0); raise AssertionError("0-layer slice keeping nothing must raise")
+    except ValueError:
+        pass
+
     # ── _kept_tensor_names mirrors remap (the I/O copy ↔ index agreement) ─────
     # this is the invariant main() asserts: the originals it copies, renamed, == the new index.
     kept = _kept_tensor_names(wm.keys(), 16, 48, keep_norm=False)

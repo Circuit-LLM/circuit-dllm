@@ -64,8 +64,11 @@ def remap_weight_map(weight_map: Dict[str, str], start: int, end: int,
     states, never embeds or projects to logits); the COORDINATOR uses keep_head to also hold
     embed/norm/lm_head. Pure: stdlib only. Returns the new {sub_name: shard_file}.
 
-    Raises ValueError if the requested range has no layers in the map (caught a typo'd range)."""
-    if not (0 <= start < end):
+    A deliberate HEAD-ONLY slice (start==end, --keep-head) keeps zero layers — the floating
+    orchestrator's bundle (embed/norm/lm_head, no decoder layers; a 0-layer AWQ model sidesteps
+    Marlin's per-layer post_init entirely). Raises ValueError on a bad range, on a non-empty range
+    that selected no layers (a typo'd range), or on a 0-layer slice that kept nothing."""
+    if not (0 <= start <= end):
         raise ValueError(f"bad range [{start},{end})")
     out: Dict[str, str] = {}
     seen_layer = False
@@ -76,9 +79,11 @@ def remap_weight_map(weight_map: Dict[str, str], start: int, end: int,
             seen_layer = True
         elif _keep_nonlayer(name, keep_norm, keep_head):
             out[name] = shard
-    if not seen_layer:
+    if start < end and not seen_layer:
         raise ValueError(f"range [{start},{end}) selected no decoder layers from the index "
                          f"(check the layer count / prefix)")
+    if start == end and not out:
+        raise ValueError(f"head-only slice [{start},{end}) kept nothing — pass --keep-head/--keep-norm")
     return out
 
 
