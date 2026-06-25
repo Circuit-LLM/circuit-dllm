@@ -203,10 +203,23 @@ This is mostly a refactor — the engine was built with the joints:
      (1.5B draft + large lm_head per lane) with more replicas the orchestrator funnel dominates more,
      so the effect is larger. Orchestrator-kill continuity is validated separately
      (scripts/e2e-multi-orchestrator.sh: survivor keeps serving).*
-   - *Remaining: replication>1 re-home KV-affinity — the control plane must pin a session's replicas
-     so re-home re-acquires the SAME holders (acquire_route session-affinity across orchestrators);
-     and HTTP-level KV-reuse re-home — carry the session-id in the request so a survivor orchestrator
-     attaches via generate_resume instead of re-prefilling.*
+   - *[DONE] replication>1 re-home KV-affinity — acquire_route now KEEPS each slot's pinned holder
+     while it is READY (only dead slots re-pick), so a re-home from a different orchestrator (same
+     session-id, no release in between) re-acquires the SAME holders' warm KV. Gated:
+     test_floating (re-home reuses holders; a dead slot re-pins, a live slot is kept).*
+   - *[DONE] globally-unique session-ids — each orchestrator gets a control-plane-assigned 15-bit
+     prefix (session id = prefix<<16 | counter), so two orchestrators never collide on a shared
+     holder's worker-global KV (a correctness fix for multi-orchestrator, and the prerequisite for
+     re-home). Gated: test_floating (distinct prefixes); byte-identical gates unchanged (prefix 0).*
+   - *[DONE] HTTP-level KV-reuse re-home — a normal completion can run with circuit_keep_warm=true and
+     returns an opaque resume blob (session_id, seq_ids, next_token, pos). If that orchestrator dies, a
+     client/gateway resends the blob as circuit_resume to ANY survivor, which attaches to the holders'
+     warm KV (acquire_route affinity) and continues with NO prompt re-prefill. Gated:
+     scripts/e2e-rehome-http.sh — O1 produces 8 tokens keep-warm, O2 re-homes via circuit_resume,
+     combined output byte-identical to a single 16-token reference.*
+   - *Remaining: the gateway/client transparent-retry loop (buffer the resume blob, detect an
+     orchestrator failure mid-request, resend to a survivor) + streaming-path exposure of the blob —
+     the engine API is in place; this is the consuming integration.*
 4. **Control-plane HA** (standby/Raft) — last, off the hot path.
 
 ## 10. Risks / open questions

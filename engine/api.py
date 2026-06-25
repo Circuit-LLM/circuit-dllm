@@ -369,8 +369,29 @@ class Handler(BaseHTTPRequestHandler):
                 log("WARN", "client disconnected mid-stream")
             log("INFO", "done", chunks=n, secs=round(time.time() - t0, 2))
         else:
-            with _coord.request_gate():
-                text, toks = _coord.generate(prompt, max_tokens)
+            # KV-reuse RE-HOME (docs/FLOATING_COORDINATOR.md §6): circuit_resume carries the opaque
+            # head-side state (session_id, seq_ids, next_token, pos) a prior orchestrator exposed. The
+            # holders still hold that session's KV (worker-global), and acquire_route's affinity lands
+            # us on the SAME holders, so we ATTACH and continue with NO prompt re-prefill. circuit_keep_warm
+            # leaves the KV warm + returns a fresh resume blob, so a client/gateway can re-home this
+            # request onto a survivor if THIS orchestrator dies.
+            import torch
+            resume = body.get("circuit_resume")
+            keep = bool(body.get("circuit_keep_warm"))
+            prior = []
+            if resume:
+                sid = int(resume["session_id"])
+                seq = torch.tensor([resume["seq_ids"]], device=_coord.device, dtype=torch.long)
+                nxt = torch.tensor([[int(resume["next_token"])]], device=_coord.device, dtype=torch.long)
+                prior = list(resume.get("output_token_ids", []))
+                with _coord.request_gate():
+                    text, toks, seq2, nxt2, cur2 = _coord.generate_resume_state(
+                        sid, seq, nxt, int(resume["pos"]), max_tokens, keep_warm=keep)
+            else:
+                sid = next(_coord._session_ids)   # allocate so we can expose it for a later re-home
+                with _coord.request_gate():
+                    text, toks, seq2, nxt2, cur2 = _coord.generate_state(
+                        prompt, max_tokens, session=sid, keep_warm=keep)
             message = {"role": "assistant", "content": text}
             finish = "stop"
             if tools:
@@ -379,13 +400,18 @@ class Handler(BaseHTTPRequestHandler):
                 if tool_calls:
                     message["tool_calls"] = tool_calls
                     finish = "tool_calls"
+            circuit = {"session_id": sid, "token_ids": prior + toks}
+            if keep:   # the KV is warm → hand back an opaque blob the client can re-home with
+                circuit["resume"] = {"session_id": sid, "seq_ids": seq2[0].tolist(),
+                                     "next_token": int(nxt2), "pos": int(cur2),
+                                     "output_token_ids": prior + toks}
             self._json(200, {
                 "id": cid, "object": "chat.completion", "created": created, "model": model,
-                "choices": [{"index": 0, "finish_reason": finish,
-                             "message": message}],
+                "choices": [{"index": 0, "finish_reason": finish, "message": message}],
                 "usage": {"completion_tokens": len(toks)},
+                "circuit": circuit,
             })
-            log("INFO", "done", tokens=len(toks), secs=round(time.time() - t0, 2))
+            log("INFO", "done", tokens=len(toks), secs=round(time.time() - t0, 2), resumed=bool(resume))
 
 
 def _control_post(url, obj, timeout=10):
@@ -454,6 +480,19 @@ def _run_orchestrator():
     priv, node_id = _resolve_orch_identity()
     signer = make_ed25519_signer(priv, node_id)
 
+    api_port = int(os.environ.get("CIRCUIT_API_PORT", "18931"))
+    advertise = os.environ.get("CIRCUIT_ORCH_ADVERTISE") or os.environ.get("CIRCUIT_API_HOST", "127.0.0.1")
+    reg_body = {"endpoint": [advertise, api_port], "capacity_layers": 0,
+                "model_fp": os.environ.get("CIRCUIT_MESH_FP", ""), "orchestrator": True,
+                "reachability": os.environ.get("CIRCUIT_REACHABILITY", "public"),
+                "payout_wallet": os.environ.get("CIRCUIT_COORD_PAYOUT_WALLET", "")}
+    # Register FIRST (JOINING) to claim our unique session-id prefix, THEN load the head + mark READY.
+    # acquire_entry only targets READY nodes, so nothing routes to us until the head is up.
+    st, resp = _control_post(control_url + "/register", signer(dict(reg_body)))   # signed (authed register)
+    prefix = int(resp.get("orch_index") or 0)
+    log("INFO", "orchestrator registered", status=st, node=node_id[:12], control=control_url,
+        advertise=f"{advertise}:{api_port}", session_prefix=prefix)
+
     key = bytes.fromhex(os.environ["CIRCUIT_KEY"])
     _coord = Coordinator(
         os.environ["CIRCUIT_MODEL"], [], key,
@@ -463,18 +502,9 @@ def _run_orchestrator():
         route_provider=RemoteRouteProvider(control_url, signer),
         max_concurrency=int(os.environ.get("CIRCUIT_MAX_CONCURRENCY", "1")),
         chain_relay=os.environ.get("CIRCUIT_CHAIN") == "1",
+        session_prefix=prefix,                      # globally-unique session ids (no cross-orch KV collision)
     )
-
-    api_port = int(os.environ.get("CIRCUIT_API_PORT", "18931"))
-    advertise = os.environ.get("CIRCUIT_ORCH_ADVERTISE") or os.environ.get("CIRCUIT_API_HOST", "127.0.0.1")
-    reg_body = {"endpoint": [advertise, api_port], "capacity_layers": 0,
-                "model_fp": os.environ.get("CIRCUIT_MESH_FP", ""), "orchestrator": True,
-                "reachability": os.environ.get("CIRCUIT_REACHABILITY", "public"),
-                "payout_wallet": os.environ.get("CIRCUIT_COORD_PAYOUT_WALLET", "")}
-    st, _ = _control_post(control_url + "/register", signer(dict(reg_body)))   # signed (authed register)
     _control_post(control_url + "/ready", {"node_id": node_id})                # head loaded → READY
-    log("INFO", "orchestrator registered", status=st, node=node_id[:12], control=control_url,
-        advertise=f"{advertise}:{api_port}")
 
     def _heartbeat():
         while True:

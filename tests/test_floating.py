@@ -100,6 +100,51 @@ def test_orchestrator_registers_without_a_slot():
     assert all(not n.orchestrator for n in route)
 
 
+def _reg_rep2():
+    """A replication=2 registry: 2 slots over [0,40), each covered by 2 READY holders."""
+    topo = Topology(num_layers=40, coordinator_end=0, num_stages=2, model_fp="t", replication=2)
+    reg = Registry(topo=topo, master_secret=b"x" * 32, coordinator_endpoint=("h", 1))
+    for i in range(4):
+        n = Node(node_id=f"h{i}", endpoint=("h", 5000 + i), capacity_layers=20, model_fp="t")
+        reg.register(n); reg.mark_ready(f"h{i}")
+    assert reg.snapshot()["coverage_ok"], "test setup: replication=2 not covered"
+    return reg
+
+
+def test_acquire_route_kv_affinity_on_rehome():
+    # Re-home = a DIFFERENT orchestrator calls acquire_route for the SAME session-id (no release in
+    # between, because the original orchestrator died). It must get the SAME holders → warm KV.
+    reg = _reg_rep2()
+    a1 = [n.node_id for n in reg.acquire_route("A")]
+    a2 = [n.node_id for n in reg.acquire_route("A")]
+    assert a1 == a2, f"re-home must reuse the same holders (KV affinity): {a1} vs {a2}"
+    # a fresh session balances onto the OTHER replicas (it is not pinned to A's holders)
+    b = [n.node_id for n in reg.acquire_route("B")]
+    assert set(b) != set(a1), f"a fresh session should balance to other replicas: {b} vs {a1}"
+
+
+def test_acquire_route_rehome_repins_only_dead_slot():
+    reg = _reg_rep2()
+    a1 = [n.node_id for n in reg.acquire_route("A")]
+    reg.mark_suspect(a1[0])                            # slot 0's holder dies
+    a2 = [n.node_id for n in reg.acquire_route("A")]
+    assert a2[0] != a1[0], "slot 0's dead holder must be replaced with its live replica"
+    assert a2[1] == a1[1], "slot 1's live holder must be KEPT (its KV is still warm)"
+
+
+def test_orchestrators_get_distinct_session_prefixes():
+    # Each orchestrator gets a UNIQUE session-id prefix so two orchestrators' sessions never collide
+    # on a shared holder's worker-global KV store; slice holders get none.
+    reg = _reg()
+    a = Node(node_id="oA", endpoint=("h", 1), capacity_layers=0, model_fp="t", orchestrator=True)
+    b = Node(node_id="oB", endpoint=("h", 2), capacity_layers=0, model_fp="t", orchestrator=True)
+    ra, rb = reg.register(a), reg.register(b)
+    assert ra["orch_index"] is not None and rb["orch_index"] is not None
+    assert ra["orch_index"] != rb["orch_index"], "orchestrators must get distinct session-id prefixes"
+    h = Node(node_id="h0", endpoint=("h", 3), capacity_layers=20, model_fp="t")
+    assert reg.register(h)["orch_index"] is None, "a slice holder gets no session-id prefix"
+
+
 def test_orchestrator_appears_in_topology_but_holds_no_slot():
     reg = _reg()
     orch = Node(node_id="orchZ", endpoint=("pub", 18931), capacity_layers=0, model_fp="t",

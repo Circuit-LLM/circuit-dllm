@@ -65,6 +65,10 @@ class Registry:
     # which head-capable node drives each session's decode loop. Separate from slice _load.
     _entry_load: Dict[str, int] = field(default_factory=dict, repr=False, compare=False)
     _session_entry: Dict[object, str] = field(default_factory=dict, repr=False, compare=False)
+    # globally-unique session-id prefixes: each registered orchestrator gets a distinct 15-bit index
+    # (its session ids = index<<16 | counter), so two orchestrators never collide on a shared holder's
+    # worker-global KV. Persisted so a control-plane restart keeps handing out fresh ones.
+    _orch_seq: int = field(default=0, repr=False, compare=False)
 
     def __post_init__(self):
         if self.state_path:
@@ -79,10 +83,15 @@ class Registry:
                 raise PermissionError(f"node {node.node_id} not on allowlist")
             if node.orchestrator:
                 # Head-only orchestrator: no layer slice → no slot. It joins the orchestrator pool
-                # (acquire_entry) rather than a slot's holders (acquire_route). assignment is null.
+                # (acquire_entry) rather than a slot's holders (acquire_route). assignment is null;
+                # it gets a unique session-id prefix so its sessions never collide with another
+                # orchestrator's on a shared holder.
                 self.topo.register_orchestrator(node, now)
                 assignment = None
+                orch_index = self._orch_seq & 0x7FFF
+                self._orch_seq += 1
             else:
+                orch_index = None
                 # prefer_range: a re-registering node asks for its already-loaded slot back.
                 slot = self.topo.register(node, now, prefer_range=prefer_range)   # raises on mismatch / capacity
                 assignment = {"start": slot.start, "end": slot.end}
@@ -96,6 +105,7 @@ class Registry:
             self._save_state()
             return {
                 "assignment": assignment,          # null for a head-only orchestrator
+                "orch_index": orch_index,          # unique session-id prefix (orchestrators only)
                 "model_fp": self.topo.model_fp,
                 "session_key": key.hex(),
                 "coordinator": self.coordinator_endpoint,
@@ -226,17 +236,48 @@ class Registry:
         its prior route first. Raises on a coverage gap.
 
         Replication=1 (one holder/slot) → identical to route_snapshot (min of one = that holder),
-        so this is a safe default; it only changes behavior once slots have replicas."""
+        so this is a safe default; it only changes behavior once slots have replicas.
+
+        KV-AFFINITY (docs/FLOATING_COORDINATOR.md §6): for an EXISTING session — a re-home onto a
+        DIFFERENT orchestrator (the original died), carrying the same session-id — each slot's
+        already-pinned holder is KEPT while it is still READY, so the re-homed session re-attaches to
+        the SAME holders' warm KV (no re-prefill). Only slots whose pinned holder is gone get a
+        least-loaded replacement (that slice — and only that slice — re-prefills). A genuine failover
+        on the SAME orchestrator drops the pin first (release_route, via _reset_sessions) so this
+        re-balances fresh; a re-home does NOT release, so the pin survives and affinity holds."""
         with self._lock:
-            self._release_locked(session)
-            route = []
-            for _slot, holders in self.topo.route():        # raises on an uncovered slot
-                i = min(range(len(holders)),
-                        key=lambda j: (self._load.get(holders[j].node_id, 0), j))
-                route.append(holders[i])
-            for n in route:
-                self._load[n.node_id] = self._load.get(n.node_id, 0) + 1
-            self._session_load[session] = [n.node_id for n in route]
+            pinned = self._session_load.get(session)
+            if pinned is None:                              # NEW session → balance across replicas
+                route = []
+                for _slot, holders in self.topo.route():    # raises on an uncovered slot
+                    i = min(range(len(holders)),
+                            key=lambda j: (self._load.get(holders[j].node_id, 0), j))
+                    route.append(holders[i])
+                for n in route:
+                    self._load[n.node_id] = self._load.get(n.node_id, 0) + 1
+                self._session_load[session] = [n.node_id for n in route]
+                return route
+            # EXISTING session → keep live pinned holders (warm KV), re-pick only dead slots.
+            route, new_ids = [], []
+            for k, (_slot, holders) in enumerate(self.topo.route()):
+                by_id = {h.node_id: h for h in holders}
+                pin = pinned[k] if k < len(pinned) else None
+                if pin in by_id:                            # pinned holder still READY → keep it
+                    route.append(by_id[pin]); new_ids.append(pin)
+                else:                                       # pinned holder gone → least-loaded replica
+                    i = min(range(len(holders)),
+                            key=lambda j: (self._load.get(holders[j].node_id, 0), j))
+                    route.append(holders[i]); new_ids.append(holders[i].node_id)
+            old, new = set(pinned), set(new_ids)
+            for nid in old - new:                           # holders this session no longer uses
+                c = self._load.get(nid, 0) - 1
+                if c > 0:
+                    self._load[nid] = c
+                else:
+                    self._load.pop(nid, None)
+            for nid in new - old:                           # replacement holders gained
+                self._load[nid] = self._load.get(nid, 0) + 1
+            self._session_load[session] = new_ids
             return route
 
     def release_route(self, session) -> None:
@@ -356,7 +397,8 @@ class Registry:
         import json, os, tempfile
         try:
             data = {"accrued": self.accrued, "wallets": self.wallets,
-                    "eviction_counts": self.eviction_counts, "banned": sorted(self.banned)}
+                    "eviction_counts": self.eviction_counts, "banned": sorted(self.banned),
+                    "orch_seq": self._orch_seq}
             d = os.path.dirname(self.state_path) or "."
             os.makedirs(d, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=d, prefix=".regstate-")
@@ -377,5 +419,6 @@ class Registry:
             self.wallets.update(data.get("wallets", {}))
             self.eviction_counts.update({k: int(v) for k, v in data.get("eviction_counts", {}).items()})
             self.banned.update(data.get("banned", []))
+            self._orch_seq = int(data.get("orch_seq", 0))
         except Exception:
             pass

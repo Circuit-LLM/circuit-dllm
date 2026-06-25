@@ -135,7 +135,7 @@ class Coordinator:
                  shard: bool = False, other_device: str = "cpu", quant: str = "",
                  submodel: str = "",
                  registry=None, max_concurrency: int = 1, chain_relay: bool = False,
-                 route_provider=None):
+                 route_provider=None, session_prefix: int = 0):
         """local_layers=(s,e): run those layers IN-PROCESS (co-located stage 0)
         so a big model loads once on this pod (layers + head) instead of a
         coordinator and a stage worker each loading the whole model. The model
@@ -214,7 +214,12 @@ class Coordinator:
         self._default_conn = _Conn()
         self._max_conc = max(1, int(max_concurrency))
         self._pool = _ConnPool(self._max_conc)
-        self._session_ids = itertools.count(1)    # atomic id source (no lock needed)
+        # Globally-unique session ids: a per-orchestrator PREFIX (control-plane-assigned, high 15
+        # bits) + a local counter (low 16 bits). Distinct orchestrators therefore never collide on a
+        # shared holder's worker-global KV store (docs/FLOATING_COORDINATOR.md §6). Monolith /
+        # prefix 0 → 1,2,3,… (unchanged). Stays below the batch-id space (>= 1<<31).
+        self._session_prefix = int(session_prefix) & 0x7FFF
+        self._session_ids = self._make_session_ids()    # atomic id source (single-stream under the API lock)
         self._spec_lock = threading.Lock()        # guards the _spec counters/window
         # System-prompt prefix cache: the dominant TTFT cost is re-prefilling the (large,
         # identical-every-request) system prompt through the mesh. Each connection slot keeps
@@ -251,6 +256,15 @@ class Coordinator:
         # has no local registry to look the key up in, so we cache it off the route elements
         # (Node or RouteHop — both carry wire_key). Bounded by mesh size; keys are stable.
         self._route_keys: dict = {}
+
+    def _make_session_ids(self):
+        """Yield (prefix<<16 | counter) ids: the counter is 1..65535 and wraps (sessions are
+        short-lived, so reuse after one ends is safe). Prefix 0 → 1,2,3,… (monolith, unchanged)."""
+        base = self._session_prefix << 16
+        n = 0
+        while True:
+            n = (n % 0xFFFF) + 1
+            yield base | n
 
     def _active_conn(self) -> _Conn:
         """The connection set for the current request: a per-request pooled _Conn when
@@ -1029,18 +1043,27 @@ class Coordinator:
             cur += 1
         return out, seq_ids, nxt, cur
 
-    def generate(self, prompt: str, n_new: int = 20) -> Tuple[str, List[int]]:
-        sid = next(self._session_ids)
+    def generate_state(self, prompt: str, n_new: int = 20, session=None, keep_warm: bool = False):
+        """Greedy generate AND return the head-side resume state. Returns
+        (text, out, seq_ids, next_token, pos): seq_ids = the tokens now in the holders' KV; next_token
+        = the token to feed at `pos` to continue. A caller exposes (session, seq_ids, next_token, pos)
+        so a survivor can re-home via generate_resume with NO re-prefill (docs/FLOATING_COORDINATOR.md
+        §6). keep_warm leaves the holders' KV intact (the holder's idle reaper reclaims it if abandoned)."""
+        sid = session if session is not None else next(self._session_ids)   # explicit id → exposable for re-home
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
-            seq = ids.shape[1]
-            # prefill (pos=0 tells the stages to begin a fresh sequence)
-            hidden = self._relay_with_failover(sid, 0, self.embed(ids), ids[:, :0])
+            hidden = self._relay_with_failover(sid, 0, self.embed(ids), ids[:, :0])   # prefill at pos 0
             nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-            out, _, _, _ = self._greedy_steps(sid, ids, nxt, seq, n_new)
-            return self.tok.decode(out), out
+            out, seq_ids, nxt, cur = self._greedy_steps(sid, ids, nxt, ids.shape[1], n_new)
+            return self.tok.decode(out), out, seq_ids, nxt, cur
         finally:
-            self._reset_sessions(sid)
+            if not keep_warm:
+                self._reset_sessions(sid)
+
+    def generate(self, prompt: str, n_new: int = 20, session=None,
+                 keep_warm: bool = False) -> Tuple[str, List[int]]:
+        text, out, _, _, _ = self.generate_state(prompt, n_new, session=session, keep_warm=keep_warm)
+        return text, out
 
     def generate_resume(self, session: int, seq_ids: torch.Tensor, nxt: torch.Tensor,
                         cur: int, n_new: int = 256) -> Tuple[str, List[int]]:
@@ -1052,11 +1075,19 @@ class Coordinator:
         supplies. Never sends pos==0 (that would reset the holders' KV). Requires the route to land
         on the SAME holders that hold this session's KV: automatic at replication=1; at replication>1
         the control plane must pin the session's replicas so re-home re-acquires them."""
+        text, out, _, _, _ = self.generate_resume_state(session, seq_ids, nxt, cur, n_new)
+        return text, out
+
+    def generate_resume_state(self, session: int, seq_ids: torch.Tensor, nxt: torch.Tensor,
+                              cur: int, n_new: int = 256, keep_warm: bool = False):
+        """generate_resume + the updated head-side state (so a re-homed session can itself be
+        re-homed again). Returns (text, out, seq_ids, next_token, pos)."""
         try:
-            out, _, _, _ = self._greedy_steps(session, seq_ids, nxt, cur, n_new)
-            return self.tok.decode(out), out
+            out, seq_ids, nxt, cur = self._greedy_steps(session, seq_ids, nxt, cur, n_new)
+            return self.tok.decode(out), out, seq_ids, nxt, cur
         finally:
-            self._reset_sessions(session)
+            if not keep_warm:
+                self._reset_sessions(session)
 
     @torch.no_grad()
     def generate_stream(self, prompt: str, n_new: int = 256, stop_on_eos: bool = True):
