@@ -77,6 +77,39 @@ def test_existing_paths_unchanged():
     assert reg.load_snapshot() == {}
 
 
+def test_orchestrator_registers_without_a_slot():
+    """A head-only orchestrator registers through the real register() path: no layer slot, null
+    assignment, joins the entry pool (acquire_entry) but never the route pool (acquire_route)."""
+    reg = _reg()                                     # 3 slots over [20,80), width 20
+    for i in range(3):                               # cover every slot with a slice holder
+        h = Node(node_id=f"h{i}", endpoint=("h", 5000 + i), capacity_layers=20, model_fp="t")
+        assert reg.register(h)["assignment"] is not None and h.slot is not None
+        reg.mark_ready(f"h{i}")
+    orch = Node(node_id="orch0", endpoint=("h", 18931), capacity_layers=0, model_fp="t",
+                orchestrator=True)
+    resp = reg.register(orch)
+    assert resp["assignment"] is None, "orchestrator must NOT be assigned a layer slot"
+    assert orch.slot is None
+    assert all("orch0" not in s.holders for s in reg.topo.slots), "orchestrator is not a slot holder"
+    reg.mark_ready("orch0")
+    # entry pool: the orchestrator drives sessions
+    assert reg.acquire_entry("sX").node_id == "orch0"
+    # route pool: acquire_route routes through slot HOLDERS only, never the orchestrator
+    route = reg.acquire_route("sY")
+    assert {n.node_id for n in route} == {"h0", "h1", "h2"}
+    assert all(not n.orchestrator for n in route)
+
+
+def test_orchestrator_appears_in_topology_but_holds_no_slot():
+    reg = _reg()
+    orch = Node(node_id="orchZ", endpoint=("pub", 18931), capacity_layers=0, model_fp="t",
+                orchestrator=True)
+    reg.register(orch)
+    snap = reg.snapshot()
+    assert all("orchZ" not in [h["node_id"] for h in s["holders"]] for s in snap["slots"])
+    assert reg.topo.nodes["orchZ"].orchestrator and reg.topo.nodes["orchZ"].slot is None
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -192,10 +192,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            if _coord._dynamic:                       # mesh mode: report the live topology
+            if _coord._dynamic and _coord.registry is not None:   # monolith mesh: report live topology
                 snap = _coord.registry.snapshot()
                 health = {"status": "ok", "model": _coord.model_id, "mesh": True,
                           "stages": len(snap["slots"]), "coverage_ok": snap["coverage_ok"]}
+            elif _coord._dynamic:                     # head-only orchestrator: topology is on the control plane
+                health = {"status": "ok", "model": _coord.model_id, "mesh": True, "role": "orchestrator"}
             else:
                 n_remote = len(_coord._stage_addrs)
                 n_stages = n_remote + (1 if _coord.local_stage is not None else 0)
@@ -209,7 +211,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": _coord.model_id, "object": "model", "owned_by": "circuit"}]})
         elif self.path == "/v1/workers":
             # in mesh mode the holders come from the live registry, not the static list
-            workers = _coord.registry.snapshot() if _coord._dynamic else _coord.stage_topology()
+            if _coord._dynamic and _coord.registry is not None:
+                workers = _coord.registry.snapshot()
+            elif _coord._dynamic:                     # head-only orchestrator: slice topology is on the control plane
+                workers = {"role": "orchestrator", "note": "slice topology lives on the control plane"}
+            else:
+                workers = _coord.stage_topology()
             self._json(200, {"workers": workers})
         else:
             self._json(404, {"error": "not found"})
@@ -381,7 +388,118 @@ class Handler(BaseHTTPRequestHandler):
             log("INFO", "done", tokens=len(toks), secs=round(time.time() - t0, 2))
 
 
+def _control_post(url, obj, timeout=10):
+    """POST JSON to the control plane, return (status, parsed-json)."""
+    import urllib.request
+    data = json.dumps(obj).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, json.loads(r.read() or b"{}")
+
+
+def _resolve_orch_identity():
+    """ed25519 keypair for this orchestrator (signs control-plane RPCs; node_id = pubkey hex).
+    Priority: CIRCUIT_NODE_KEY hex, else a persisted key file (stable id across restarts), else
+    generate + save — mirrors the stage worker's node identity."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    RAW, RAWPRIV, NOENC = (serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                           serialization.NoEncryption())
+    hexk = os.environ.get("CIRCUIT_NODE_KEY")
+    if hexk:
+        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(hexk.strip()))
+    else:
+        kf = os.environ.get("CIRCUIT_NODE_KEY_FILE", "/workspace/orch_key.hex")
+        if os.path.exists(kf):
+            sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(open(kf).read().strip()))
+        else:
+            sk = Ed25519PrivateKey.generate()
+            try:
+                with open(kf, "w") as f:
+                    f.write(sk.private_bytes(RAW, RAWPRIV, NOENC).hex())
+            except OSError:
+                pass
+    priv = sk.private_bytes(RAW, RAWPRIV, NOENC).hex()
+    node_id = sk.public_key().public_bytes(RAW, serialization.PublicFormat.Raw).hex()
+    return priv, node_id
+
+
+def _run_control_plane():
+    """CIRCUIT_ROLE=control — the standalone control plane (docs/FLOATING_COORDINATOR.md §4a):
+    registry + control channel only. No model, no coordinator, no inference HTTP. Off-GPU-capable;
+    a single instance is fine to launch (HA is Phase 4). Orchestrators + slice holders register here;
+    the gateway resolves an orchestrator via /entry/acquire."""
+    from engine.control_server import make_server
+    mesh = _build_mesh()
+    if not mesh:
+        raise SystemExit("CIRCUIT_ROLE=control needs CIRCUIT_MESH=1 (+ CIRCUIT_MESH_LAYERS / _STAGES)")
+    reg, chost, cport, reap, verify_sig = mesh
+    csrv = make_server(reg, host=chost, port=cport, reap_interval=reap, verify_sig=verify_sig)
+    log("INFO", "standalone control plane up", port=cport, stages=len(reg.topo.slots),
+        replication=reg.topo.replication, verify_sig=bool(verify_sig))
+    csrv.serve_forever()
+
+
+def _run_orchestrator():
+    """CIRCUIT_ROLE=orchestrator — a head-only orchestrator node (docs/FLOATING_COORDINATOR.md §4b):
+    the head bundle (embed/norm/lm_head + 1.5B draft), NO co-located layer slice. It routes every
+    session through the standalone control plane (RemoteRouteProvider) and self-registers so the
+    gateway's acquire_entry can target it. Many of these run in parallel; each drives its own draft,
+    so draft + head + orchestration compute distribute across the network."""
+    global _coord
+    from engine.control_server import make_ed25519_signer
+    from engine.route_provider import RemoteRouteProvider
+    control_url = os.environ["CIRCUIT_CONTROL_URL"].rstrip("/")
+    priv, node_id = _resolve_orch_identity()
+    signer = make_ed25519_signer(priv, node_id)
+
+    key = bytes.fromhex(os.environ["CIRCUIT_KEY"])
+    _coord = Coordinator(
+        os.environ["CIRCUIT_MODEL"], [], key,
+        device=os.environ.get("CIRCUIT_DEVICE", "cuda"),
+        local_layers=None,                          # HEAD-ONLY: no co-located slice
+        draft_model_id=os.environ.get("CIRCUIT_DRAFT") or None,
+        route_provider=RemoteRouteProvider(control_url, signer),
+        max_concurrency=int(os.environ.get("CIRCUIT_MAX_CONCURRENCY", "1")),
+        chain_relay=os.environ.get("CIRCUIT_CHAIN") == "1",
+    )
+
+    api_port = int(os.environ.get("CIRCUIT_API_PORT", "18931"))
+    advertise = os.environ.get("CIRCUIT_ORCH_ADVERTISE") or os.environ.get("CIRCUIT_API_HOST", "127.0.0.1")
+    reg_body = {"endpoint": [advertise, api_port], "capacity_layers": 0,
+                "model_fp": os.environ.get("CIRCUIT_MESH_FP", ""), "orchestrator": True,
+                "reachability": os.environ.get("CIRCUIT_REACHABILITY", "public"),
+                "payout_wallet": os.environ.get("CIRCUIT_COORD_PAYOUT_WALLET", "")}
+    st, _ = _control_post(control_url + "/register", signer(dict(reg_body)))   # signed (authed register)
+    _control_post(control_url + "/ready", {"node_id": node_id})                # head loaded → READY
+    log("INFO", "orchestrator registered", status=st, node=node_id[:12], control=control_url,
+        advertise=f"{advertise}:{api_port}")
+
+    def _heartbeat():
+        while True:
+            time.sleep(float(os.environ.get("CIRCUIT_HEARTBEAT_INTERVAL", "10")))
+            try:
+                _, r = _control_post(control_url + "/heartbeat", {"node_id": node_id})
+                if not r.get("registered"):           # control plane restarted/forgot us → re-register
+                    _control_post(control_url + "/register", signer(dict(reg_body)))
+                    _control_post(control_url + "/ready", {"node_id": node_id})
+                    log("INFO", "re-registered after control-plane restart", node=node_id[:12])
+            except Exception as e:   # noqa: BLE001 — heartbeat must never take down serving
+                log("WARN", "heartbeat failed", err=str(e))
+    threading.Thread(target=_heartbeat, daemon=True).start()
+
+    host = os.environ.get("CIRCUIT_API_HOST", "0.0.0.0")
+    srv = ThreadingHTTPServer((host, api_port), Handler)
+    log("INFO", "orchestrator API ready", port=api_port, model=_coord.model_id)
+    srv.serve_forever()
+
+
 def main():
+    role = os.environ.get("CIRCUIT_ROLE", "")
+    if role == "control":
+        return _run_control_plane()
+    if role == "orchestrator":
+        return _run_orchestrator()
     global _coord, _sched
     log("INFO", "loading engine", model=os.environ.get("CIRCUIT_MODEL"))
     mesh = _build_mesh()                       # None unless CIRCUIT_MESH=1

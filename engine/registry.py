@@ -77,8 +77,15 @@ class Registry:
                 raise PermissionError(f"node {node.node_id} is banned (evicted {self.ban_after}+ times)")
             if self.allowlist is not None and node.node_id not in self.allowlist:
                 raise PermissionError(f"node {node.node_id} not on allowlist")
-            # prefer_range: a re-registering node asks for its already-loaded slot back.
-            slot = self.topo.register(node, now, prefer_range=prefer_range)   # raises on mismatch / capacity
+            if node.orchestrator:
+                # Head-only orchestrator: no layer slice → no slot. It joins the orchestrator pool
+                # (acquire_entry) rather than a slot's holders (acquire_route). assignment is null.
+                self.topo.register_orchestrator(node, now)
+                assignment = None
+            else:
+                # prefer_range: a re-registering node asks for its already-loaded slot back.
+                slot = self.topo.register(node, now, prefer_range=prefer_range)   # raises on mismatch / capacity
+                assignment = {"start": slot.start, "end": slot.end}
             # Bootstrap fleet is trusted outright so newcomers have a reference to be verified
             # against; everyone else stays PROBATION (default) until they pass challenges.
             if self.seed_nodes and node.node_id in self.seed_nodes:
@@ -88,7 +95,7 @@ class Registry:
             self.wallets[node.node_id] = node.payout_wallet
             self._save_state()
             return {
-                "assignment": {"start": slot.start, "end": slot.end},
+                "assignment": assignment,          # null for a head-only orchestrator
                 "model_fp": self.topo.model_fp,
                 "session_key": key.hex(),
                 "coordinator": self.coordinator_endpoint,

@@ -128,8 +128,9 @@ def _handler(registry, now_fn, verify_sig):
                     # loaded_layers (optional): a re-registering node asks for its already-
                     # loaded slot back so it doesn't get a different range and serve stale layers.
                     resp = registry.register(node, now_fn(), prefer_range=body.get("loaded_layers"))
+                    a = resp.get("assignment")
                     log("INFO", "node registered", node=node.node_id[:12],
-                        layers=f'{resp["assignment"]["start"]}:{resp["assignment"]["end"]}')
+                        layers=(f'{a["start"]}:{a["end"]}' if a else "orchestrator(head-only)"))
                     return self._send(200, resp)
                 if self.path == "/ready":
                     registry.mark_ready(str(body["node_id"]))

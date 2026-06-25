@@ -331,6 +331,23 @@ class Topology:
         slot.holders.append(node.node_id)
         return slot
 
+    def register_orchestrator(self, node: Node, now: float = 0.0) -> None:
+        """Admit a HEAD-ONLY orchestrator (docs/FLOATING_COORDINATOR.md §4b): it drives sessions
+        (head + 1.5B draft) but holds NO layer slice, so it takes NO slot. It joins the node table
+        for acquire_entry / heartbeat / trust with slot=None, and is invisible to acquire_route
+        (which routes only through slot holders). Re-registration (same node_id) is idempotent.
+        model_fp must still match — an orchestrator loads the head of the SAME model."""
+        if node.model_fp != self.model_fp:
+            raise ValueError(f"model mismatch: node {node.model_fp!r} != mesh {self.model_fp!r}")
+        for s in self.slots:                       # re-register: drop any prior (slot) holding
+            if node.node_id in s.holders:
+                s.holders.remove(node.node_id)
+        node.slot = None
+        node.orchestrator = True
+        node.state = JOINING
+        node.last_hb = now
+        self.nodes[node.node_id] = node
+
     def _pick_slot(self, node: Node) -> Optional[Slot]:
         cands = [s for s in self.slots if node.capacity_layers >= self._slot_size(s)]
         if not cands:
