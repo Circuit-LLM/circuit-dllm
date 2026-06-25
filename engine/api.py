@@ -499,8 +499,10 @@ def _run_orchestrator():
         device=os.environ.get("CIRCUIT_DEVICE", "cuda"),
         local_layers=None,                          # HEAD-ONLY: no co-located slice
         draft_model_id=os.environ.get("CIRCUIT_DRAFT") or None,
-        # a big model (72B) can't load whole on one card → shard-load the head only
-        # (CIRCUIT_SHARD=1 [+ CIRCUIT_QUANT=bnb]); small models load fp16 whole (shard unset).
+        # AWQ path (prod): a pre-sliced head-only AWQ submodel (embed/norm/lm_head, 0 layers) loaded
+        # whole via CIRCUIT_COORD_SUBMODEL. bnb path: CIRCUIT_SHARD=1 [+ CIRCUIT_QUANT=bnb] shard-loads
+        # the head from the fp16. Small models: neither set → load fp16 whole. submodel wins if set.
+        submodel=os.environ.get("CIRCUIT_COORD_SUBMODEL", ""),
         shard=os.environ.get("CIRCUIT_SHARD") == "1",
         quant=os.environ.get("CIRCUIT_QUANT", ""),
         other_device=os.environ.get("CIRCUIT_OTHER_DEVICE", "cpu"),

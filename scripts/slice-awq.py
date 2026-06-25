@@ -96,6 +96,12 @@ def sub_config(config: dict, start: int, end: int, keep_head: bool = False) -> d
     c["num_hidden_layers"] = end - start
     if not keep_head:
         c["tie_word_embeddings"] = False
+    if end - start == 0:
+        # HEAD-ONLY slice: no transformer layers remain, so there are NO AWQ-quantized tensors
+        # (AWQ leaves embed/norm/lm_head in fp16). Drop quantization_config — otherwise transformers'
+        # AWQ replacement finds nothing to replace and crashes (has_been_replaced UnboundLocalError).
+        # The head loads as plain fp16, byte-identical to the head weights in any keep-head slice.
+        c.pop("quantization_config", None)
     return c
 
 
