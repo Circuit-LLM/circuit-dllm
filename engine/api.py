@@ -499,6 +499,11 @@ def _run_orchestrator():
         device=os.environ.get("CIRCUIT_DEVICE", "cuda"),
         local_layers=None,                          # HEAD-ONLY: no co-located slice
         draft_model_id=os.environ.get("CIRCUIT_DRAFT") or None,
+        # a big model (72B) can't load whole on one card → shard-load the head only
+        # (CIRCUIT_SHARD=1 [+ CIRCUIT_QUANT=bnb]); small models load fp16 whole (shard unset).
+        shard=os.environ.get("CIRCUIT_SHARD") == "1",
+        quant=os.environ.get("CIRCUIT_QUANT", ""),
+        other_device=os.environ.get("CIRCUIT_OTHER_DEVICE", "cpu"),
         route_provider=RemoteRouteProvider(control_url, signer),
         max_concurrency=int(os.environ.get("CIRCUIT_MAX_CONCURRENCY", "1")),
         chain_relay=os.environ.get("CIRCUIT_CHAIN") == "1",

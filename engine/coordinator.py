@@ -180,6 +180,20 @@ class Coordinator:
                                          device=gpu, other_device=other_device)
                 self.log("INFO", "co-located stage (sharded)", layers=f"{s}:{e}")
             self.local_stage = stage_for_range(model, s, e)
+        elif local_layers is None and shard:
+            # HEAD-ONLY (floating-coordinator orchestrator, docs/FLOATING_COORDINATOR.md §4b): shard-load
+            # ONLY the head bundle (embed/norm/lm_head). With start==end the device_map puts EVERY
+            # transformer layer on meta, so a big model's head (~6 GB at 72B) fits one card without ever
+            # materializing the 144 GB of layers. No co-located stage — all layers are relayed.
+            gpu = "cuda:0" if device == "cuda" else device
+            if quant == "bnb":
+                from engine.model import load_model_shard_bnb
+                model = load_model_shard_bnb(model_id, 0, 0, keep_head=True, device=gpu)
+            else:
+                from engine.model import load_model_shard
+                model = load_model_shard(model_id, 0, 0, keep_head=True,
+                                         device=gpu, other_device=other_device)
+            self.log("INFO", "head-only shard load (orchestrator)", quant=quant or "fp16")
         else:
             model = load_model(model_id, device=device)
             if local_layers is not None:

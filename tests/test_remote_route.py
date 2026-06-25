@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives.serialization import (  # noqa: E402
 
 from engine import wire  # noqa: E402
 from engine.coordinator import Coordinator  # noqa: E402
+from engine.model import load_model  # noqa: E402
 from engine.topology import Topology, Node, READY  # noqa: E402
 from engine.registry import Registry  # noqa: E402
 from engine.control_server import make_server, make_ed25519_verifier, make_ed25519_signer  # noqa: E402
@@ -111,12 +112,19 @@ def main():
         # ── the head-only orchestrator: no local slice, no local registry, route via the control plane ──
         priv, pub = _ed25519_pair()
         rp = RemoteRouteProvider(url, make_ed25519_signer(priv, pub))
-        coord = Coordinator(MODEL, [], coord_key, local_layers=None, route_provider=rp)
+        # CIRCUIT_TEST_SHARD=1 exercises the HEAD-ONLY SHARD load path (the 72B orchestrator path:
+        # embed/norm/lm_head only, layers on meta) instead of a whole fp16 load — must be byte-identical.
+        shard = os.environ.get("CIRCUIT_TEST_SHARD") == "1"
+        coord = Coordinator(MODEL, [], coord_key, local_layers=None, shard=shard, route_provider=rp)
+        print(f"  (head-only load: {'SHARD' if shard else 'whole-fp16'})")
         assert coord.registry is None, "orchestrator must NOT hold a local registry"
         assert coord._dynamic, "orchestrator must route dynamically (via the provider)"
         assert coord.local_stage is None, "head-only: no co-located layer slice"
 
-        ref = _reference(coord._model, coord.tok, N_NEW)
+        # the reference is a FULL-model forward; coord._model is head-only when sharded (layers
+        # dropped to meta/Identity), so load a separate whole model for the ground truth.
+        ref_model = load_model(MODEL) if shard else coord._model
+        ref = _reference(ref_model, coord.tok, N_NEW)
         t0 = time.time(); text, got = coord.generate(PROMPT, N_NEW); dt = time.time() - t0
 
         print(f"  head-only remote-route: {got == ref}  ({dt:.1f}s)")
