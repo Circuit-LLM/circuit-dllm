@@ -1,0 +1,9 @@
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.yarn
+# keypairs are environment secrets — never commit (regenerate per the README)
+keys/*.json
