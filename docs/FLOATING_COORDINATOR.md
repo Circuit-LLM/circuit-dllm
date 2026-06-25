@@ -159,15 +159,30 @@ This is mostly a refactor — the engine was built with the joints:
 
 ## 9. Build order (do it right; byte-identical gates like every prior engine change)
 
-1. **Control/data-plane split, behavior-preserving.** Registry as a standalone service; one
-   orchestrator still in the loop. DoD: output **byte-identical** to today (the standing engine
-   gate), `coverage_ok`, no perf regression.
-2. **Head-only orchestrator + remote `acquire_route` + gateway `acquire_entry`.** Still one
-   orchestrator. DoD: parity/byte-identical; failover re-home re-attaches KV (no re-prefill) in a
-   unit test over a synthetic latency matrix (`topology.py` is pure logic).
-3. **Second orchestrator + session re-home on the shared replica pool.** DoD: measure aggregate
-   throughput scaling on a **scattered** mesh (the only valid test); confirm draft compute
-   distributes; orchestrator-kill mid-session continues the conversation.
+1. **[DONE]** **Control/data-plane split, behavior-preserving.** Registry as a standalone service;
+   one orchestrator still in the loop. DoD: output **byte-identical** to today (the standing engine
+   gate), `coverage_ok`, no perf regression. — *Coordinator routes via a RouteProvider
+   (Local=byte-identical passthrough); authed route/entry RPCs on the control channel. Gated on an
+   A4000: `test_chain_relay` star==ref==chain byte-identical.*
+2. **[DONE]** **Head-only orchestrator + remote `acquire_route` + KV re-home.** Still one orchestrator
+   per session. DoD: parity/byte-identical; re-home re-attaches KV (no re-prefill).
+   - *2a — registry-optional dynamic relay: a head-only orchestrator (no co-located slice, no local
+     registry) consumes routes from a `RemoteRouteProvider`; `RouteHop` is a drop-in for a `Node`;
+     per-node keys come from a route-key cache; `mark_suspect` routes through the provider
+     (`/route/suspect`). Gate: `test_remote_route` byte-identical to the in-process reference on an
+     A6000.*
+   - *2b — worker-global session KV (survives an orchestrator disconnect) + reaper;
+     `generate_resume` continues a session from carried head-side state with no pos==0. Gate:
+     `test_rehome` — orchestrator A builds K tokens, drops its connections, orchestrator B re-homes
+     and produces M more, A++B byte-identical to the single-model reference; empty-KV control
+     diverges.*
+   - *Remaining for full 2: gateway `acquire_entry` (3.3) — only meaningful once orchestrators run as
+     registered HTTP services (§4 below), so it lands with step 3.*
+3. **[NEXT — GPU mesh]** **Second orchestrator + session re-home on the shared replica pool + gateway
+   `acquire_entry`.** DoD: measure aggregate throughput scaling on a **scattered** mesh (the only
+   valid test); confirm draft compute distributes; orchestrator-kill mid-session continues the
+   conversation. NB: re-home KV-affinity is automatic at replication=1; at replication>1 the control
+   plane must pin a session's replicas so re-home re-acquires the SAME holders.
 4. **Control-plane HA** (standby/Raft) — last, off the hot path.
 
 ## 10. Risks / open questions

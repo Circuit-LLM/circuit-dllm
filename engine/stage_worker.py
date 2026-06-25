@@ -21,6 +21,7 @@ import os
 import socket
 import struct
 import threading
+import time
 
 import torch
 
@@ -77,13 +78,17 @@ def _fwd_conn(pool, host, port):
     return s
 
 
-def _serve_conn(conn, addr, key, stage, config, device, compute_lock, log):
-    """Serve one peer connection (its own session/KV space) until it closes."""
+def _serve_conn(conn, addr, key, stage, config, device, compute_lock, log,
+                sessions, sessions_lock, session_touch):
+    """Serve one peer connection until it closes. The session/KV store is WORKER-GLOBAL (shared
+    across peer connections, passed in by serve()), so a session's KV survives the orchestrator
+    that created it dropping its connection — a re-homed orchestrator re-attaches by session-id
+    with no re-prefill (docs/FLOATING_COORDINATOR.md §6)."""
     log("INFO", "peer connected", addr=f"{addr[0]}:{addr[1]}")
-    sessions: dict[int, StageKV] = {}
     fwd_conns: dict = {}             # (host,port) -> outbound socket for chain forwarding
     try:
-        _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_conns)
+        _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_conns,
+                sessions_lock, session_touch)
     except (wire.WireError, OSError) as e:
         log("WARN", "connection dropped", reason=str(e))
     finally:
@@ -193,6 +198,30 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
     config = model.config
     compute_lock = threading.Lock()   # serialize model use across peer threads
 
+    # WORKER-GLOBAL session KV (docs/FLOATING_COORDINATOR.md §6): shared across peer connections so a
+    # session's KV outlives the orchestrator that built it — a re-homed orchestrator re-attaches by
+    # session-id without re-prefill. A reaper frees sessions idle past the TTL, so a crashed
+    # orchestrator that never sends KVOP_FREE can't leak KV unboundedly. session-ids must be globally
+    # unique across orchestrators (the entry allocator guarantees this) or distinct conversations
+    # would collide in this one store.
+    sessions: dict = {}
+    sessions_lock = threading.Lock()
+    session_touch: dict = {}
+    session_ttl = float(os.environ.get("CIRCUIT_SESSION_TTL_S", "1800"))
+
+    def _session_reaper():
+        while True:
+            time.sleep(min(session_ttl, 60.0))
+            cutoff = time.monotonic() - session_ttl
+            with sessions_lock:
+                stale = [s for s, t in list(session_touch.items()) if t < cutoff]
+                for s in stale:
+                    sessions.pop(s, None)
+                    session_touch.pop(s, None)
+            if stale:
+                log("INFO", "reaped abandoned sessions", n=len(stale))
+    threading.Thread(target=_session_reaper, daemon=True).start()
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -208,7 +237,8 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
         def _on_relay_data(sock):
             _set_keepalive(sock)
             threading.Thread(target=_serve_conn,
-                             args=(sock, ("relay", 0), key, stage, config, device, compute_lock, log),
+                             args=(sock, ("relay", 0), key, stage, config, device, compute_lock, log,
+                                   sessions, sessions_lock, session_touch),
                              daemon=True).start()
         threading.Thread(target=_relay_client, args=(relay, _on_relay_data, log), daemon=True).start()
         log("INFO", "relay client started", relay=relay.get("url"))
@@ -223,14 +253,34 @@ def serve(port: int, start: int, end: int, model_id: str, key: bytes,
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # small frames: no Nagle
         _set_keepalive(conn)
         threading.Thread(target=_serve_conn,
-                         args=(conn, addr, key, stage, config, device, compute_lock, log),
+                         args=(conn, addr, key, stage, config, device, compute_lock, log,
+                               sessions, sessions_lock, session_touch),
                          daemon=True).start()
 
 
 @torch.no_grad()
-def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_conns=None):
+def _get_cache(sessions, lock, touch, session, pos, config, now):
+    """Locked get-or-create of a session's KV in the worker-global store. pos==0 starts a fresh
+    sequence (new conversation / failover re-prefill); otherwise an EXISTING entry is reused — and
+    that reuse across a different peer connection is exactly what lets a re-homed orchestrator
+    resume without re-prefill. `touch` records last activity for the abandoned-session reaper."""
+    with lock:
+        cache = sessions.get(session)
+        if cache is None or pos == 0:
+            cache = StageKV(config)
+            sessions[session] = cache
+        touch[session] = now
+        return cache
+
+
+def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_conns=None,
+            sessions_lock=None, session_touch=None):
     if fwd_conns is None:
         fwd_conns = {}
+    if sessions_lock is None:   # legacy/standalone callers: a private store needs no cross-conn lock
+        sessions_lock = threading.Lock()
+    if session_touch is None:
+        session_touch = {}
     while True:
         try:
             mt, payload = wire.read_frame_keyed(conn, key)
@@ -242,10 +292,8 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_c
         if mt == wire.ACTIVATION:
             session, pos, _flags, hidden = unpack_activation(payload)
             hidden = hidden.to(device)
-            cache = sessions.get(session)
-            if cache is None or pos == 0:           # pos==0 begins a new sequence
-                cache = StageKV(config)
-                sessions[session] = cache
+            cache = _get_cache(sessions, sessions_lock, session_touch, session, pos, config,
+                               time.monotonic())
             position_ids = _position_ids(hidden.shape[1], pos, device)
             with compute_lock:                      # one model fwd at a time across peers
                 out = stage.forward(hidden, position_ids, past_key_values=cache, use_cache=True)
@@ -258,10 +306,8 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_c
             hidden = hidden.to(device)
             position_ids = position_ids.to(device).long()
             attn = attn.to(device)
-            cache = sessions.get(batch_id)
-            if cache is None or pos == 0:           # pos==0 begins a fresh batch
-                cache = StageKV(config)
-                sessions[batch_id] = cache
+            cache = _get_cache(sessions, sessions_lock, session_touch, batch_id, pos, config,
+                               time.monotonic())
             with compute_lock:
                 out = stage.forward(hidden, position_ids, past_key_values=cache,
                                     use_cache=True, attention_mask=attn)
@@ -278,10 +324,8 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_c
             hidden = hidden.to(device)
             tpos = tpos.to(device).long().view(1, -1)
             parents = [int(x) for x in parents.tolist()]
-            cache = sessions.get(session)
-            if cache is None or pos == 0:
-                cache = StageKV(config)
-                sessions[session] = cache
+            cache = _get_cache(sessions, sessions_lock, session_touch, session, pos, config,
+                               time.monotonic())
             tm = build_tree_mask(parents, pos, device, hidden.dtype)
             with compute_lock:
                 out = stage.forward(hidden, tpos, past_key_values=cache,
@@ -297,14 +341,12 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_c
             route, rest = chain.decode_route(payload)
             session, pos, _flags, hidden = unpack_activation(rest)
             hidden = hidden.to(device)
-            cache = sessions.get(session)
-            # pos==0 resets this session's KV — and this IS the chain failover recovery: on a
-            # mid-chain hop failure the coordinator re-prefills the session at pos==0 on a
-            # fresh route, which lands here and clears any half-advanced KV. (In chain mode a
-            # KV_CTRL reset reaches only the head; non-head nodes rely on this pos==0 reset.)
-            if cache is None or pos == 0:
-                cache = StageKV(config)
-                sessions[session] = cache
+            # pos==0 starts a fresh KV — and this IS the chain failover recovery: on a mid-chain
+            # hop failure the coordinator re-prefills the session at pos==0 on a fresh route, which
+            # lands here and clears any half-advanced KV. (In chain mode a KV_CTRL reset reaches only
+            # the head; non-head nodes rely on this pos==0 reset.)
+            cache = _get_cache(sessions, sessions_lock, session_touch, session, pos, config,
+                               time.monotonic())
             position_ids = _position_ids(hidden.shape[1], pos, device)
             with compute_lock:
                 out = stage.forward(hidden, position_ids, past_key_values=cache, use_cache=True)
@@ -332,22 +374,25 @@ def _handle(conn, key, stage, config, device, sessions, log, compute_lock, fwd_c
 
         elif mt == wire.KV_CTRL:
             session, op, arg = struct.unpack(">IBI", payload[:9])
-            if op == KVOP_FREE:
-                sessions.pop(session, None)         # drop the entry; frees its KV
-            elif op == KVOP_TREE_KEEP:
-                # compact KV to prefix [0,arg) + the accepted-path tree slots that follow
-                cache = sessions.get(session)
-                if cache is not None:
+            with sessions_lock:                     # dict structure access only (cache mutated below)
+                if op == KVOP_FREE:
+                    sessions.pop(session, None)      # drop the entry; frees its KV
+                    session_touch.pop(session, None)
+                    cache = None
+                else:
+                    cache = sessions.get(session)
+                    if cache is not None:
+                        session_touch[session] = time.monotonic()
+            if cache is not None:                   # single-owner cache → mutate outside the lock
+                if op == KVOP_TREE_KEEP:
+                    # compact KV to prefix [0,arg) + the accepted-path tree slots that follow
                     (n,) = struct.unpack(">I", payload[9:13])
                     slots = struct.unpack(">%dI" % n, payload[13:13 + 4 * n]) if n else ()
                     cache.keep_tree_path(arg, slots)
-            else:
-                cache = sessions.get(session)
-                if cache is not None:
-                    if op == KVOP_RESET:
-                        cache.reset()
-                    elif op == KVOP_TRUNCATE:
-                        cache.truncate_to(arg)
+                elif op == KVOP_RESET:
+                    cache.reset()
+                elif op == KVOP_TRUNCATE:
+                    cache.truncate_to(arg)
 
         elif mt == wire.PING:
             wire.write_frame(conn, key, wire.PONG, payload)

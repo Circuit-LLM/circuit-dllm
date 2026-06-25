@@ -1011,30 +1011,52 @@ class Coordinator:
         return outs
 
     @torch.no_grad()
+    def _greedy_steps(self, session, seq_ids, nxt, cur, n_new):
+        """The greedy decode loop, factored out so a fresh generate() and a re-homed
+        generate_resume() share ONE code path (so the resumed tokens are byte-identical to normal
+        decode). Runs up to n_new steps from the carried head-side state (token history `seq_ids`,
+        next token `nxt`, position `cur`); does NOT prefill and does NOT reset KV (the caller owns
+        the session lifecycle). Returns (produced tokens, updated seq_ids, next token, position)."""
+        out: List[int] = []
+        for _ in range(n_new):
+            tid = int(nxt)
+            if tid in self._eos_ids:
+                break
+            out.append(tid)
+            hidden = self._relay_with_failover(session, cur, self.embed(nxt), seq_ids)
+            seq_ids = torch.cat([seq_ids, nxt], dim=1)
+            nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
+            cur += 1
+        return out, seq_ids, nxt, cur
+
     def generate(self, prompt: str, n_new: int = 20) -> Tuple[str, List[int]]:
         sid = next(self._session_ids)
         try:
             ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
             seq = ids.shape[1]
-            seq_ids = ids                            # tokens for the positions already in KV
-
             # prefill (pos=0 tells the stages to begin a fresh sequence)
-            hidden = self._relay_with_failover(sid, 0, self.embed(ids), seq_ids[:, :0])
+            hidden = self._relay_with_failover(sid, 0, self.embed(ids), ids[:, :0])
             nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-            out = []
-            cur = seq
-            for _ in range(n_new):
-                tid = int(nxt)
-                if tid in self._eos_ids:
-                    break
-                out.append(tid)
-                hidden = self._relay_with_failover(sid, cur, self.embed(nxt), seq_ids)
-                seq_ids = torch.cat([seq_ids, nxt], dim=1)
-                nxt = self.lm_head(self.norm(hidden))[:, -1].argmax(-1, keepdim=True)
-                cur += 1
+            out, _, _, _ = self._greedy_steps(sid, ids, nxt, seq, n_new)
             return self.tok.decode(out), out
         finally:
             self._reset_sessions(sid)
+
+    def generate_resume(self, session: int, seq_ids: torch.Tensor, nxt: torch.Tensor,
+                        cur: int, n_new: int = 256) -> Tuple[str, List[int]]:
+        """Re-home entry (docs/FLOATING_COORDINATOR.md §6): continue an in-flight session on THIS
+        orchestrator WITHOUT re-prefill. The slice-holders already hold this session's KV (worker-
+        global, keyed by session-id) up to position `cur`; we resume the greedy loop from the carried
+        head-side state — the running token sequence `seq_ids`, the next token `nxt`, the position
+        `cur` — which the dying orchestrator's session record (or a client resend of the tail)
+        supplies. Never sends pos==0 (that would reset the holders' KV). Requires the route to land
+        on the SAME holders that hold this session's KV: automatic at replication=1; at replication>1
+        the control plane must pin the session's replicas so re-home re-acquires them."""
+        try:
+            out, _, _, _ = self._greedy_steps(session, seq_ids, nxt, cur, n_new)
+            return self.tok.decode(out), out
+        finally:
+            self._reset_sessions(session)
 
     @torch.no_grad()
     def generate_stream(self, prompt: str, n_new: int = 256, stop_on_eos: bool = True):
