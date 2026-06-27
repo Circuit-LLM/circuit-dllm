@@ -24,6 +24,7 @@ make_ed25519_verifier()`. Until that's enforced, run permissioned on a private n
 """
 
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,14 +35,25 @@ from engine.topology import Node
 log = make_logger("control")
 
 
-def make_ed25519_verifier():
+def make_ed25519_verifier(ts_window=None):
     """A verify_sig(body) that proves the registrant holds the private key behind its
     node_id (= ed25519 public key hex). body must carry `ts` and `sig` (hex); the
-    signed message is canonical-JSON of the body minus `sig`."""
+    signed message is canonical-JSON of the body minus `sig`.
+
+    Also enforces timestamp freshness so a captured signed body can't be REPLAYED to
+    re-register a victim (redirecting its payout_wallet/endpoint) or replay a route RPC.
+    Window = ts_window seconds (env CIRCUIT_MESH_TS_WINDOW, default 300; 0 disables).
+    All signers stamp a fresh `ts` (make_ed25519_signer / stage_worker), so this is safe."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    if ts_window is None:
+        ts_window = float(os.environ.get("CIRCUIT_MESH_TS_WINDOW", "300"))
 
     def verify(body: dict) -> bool:
         try:
+            if ts_window:
+                ts = body.get("ts")
+                if ts is None or abs(time.time() - float(ts)) > ts_window:
+                    return False
             sig = bytes.fromhex(body["sig"])
             pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(body["node_id"]))
             msg = json.dumps({k: v for k, v in body.items() if k != "sig"},
@@ -88,6 +100,17 @@ def _node_json(registry, n, with_key=False):
 
 
 def _handler(registry, now_fn, verify_sig, entry_require_sig=False):
+    # Liveness (/ready,/heartbeat,/drain) signature enforcement. Default LENIENT (verify a
+    # signature if present, but still accept unsigned) so the control plane can be upgraded
+    # before every worker is — set CIRCUIT_MESH_STRICT_LIVENESS=1 once all workers sign to
+    # reject unsigned liveness (closes the unauth /drain / fake-/ready DoS).
+    strict_liveness = os.environ.get("CIRCUIT_MESH_STRICT_LIVENESS") == "1"
+    # Per-caller rate limit on /route/suspect so one (authenticated but compromised)
+    # orchestrator can't flood-SUSPECT every holder and deny the whole mesh.
+    suspect_max_per_min = int(os.environ.get("CIRCUIT_SUSPECT_MAX_PER_MIN", "20"))
+    _suspect_log = {}
+    _suspect_lock = threading.Lock()
+
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -132,6 +155,18 @@ def _handler(registry, now_fn, verify_sig, entry_require_sig=False):
                     log("INFO", "node registered", node=node.node_id[:12],
                         layers=(f'{a["start"]}:{a["end"]}' if a else "orchestrator(head-only)"))
                     return self._send(200, resp)
+                # Liveness mutations — AUTHENTICATE when verify_sig is configured. node_id is
+                # public (returned by GET /topology), so without this any peer could /drain a
+                # holder (forced coverage gap) or fake-/ready a JOINING node before its weights
+                # load. Workers sign these (stage_worker `_live_body`); unsigned is accepted only
+                # while not strict (rollout grace).
+                if self.path in ("/ready", "/heartbeat", "/drain"):
+                    if verify_sig is not None:
+                        if "sig" in body:
+                            if not verify_sig(body):
+                                return self._send(401, {"error": "signature verification failed"})
+                        elif strict_liveness:
+                            return self._send(401, {"error": "liveness endpoints require a signature"})
                 if self.path == "/ready":
                     registry.mark_ready(str(body["node_id"]))
                     return self._send(200, {"ok": True})
@@ -169,6 +204,16 @@ def _handler(registry, now_fn, verify_sig, entry_require_sig=False):
                     if not verify_sig(body):
                         return self._send(401, {"error": "signature verification failed"})
                     if self.path == "/route/suspect":      # failover: a remote orchestrator reports a dead holder
+                        # Rate-limit per caller so one compromised orchestrator can't flood-SUSPECT
+                        # every holder (mesh-wide coverage gap). node_id is the verified caller.
+                        caller = str(body.get("node_id", ""))
+                        now = time.time()
+                        with _suspect_lock:
+                            hist = [t for t in _suspect_log.get(caller, ()) if now - t < 60.0]
+                            if len(hist) >= suspect_max_per_min:
+                                return self._send(429, {"error": "too many suspect reports"})
+                            hist.append(now)
+                            _suspect_log[caller] = hist
                         registry.mark_suspect(str(body["suspect"]))
                         return self._send(200, {"ok": True})
                     session = str(body["session"])

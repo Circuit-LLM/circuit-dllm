@@ -303,7 +303,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": f"bad request: {e}"})
 
         messages = body.get("messages", [])
-        max_tokens = int(body.get("max_tokens") or 256)
+        # Clamp max_tokens to a hard ceiling IN THE ENGINE (not only the gateway, which an
+        # attacker reaching the engine port directly bypasses). The decode loop is bounded
+        # only by this, so an unbounded value would monopolize the whole mesh pipeline (DoS).
+        _mt_cap = int(os.environ.get("CIRCUIT_MAX_TOKENS_CAP", "2048"))
+        max_tokens = max(1, min(int(body.get("max_tokens") or 256), _mt_cap))
         tools = body.get("tools") or None
         # tool calls are parsed from the full generation, so they always run
         # non-stream (streaming partial tool-calls is deferred).
@@ -380,6 +384,20 @@ class Handler(BaseHTTPRequestHandler):
             keep = bool(body.get("circuit_keep_warm"))
             prior = []
             if resume:
+                # AUTH the re-home: the holders' KV store is keyed only by session-id, and ids are
+                # small/predictable — a raw session_id from an arbitrary caller would ATTACH to
+                # another user's warm KV (cross-session leak/poison). Restrict resume to a trusted
+                # caller: loopback (the local gateway) or a matching X-Circuit-Internal key. The gate
+                # activates once CIRCUIT_ENGINE_INTERNAL_KEY is set (until then, unchanged behavior so
+                # a deploy can't break re-home before the gateway is configured to send the key).
+                _ik = os.environ.get("CIRCUIT_ENGINE_INTERNAL_KEY", "")
+                if _ik:
+                    import hmac as _hmac
+                    _peer = self.client_address[0] if self.client_address else ""
+                    _is_local = _peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+                    _hdr = self.headers.get("X-Circuit-Internal", "")
+                    if not (_is_local or _hmac.compare_digest(_hdr, _ik)):
+                        return self._json(403, {"error": "circuit_resume requires a trusted caller"})
                 sid = int(resume["session_id"])
                 seq = torch.tensor([resume["seq_ids"]], device=_coord.device, dtype=torch.long)
                 nxt = torch.tensor([[int(resume["next_token"])]], device=_coord.device, dtype=torch.long)

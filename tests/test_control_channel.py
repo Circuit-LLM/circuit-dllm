@@ -11,6 +11,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -83,15 +84,20 @@ def main():
         priv = Ed25519PrivateKey.generate()
         pub_hex = priv.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
-        body = {"node_id": pub_hex, "endpoint": ["h", 1], "model_fp": FP, "ts": 123}
-        msg = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-        body["sig"] = priv.sign(msg).hex()
+        def _signed(ts):
+            b = {"node_id": pub_hex, "endpoint": ["h", 1], "model_fp": FP, "ts": ts}
+            b["sig"] = priv.sign(json.dumps(b, sort_keys=True, separators=(",", ":")).encode()).hex()
+            return b
         verify = make_ed25519_verifier()
+        body = _signed(int(time.time()))           # fresh ts
         assert verify(body) is True, "valid signature accepted"
         tampered = dict(body); tampered["model_fp"] = "TAMPERED"
         assert verify(tampered) is False, "tampered body rejected"
+        # ts-freshness (replay protection): a stale/ancient ts is rejected even with a valid sig
+        assert verify(_signed(123)) is False, "stale ts rejected (replay protection)"
+        assert verify(_signed(int(time.time()) - 10_000)) is False, "old ts rejected"
 
-        print("CONTROL CHANNEL TESTS PASSED — register/assign/key, reject, ready, topology, ed25519")
+        print("CONTROL CHANNEL TESTS PASSED — register/assign/key, reject, ready, topology, ed25519, ts-freshness")
     finally:
         srv.shutdown()
 

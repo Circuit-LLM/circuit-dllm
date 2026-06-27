@@ -537,6 +537,17 @@ def run_control_client(a):
         return (resp["assignment"]["start"], resp["assignment"]["end"],
                 wire.normalize_key(bytes.fromhex(resp["session_key"])))
 
+    def _live_body(node_id):
+        """A SIGNED liveness body for /ready, /heartbeat, /drain — same scheme as /register so the
+        control plane can authenticate liveness (node_id is public via /topology; without a signature
+        any peer could /drain a holder or fake-/ready a JOINING node). Canonical-JSON of {node_id, ts}
+        signed with our ed25519 key; byte-identical to the control_server verifier's reconstruction."""
+        b = {"node_id": node_id, "ts": int(_time.time())}
+        if getattr(a, "_signing_key", None) is not None:
+            msg = _json.dumps(b, sort_keys=True, separators=(",", ":")).encode()
+            b["sig"] = a._signing_key.sign(msg).hex()
+        return b
+
     def _register_standby(target, prefer_range):
         """Best-effort: register our ALREADY-loaded slot on a warm-standby control plane (+ ready),
         so it can route to us the instant the active dies. prefer_range pins the SAME slot the active
@@ -554,7 +565,7 @@ def run_control_client(a):
                 clog("ERROR", "standby assigned a different slot — not honoring prefer_range",
                      target=target, want=f"{prefer_range[0]}:{prefer_range[1]}",
                      got=f"{asn.get('start')}:{asn.get('end')}")
-            _control_post(target + "/ready", {"node_id": a.node_id}, timeout=5)
+            _control_post(target + "/ready", _live_body(a.node_id), timeout=5)
             return True
         except Exception as e:                       # noqa: BLE001 — best-effort warm-up
             clog("WARN", "standby register failed (will retry on heartbeat)", target=target, error=str(e))
@@ -591,7 +602,7 @@ def run_control_client(a):
             # restart NOT orphan the nodes, now across the active + standbys.
             for b in bases:
                 try:
-                    _c, _resp = _control_post(b + "/heartbeat", {"node_id": a.node_id}, timeout=5)
+                    _c, _resp = _control_post(b + "/heartbeat", _live_body(a.node_id), timeout=5)
                     if isinstance(_resp, dict) and _resp.get("registered") is False:
                         clog("WARN", "control plane forgot us — re-registering", base=b,
                              layers=f"{start}:{end}")
@@ -605,7 +616,7 @@ def run_control_client(a):
     def _on_listening():
         for b in bases:                              # announce READY to every control plane
             try:
-                _control_post(b + "/ready", {"node_id": a.node_id}, timeout=5)
+                _control_post(b + "/ready", _live_body(a.node_id), timeout=5)
             except Exception as e:
                 clog("WARN", "ready post failed", base=b, error=str(e))
         clog("INFO", "ready (serving)", control_planes=len(bases))
@@ -622,7 +633,7 @@ def run_control_client(a):
         stop.set()
         for b in bases:                              # drain from every control plane on exit
             try:
-                _control_post(b + "/drain", {"node_id": a.node_id}, timeout=5)
+                _control_post(b + "/drain", _live_body(a.node_id), timeout=5)
             except Exception:
                 pass
 
