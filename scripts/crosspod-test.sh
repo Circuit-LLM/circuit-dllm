@@ -4,10 +4,12 @@
 # inter-pod connection + relay, not the model. Run in background.
 set -uo pipefail
 KEY=/home/watchtower/.ssh/id_ed25519
-HOST=157.157.221.29
-P1=43452            # pod 1 SSH
-P2=43636            # pod 2 SSH
-STAGE_EXT=43638     # pod 2 stage worker, external (->19210)
+# RunPod proxy IP + the per-pod TCP ports are ephemeral (they change on pod restart) — override via
+# env; the values below are defaults for the pods this smoke test was last run against.
+HOST="${CIRCUIT_RUNPOD_IP:-157.157.221.29}"
+P1="${CROSSPOD_P1:-43452}"            # pod 1 SSH
+P2="${CROSSPOD_P2:-43636}"            # pod 2 SSH
+STAGE_EXT="${CROSSPOD_STAGE_EXT:-43638}"     # pod 2 stage worker, external (->19210)
 MODEL="Qwen/Qwen2.5-0.5B-Instruct"
 CKEY=$(python3 -c "import os;print(os.urandom(32).hex())")
 SSH1="ssh -p $P1 -i $KEY -o StrictHostKeyChecking=no -o ConnectTimeout=8"

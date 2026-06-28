@@ -8,7 +8,9 @@
 #   ./scripts/sync-runpod.sh 'python3 -m tests.test_wire'   # sync + run anything
 set -euo pipefail
 
-HOST=root@157.157.221.29
+# RunPod's proxy IP can change too (like the SSH port) — override with CIRCUIT_RUNPOD_IP; the current
+# proxy IP is the default so existing use is unchanged.
+HOST="root@${CIRCUIT_RUNPOD_IP:-157.157.221.29}"
 KEY=/home/watchtower/.ssh/id_ed25519
 REMOTE=/workspace/circuit-engine
 LOCAL="$(cd "$(dirname "$0")/.." && pwd)/"
