@@ -28,9 +28,20 @@ You should see your GPU and driver version. If `nvidia-smi` is missing:
 - Then re-run `nvidia-smi` to confirm.
 
 ### 1.2 Run the installer
+
+**Linux / WSL2** (inside a bash shell):
 ```bash
 curl -fsSL https://circuitllm.xyz/join | bash
 ```
+
+**Windows** — run in an **Administrator PowerShell** (it installs WSL2 + Ubuntu if needed, then runs
+the installer inside it; the GPU passes through from the NVIDIA *Windows* driver, no driver inside WSL):
+```powershell
+irm https://circuitllm.xyz/join.ps1 | iex
+```
+> Don't paste the `curl … | bash` line into PowerShell — there `curl` is an alias for
+> `Invoke-WebRequest` and just prints the HTTP response (the `$'\r'` / `StatusCode:` errors). Use the
+> `irm … | iex` line, or run the bash line from inside a WSL/Ubuntu shell.
 It will:
 1. detect your GPU,
 2. install **Docker** + the **NVIDIA Container Toolkit** if they're missing,

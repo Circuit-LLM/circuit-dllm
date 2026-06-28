@@ -95,11 +95,23 @@ from several seconds to **sub-second** on every request after the first. On by d
 
 ## Run a GPU node (join the mesh)
 
-Add your GPU to the live mesh with one command — Linux, or Windows via WSL2:
+Add your GPU to the live mesh with one command:
 
 ```bash
+# Linux / WSL2 (run inside a bash shell):
 curl -fsSL https://circuitllm.xyz/join | bash
 ```
+
+**Windows:** run this in an **Administrator PowerShell** — it sets up WSL2 + GPU passthrough, then
+runs the installer inside it:
+
+```powershell
+irm https://circuitllm.xyz/join.ps1 | iex
+```
+
+> Don't paste `curl … | bash` into PowerShell: there `curl` is an alias for `Invoke-WebRequest` and
+> prints the HTTP response instead of running the script. Use `irm … | iex` (or run the bash line
+> from inside WSL/Ubuntu).
 
 It installs Docker + the NVIDIA Container Toolkit if missing, pulls the GPU image, asks for a payout
 wallet, and runs an auto-restarting container. The node detects your GPU, sizes how many layers it
