@@ -32,6 +32,7 @@ from engine.stage import Stage, stage_for_range
 from engine.kv import StageKV
 from engine.model import load_model
 from engine.log import make_logger
+from engine.canonical import canonical
 
 # KV_CTRL payload: [session u32][op u8][arg u32]
 KVOP_RESET = 1
@@ -499,7 +500,7 @@ def run_control_client(a):
         reg["ts"] = int(_time.time())
         reg.pop("sig", None)
         if getattr(a, "_signing_key", None) is not None:
-            msg = _json.dumps(reg, sort_keys=True, separators=(",", ":")).encode()
+            msg = canonical(reg)
             reg["sig"] = a._signing_key.sign(msg).hex()
 
     def _do_register(prefer_range=None, timeout=2400.0):
@@ -544,7 +545,7 @@ def run_control_client(a):
         signed with our ed25519 key; byte-identical to the control_server verifier's reconstruction."""
         b = {"node_id": node_id, "ts": int(_time.time())}
         if getattr(a, "_signing_key", None) is not None:
-            msg = _json.dumps(b, sort_keys=True, separators=(",", ":")).encode()
+            msg = canonical(b)
             b["sig"] = a._signing_key.sign(msg).hex()
         return b
 
@@ -557,7 +558,7 @@ def run_control_client(a):
             reg2["loaded_layers"] = list(prefer_range)
             reg2["ts"] = int(_time.time()); reg2.pop("sig", None)
             if getattr(a, "_signing_key", None) is not None:
-                msg = _json.dumps(reg2, sort_keys=True, separators=(",", ":")).encode()
+                msg = canonical(reg2)
                 reg2["sig"] = a._signing_key.sign(msg).hex()
             _c, _resp = _control_post(target + "/register", reg2, timeout=15)
             asn = (_resp or {}).get("assignment") or {}

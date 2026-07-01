@@ -1,0 +1,163 @@
+{
+  "note": "Golden vectors pinning THE canonical serializer @circuit/core `stableStringify` (drops undefined → valid JSON) against drift, incl. cross-repo. `undefined` in `input` is the sentinel below — revive to real undefined before calling. `undefinedInput` flags vectors that contain undefined: cross-repo peers still KEEPING undefined only agree on the undefinedInput=false subset until they converge (see docs/canonical-serialization.md).",
+  "undefinedSentinel": "@@undefined@@",
+  "vectors": [
+    {
+      "note": "key ordering",
+      "undefinedInput": false,
+      "input": {
+        "b": 2,
+        "a": 1
+      },
+      "canonical": "{\"a\":1,\"b\":2}"
+    },
+    {
+      "note": "nested objects + array order preserved",
+      "undefinedInput": false,
+      "input": {
+        "z": {
+          "y": 2,
+          "x": 1
+        },
+        "a": [
+          3,
+          1,
+          2
+        ]
+      },
+      "canonical": "{\"a\":[3,1,2],\"z\":{\"x\":1,\"y\":2}}"
+    },
+    {
+      "note": "null value",
+      "undefinedInput": false,
+      "input": {
+        "a": null
+      },
+      "canonical": "{\"a\":null}"
+    },
+    {
+      "note": "top-level null",
+      "undefinedInput": false,
+      "input": null,
+      "canonical": "null"
+    },
+    {
+      "note": "mixed array",
+      "undefinedInput": false,
+      "input": [
+        1,
+        "two",
+        true,
+        null
+      ],
+      "canonical": "[1,\"two\",true,null]"
+    },
+    {
+      "note": "ascii-symbol keys (quote, dash)",
+      "undefinedInput": false,
+      "input": {
+        "a-b": 2,
+        "a\"b": 3
+      },
+      "canonical": "{\"a\\\"b\":3,\"a-b\":2}"
+    },
+    {
+      "note": "numbers",
+      "undefinedInput": false,
+      "input": {
+        "big": 1000000,
+        "n": 1.5,
+        "neg": -2
+      },
+      "canonical": "{\"big\":1000000,\"n\":1.5,\"neg\":-2}"
+    },
+    {
+      "note": "empty object",
+      "undefinedInput": false,
+      "input": {},
+      "canonical": "{}"
+    },
+    {
+      "note": "empty array",
+      "undefinedInput": false,
+      "input": [],
+      "canonical": "[]"
+    },
+    {
+      "note": "top-level bool",
+      "undefinedInput": false,
+      "input": true,
+      "canonical": "true"
+    },
+    {
+      "note": "top-level number",
+      "undefinedInput": false,
+      "input": 42,
+      "canonical": "42"
+    },
+    {
+      "note": "top-level string",
+      "undefinedInput": false,
+      "input": "hi",
+      "canonical": "\"hi\""
+    },
+    {
+      "note": "NON-ASCII keys kept UNESCAPED (catches Python ensure_ascii=True)",
+      "undefinedInput": false,
+      "input": {
+        "café": 1,
+        "a": 2,
+        "π": 3
+      },
+      "canonical": "{\"a\":2,\"café\":1,\"π\":3}"
+    },
+    {
+      "note": "NON-ASCII values kept unescaped",
+      "undefinedInput": false,
+      "input": {
+        "k": "café",
+        "j": "π/2"
+      },
+      "canonical": "{\"j\":\"π/2\",\"k\":\"café\"}"
+    },
+    {
+      "note": "undefined key dropped",
+      "undefinedInput": true,
+      "input": {
+        "a": 1,
+        "b": "@@undefined@@",
+        "c": 3
+      },
+      "canonical": "{\"a\":1,\"c\":3}"
+    },
+    {
+      "note": "nested undefined dropped",
+      "undefinedInput": true,
+      "input": {
+        "a": {
+          "b": "@@undefined@@",
+          "c": 2
+        }
+      },
+      "canonical": "{\"a\":{\"c\":2}}"
+    },
+    {
+      "note": "undefined in array → null",
+      "undefinedInput": true,
+      "input": [
+        1,
+        "@@undefined@@",
+        3
+      ],
+      "canonical": "[1,null,3]"
+    },
+    {
+      "note": "object with only-undefined value → {}",
+      "undefinedInput": true,
+      "input": {
+        "a": "@@undefined@@"
+      },
+      "canonical": "{}"
+    }
+  ]
+}

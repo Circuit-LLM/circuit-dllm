@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from engine.log import make_logger
 from engine.topology import Node
+from engine.canonical import canonical
 
 log = make_logger("control")
 
@@ -56,8 +57,7 @@ def make_ed25519_verifier(ts_window=None):
                     return False
             sig = bytes.fromhex(body["sig"])
             pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(body["node_id"]))
-            msg = json.dumps({k: v for k, v in body.items() if k != "sig"},
-                             sort_keys=True, separators=(",", ":")).encode()
+            msg = canonical({k: v for k, v in body.items() if k != "sig"})
             pub.verify(sig, msg)
             return True
         except Exception:
@@ -75,8 +75,7 @@ def make_ed25519_signer(private_key_hex: str, node_id_hex: str, now_fn=time.time
 
     def sign(body: dict) -> dict:
         body = {**body, "node_id": node_id_hex, "ts": now_fn()}
-        msg = json.dumps({k: v for k, v in body.items() if k != "sig"},
-                         sort_keys=True, separators=(",", ":")).encode()
+        msg = canonical({k: v for k, v in body.items() if k != "sig"})
         body["sig"] = priv.sign(msg).hex()
         return body
 
