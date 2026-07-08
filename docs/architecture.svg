@@ -1,0 +1,201 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" font-family="'Segoe UI',Helvetica,Arial,sans-serif">
+  <defs>
+    <marker id="aData" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#fbbf24"/></marker>
+    <marker id="aRet" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#38e0a8"/></marker>
+    <marker id="aCtrl" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#7f8db0"/></marker>
+    <marker id="aReg" markerWidth="11" markerHeight="11" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#34d399"/></marker>
+    <style>
+      .ttl{fill:#f1f5fb;font-weight:700}
+      .sub{fill:#8694ab}
+      .bt{font-weight:700}
+      .bd{font-size:14px}
+      .nt{font-size:12.5px;fill:#93a0b6}
+      .lbl{font-size:12.5px;font-weight:600}
+      .tier{font-size:13px;font-weight:700;letter-spacing:2px}
+      text{fill:#e7edf5}
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1600" height="1000" fill="#0a0d13"/>
+
+  <!-- Title -->
+  <text x="50" y="44" class="ttl" font-size="30">Circuit DLLM</text>
+  <text x="270" y="44" font-size="20" fill="#9fb0c8">— decentralized 72B inference mesh</text>
+  <text x="50" y="70" class="sub" font-size="15">floating coordinator · head-only orchestrators · sharded 72B-AWQ holders · HA control plane · scattered-by-design</text>
+
+  <!-- Compute-fleet summary -->
+  <rect x="1150" y="18" width="400" height="58" rx="11" fill="#0f2017" stroke="#4ade80" stroke-width="1.8"/>
+  <text x="1168" y="42" class="bt" font-size="16" fill="#bbf7d0">COMPUTE FLEET  ·  4 GPUs</text>
+  <text x="1168" y="64" font-size="13" fill="#8fd6ab">2× A5000 (orchestrators) · 2× A6000 48GB (holders)</text>
+
+  <!-- ===================== CLIENTS ===================== -->
+  <text x="50" y="104" class="tier" fill="#69b4ff">CLIENTS</text>
+  <g>
+    <rect x="50" y="114" width="300" height="74" rx="12" fill="#10233f" stroke="#4aa3ff" stroke-width="2"/>
+    <text x="68" y="142" class="bt bd" fill="#cfe3ff">Paid API</text>
+    <text x="68" y="162" class="bd" fill="#cfe3ff">inference.circuitllm.xyz</text>
+    <text x="68" y="180" class="nt">x402 micropayment · $0.03 / call</text>
+  </g>
+  <g>
+    <rect x="372" y="114" width="300" height="74" rx="12" fill="#10233f" stroke="#4aa3ff" stroke-width="2"/>
+    <text x="390" y="142" class="bt bd" fill="#cfe3ff">Free chat</text>
+    <text x="390" y="162" class="bd" fill="#cfe3ff">circuitllm.xyz</text>
+    <text x="390" y="180" class="nt">website + live dllm status page</text>
+  </g>
+  <g>
+    <rect x="694" y="114" width="300" height="74" rx="12" fill="#10233f" stroke="#4aa3ff" stroke-width="2"/>
+    <text x="712" y="142" class="bt bd" fill="#cfe3ff">circuit-cli</text>
+    <text x="712" y="162" class="bd" fill="#cfe3ff">chat module</text>
+    <text x="712" y="180" class="nt">x402-paid DLLM · streaming</text>
+  </g>
+
+  <!-- clients -> gateway -->
+  <path d="M200,188 L200,224" stroke="#fbbf24" stroke-width="2.2" fill="none" marker-end="url(#aData)"/>
+  <path d="M522,188 L522,224" stroke="#fbbf24" stroke-width="2.2" fill="none" marker-end="url(#aData)"/>
+  <path d="M844,188 L560,224" stroke="#fbbf24" stroke-width="2.2" fill="none" marker-end="url(#aData)"/>
+
+  <!-- ===================== VPS EDGE ===================== -->
+  <rect x="50" y="228" width="944" height="104" rx="14" fill="#0d1b22" stroke="#2dd4bf" stroke-width="2"/>
+  <text x="68" y="252" class="tier" fill="#2dd4bf">VPS  ·  76.13.107.150</text>
+  <rect x="68" y="262" width="170" height="58" rx="10" fill="#0f2b2a" stroke="#2dd4bf" stroke-width="1.5"/>
+  <text x="84" y="288" class="bt bd" fill="#b8f5ee">nginx</text>
+  <text x="84" y="307" class="nt">TLS · routing</text>
+  <rect x="256" y="262" width="722" height="58" rx="10" fill="#0f2b2a" stroke="#2dd4bf" stroke-width="1.5"/>
+  <text x="274" y="288" class="bt bd" fill="#b8f5ee">inference-gateway  ·  x402 payment gate</text>
+  <text x="274" y="307" class="nt">acquire_entry → picks a READY orchestrator · fails over across control planes</text>
+
+  <!-- gateway -> orchestrators -->
+  <path d="M300,332 L300,392" stroke="#fbbf24" stroke-width="2.4" fill="none" marker-end="url(#aData)"/>
+  <path d="M760,332 L760,392" stroke="#fbbf24" stroke-width="2.4" fill="none" marker-end="url(#aData)"/>
+  <text x="330" y="362" class="lbl" fill="#fbbf24">proxy request → chosen orchestrator</text>
+
+  <!-- ===================== ORCHESTRATORS ===================== -->
+  <text x="50" y="384" class="tier" fill="#b69dff">ORCHESTRATORS  —  head-only, replicated</text>
+  <g>
+    <rect x="50" y="396" width="448" height="116" rx="12" fill="#1d1838" stroke="#a78bfa" stroke-width="2"/>
+    <rect x="404" y="406" width="84" height="23" rx="6" fill="#0f2e1e" stroke="#4ade80" stroke-width="1.5"/>
+    <text x="446" y="422" font-size="13" font-weight="700" fill="#bbf7d0" text-anchor="middle">GPU 1 / 4</text>
+    <text x="70" y="424" class="bt bd" fill="#ddd2ff">orch0  ·  A5000</text>
+    <text x="70" y="448" class="bd" fill="#e7deff">embed · final-norm · lm_head</text>
+    <text x="70" y="470" class="bd" fill="#e7deff">+ 1.5B draft model</text>
+    <text x="70" y="494" class="nt">speculative / predictive drafting · own session-id prefix</text>
+  </g>
+  <g>
+    <rect x="522" y="396" width="448" height="116" rx="12" fill="#1d1838" stroke="#a78bfa" stroke-width="2"/>
+    <rect x="876" y="406" width="84" height="23" rx="6" fill="#0f2e1e" stroke="#4ade80" stroke-width="1.5"/>
+    <text x="918" y="422" font-size="13" font-weight="700" fill="#bbf7d0" text-anchor="middle">GPU 2 / 4</text>
+    <text x="542" y="424" class="bt bd" fill="#ddd2ff">orch1  ·  A5000</text>
+    <text x="542" y="448" class="bd" fill="#e7deff">embed · final-norm · lm_head</text>
+    <text x="542" y="470" class="bd" fill="#e7deff">+ 1.5B draft model</text>
+    <text x="542" y="494" class="nt">no co-located layers → draft+head spread across the net</text>
+  </g>
+
+  <!-- orch -> holders (relay) -->
+  <path d="M240,512 L240,576" stroke="#fbbf24" stroke-width="2.4" fill="none" marker-end="url(#aData)"/>
+  <path d="M700,512 L700,576" stroke="#fbbf24" stroke-width="2.4" fill="none" marker-end="url(#aData)"/>
+  <text x="270" y="544" class="lbl" fill="#fbbf24">relay hidden states through the layer pipeline (warm KV per session)</text>
+
+  <!-- ===================== HOLDERS ===================== -->
+  <text x="50" y="568" class="tier" fill="#f6c84a">SLICE HOLDERS  —  the 72B layers, sharded</text>
+  <g>
+    <rect x="50" y="580" width="448" height="112" rx="12" fill="#2a2110" stroke="#fbbf24" stroke-width="2"/>
+    <rect x="404" y="590" width="84" height="23" rx="6" fill="#0f2e1e" stroke="#4ade80" stroke-width="1.5"/>
+    <text x="446" y="606" font-size="13" font-weight="700" fill="#bbf7d0" text-anchor="middle">GPU 3 / 4</text>
+    <text x="70" y="608" class="bt bd" fill="#ffe9b8">hold0  ·  A6000 48GB</text>
+    <text x="70" y="634" class="bd" fill="#ffe9b8" font-weight="700">layers [0, 40)</text>
+    <text x="70" y="658" class="nt">Qwen2.5-72B-Instruct-AWQ submodel (Marlin)</text>
+    <text x="70" y="679" class="nt">↳ also hosts the ACTIVE control plane</text>
+  </g>
+  <g>
+    <rect x="522" y="580" width="448" height="112" rx="12" fill="#2a2110" stroke="#fbbf24" stroke-width="2"/>
+    <rect x="876" y="590" width="84" height="23" rx="6" fill="#0f2e1e" stroke="#4ade80" stroke-width="1.5"/>
+    <text x="918" y="606" font-size="13" font-weight="700" fill="#bbf7d0" text-anchor="middle">GPU 4 / 4</text>
+    <text x="542" y="608" class="bt bd" fill="#ffe9b8">hold1  ·  A6000 48GB</text>
+    <text x="542" y="634" class="bd" fill="#ffe9b8" font-weight="700">layers [40, 80)</text>
+    <text x="542" y="658" class="nt">Qwen2.5-72B-Instruct-AWQ submodel (Marlin)</text>
+    <text x="542" y="679" class="nt">scattered host · high-RTT mesh</text>
+  </g>
+  <!-- slice-to-slice relay -->
+  <path d="M498,624 L520,624" stroke="#fbbf24" stroke-width="2.6" fill="none" marker-end="url(#aData)"/>
+  <text x="372" y="617" class="nt" fill="#f6c84a">slice → slice</text>
+
+  <!-- return path (tokens stream back) -->
+  <path d="M30,636 C18,636 18,150 30,150" stroke="#38e0a8" stroke-width="2.4" fill="none" marker-end="url(#aRet)" stroke-dasharray="1 0"/>
+  <text x="40" y="400" class="lbl" fill="#38e0a8" transform="rotate(-90 40 400)">tokens stream back  →  norm / lm_head  →  client</text>
+
+  <!-- ===================== CONTROL PLANE (HA) ===================== -->
+  <rect x="1030" y="228" width="520" height="464" rx="14" fill="#0c241b" stroke="#34d399" stroke-width="2.2"/>
+  <text x="1050" y="256" class="tier" fill="#34d399">CONTROL PLANE  —  HA</text>
+  <text x="1050" y="278" class="nt" fill="#7fd9b4">registry · router · trust / verification</text>
+
+  <g>
+    <rect x="1050" y="296" width="480" height="86" rx="11" fill="#103226" stroke="#34d399" stroke-width="1.6"/>
+    <text x="1068" y="324" class="bt bd" fill="#bff3da">ACTIVE control plane</text>
+    <text x="1068" y="346" class="bd" fill="#bff3da">on hold0 · 194.68.245.84:22035</text>
+    <text x="1068" y="368" class="nt" fill="#86cfa9">acquire_entry · acquire_route · /register · /trust</text>
+  </g>
+  <text x="1290" y="404" font-size="20" fill="#34d399" text-anchor="middle">⇅  identical topology  ⇅</text>
+  <g>
+    <rect x="1050" y="414" width="480" height="86" rx="11" fill="#0e2a20" stroke="#34d399" stroke-width="1.6" stroke-dasharray="6 4"/>
+    <text x="1068" y="442" class="bt bd" fill="#bff3da">WARM STANDBY control plane</text>
+    <text x="1068" y="464" class="bd" fill="#bff3da">on orch1 · 69.30.85.171:22183</text>
+    <text x="1068" y="486" class="nt" fill="#86cfa9">different host → survives either pod dying</text>
+  </g>
+
+  <rect x="1050" y="520" width="480" height="150" rx="11" fill="#0a1f18" stroke="#2f6f53" stroke-width="1.4"/>
+  <text x="1068" y="546" class="lbl" fill="#7fd9b4">OFF the per-token path</text>
+  <text x="1068" y="568" class="nt" fill="#9fcdb8">touched only at session start + on failover —</text>
+  <text x="1068" y="586" class="nt" fill="#9fcdb8">never per token. Featherweight (no GPU).</text>
+  <text x="1068" y="612" class="lbl" fill="#7fd9b4">every node registers with BOTH</text>
+  <text x="1068" y="634" class="nt" fill="#9fcdb8">clients hold the list + fail over (sticky-preferred);</text>
+  <text x="1068" y="652" class="nt" fill="#9fcdb8">holders mirror their slot → standby stays identical</text>
+
+  <!-- control connections (dashed) -->
+  <path d="M978,291 L1030,300" stroke="#7f8db0" stroke-width="1.8" fill="none" stroke-dasharray="6 4" marker-end="url(#aCtrl)"/>
+  <text x="985" y="284" class="nt" fill="#9aa6c0">acquire_entry</text>
+  <path d="M970,454 L1030,440" stroke="#7f8db0" stroke-width="1.8" fill="none" stroke-dasharray="6 4" marker-end="url(#aCtrl)"/>
+  <text x="980" y="452" class="nt" fill="#9aa6c0">acquire_route</text>
+  <path d="M970,636 C1010,636 1010,560 1048,556" stroke="#34d399" stroke-width="1.8" fill="none" stroke-dasharray="5 4" marker-end="url(#aReg)"/>
+  <text x="980" y="660" class="nt" fill="#5fce9a">register · heartbeat → both CPs</text>
+
+  <!-- ===================== ECONOMIC / TRUST LAYER ===================== -->
+  <text x="50" y="744" class="tier" fill="#9aa7bd">ECONOMIC + TRUST LAYER  (underpins the open mesh)</text>
+  <g font-size="13">
+    <rect x="50" y="756" width="360" height="120" rx="12" fill="#141a25" stroke="#3a4860" stroke-width="1.6"/>
+    <text x="68" y="784" class="bt bd" fill="#cdd8ea">Node onboarding</text>
+    <text x="68" y="808" fill="#aab6cb">curl | bash → ghcr.io gpu-node</text>
+    <text x="68" y="830" fill="#aab6cb">registers at node.circuitllm.xyz</text>
+    <text x="68" y="855" class="nt">anyone can contribute a GPU</text>
+
+    <rect x="432" y="756" width="360" height="120" rx="12" fill="#141a25" stroke="#3a4860" stroke-width="1.6"/>
+    <text x="450" y="784" class="bt bd" fill="#cdd8ea">Trustless verification</text>
+    <text x="450" y="808" fill="#aab6cb">probation → trusted auditor</text>
+    <text x="450" y="830" fill="#aab6cb">cross-GPU output checks · evict/ban</text>
+    <text x="450" y="855" class="nt">no node is trusted on faith</text>
+
+    <rect x="814" y="756" width="360" height="120" rx="12" fill="#141a25" stroke="#3a4860" stroke-width="1.6"/>
+    <text x="832" y="784" class="bt bd" fill="#cdd8ea">CIRC payouts</text>
+    <text x="832" y="808" fill="#aab6cb">x402 revenue → node operators</text>
+    <text x="832" y="830" fill="#aab6cb">revenue-ledger + distributor (timer)</text>
+    <text x="832" y="855" class="nt">GPUs earn per contribution</text>
+
+    <rect x="1196" y="756" width="354" height="120" rx="12" fill="#141a25" stroke="#3a4860" stroke-width="1.6"/>
+    <text x="1214" y="784" class="bt bd" fill="#cdd8ea">On-chain (Solana)</text>
+    <text x="1214" y="808" fill="#aab6cb">CIRC token · StakePoint</text>
+    <text x="1214" y="830" fill="#aab6cb">mesh_registry program</text>
+    <text x="1214" y="855" class="nt">future: leaderless CP (devnet, parked)</text>
+  </g>
+
+  <!-- ===================== LEGEND ===================== -->
+  <line x1="50" y1="916" x2="92" y2="916" stroke="#fbbf24" stroke-width="3" marker-end="url(#aData)"/>
+  <text x="100" y="921" font-size="13" fill="#c8d2e2">token data path (per request)</text>
+  <line x1="330" y1="916" x2="372" y2="916" stroke="#38e0a8" stroke-width="3" marker-end="url(#aRet)"/>
+  <text x="380" y="921" font-size="13" fill="#c8d2e2">tokens streamed back to client</text>
+  <line x1="640" y1="916" x2="682" y2="916" stroke="#7f8db0" stroke-width="2.4" stroke-dasharray="6 4" marker-end="url(#aCtrl)"/>
+  <text x="690" y="921" font-size="13" fill="#c8d2e2">control (session-start + failover · off hot path)</text>
+  <line x1="1060" y1="916" x2="1102" y2="916" stroke="#34d399" stroke-width="2.4" stroke-dasharray="5 4" marker-end="url(#aReg)"/>
+  <text x="1110" y="921" font-size="13" fill="#c8d2e2">register / heartbeat (to both control planes)</text>
+
+  <text x="50" y="958" font-size="13" fill="#7d8aa0">Model: Qwen2.5-72B-Instruct-AWQ (80 layers, 2 slots) + Qwen2.5-1.5B draft  ·  ~7.9 tok/s single / ~18.7 tok/s @conc4  ·  prefix cache TTFT 0.74s  ·  tree drafting + K=12</text>
+  <text x="50" y="980" font-size="13" fill="#5f6b80">Floating coordinator: standalone control plane + replicated head-only orchestrators + replicated slice holders. No single point of failure on the routing path.</text>
+</svg>

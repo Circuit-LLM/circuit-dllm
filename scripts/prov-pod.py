@@ -9,7 +9,7 @@ def secret(n):
 
 RPK = secret("RUNPOD_API_KEY")
 UA = {"User-Agent": "curl/8.5.0"}
-AUTHID = os.environ.get("CIRCUIT_RUNPOD_AUTHID", "cmqt3hdwr000z13yr15hgooyh")  # Circuit-LLM private GHCR auth (RunPod registry-auth id; recreate via saveRegistryAuth + override here if myself.containerRegistryAuths is empty — a stale id silently fails the image pull)
+AUTHID = os.environ.get("CIRCUIT_RUNPOD_AUTHID", "cmr1lpvhy000whb4s70igs6ju")  # Circuit-LLM private GHCR auth (RunPod registry-auth id; recreate via saveRegistryAuth + override here if myself.containerRegistryAuths is empty — a stale id silently fails the image pull). Recreated 2026-07-01 after the PAT rotation invalidated the old auth (cmqt3hdwr000z13yr15hgooyh).
 IMAGE  = "ghcr.io/circuit-llm/circuit-dllm:v2-indep"   # has bitsandbytes baked
 NAME, ROLE, PORTS, MIN_FREE = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 CLOUD = sys.argv[5] if len(sys.argv) > 5 else "SECURE"      # SECURE | COMMUNITY
@@ -36,7 +36,9 @@ def gql(q, v=None):
     except urllib.error.HTTPError as e:
         return {"http_error": e.code, "body": e.read().decode()[:400]}
 
-pubkey = rest("GET", "pods/0e78t6cfl72z9y").get("env", {}).get("PUBLIC_KEY", "")
+# PUBLIC_KEY for SSH access. The old approach copied it from a live reference pod, but after the
+# 2026-06-29 teardown there is no live pod — read the local key directly (override via CIRCUIT_PUBKEY).
+pubkey = os.environ.get("CIRCUIT_PUBKEY") or open(os.path.expanduser("~/.ssh/id_ed25519.pub")).read().strip()
 assert pubkey, "no PUBLIC_KEY"
 
 # Only DECLARE + use $dc when a datacenter is pinned — GraphQL rejects a declared-but-unused
